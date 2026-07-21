@@ -1,0 +1,58 @@
+# --- macOS ---
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- C++ / native engine build artifacts (sts_lightspeed) ---
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# --- ML training artifacts ---
+# Checkpoints, logs, and rollout data are reproducible outputs, not source.
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.pt
+*.ckpt
+*.tfevents.*
+logs/
+
+# --- Local / editor / tooling ---
+.idea/
+.vscode/
+.kiro/
+*.log
+
+# --- Local working files (private, not published) ---
+docs/
+*.zip
