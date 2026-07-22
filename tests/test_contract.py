@@ -113,6 +113,21 @@ def test_obs_field_shapes_match_constants():
     assert by_name["hand_feats"].shape == (contract.HAND_MAX, 6)
 
 
+def test_obs_dim_constants_match_doc_literals():
+    # The named feature-width constants must equal the doc's literal values, so
+    # lifting them to constants (vs bare ints in OBS_FIELDS) cannot drift.
+    assert contract.PLAYER_SCALAR_DIM == 8
+    assert contract.ENEMY_SCALAR_DIM == 5
+    assert contract.HAND_FEAT_DIM == 6
+    assert contract.MAP_CONTEXT_DIM == 40
+    # And OBS_FIELDS must actually use them.
+    by_name = contract.OBS_FIELD_BY_NAME
+    assert by_name["player_scalars"].shape == (contract.PLAYER_SCALAR_DIM,)
+    assert by_name["enemy_scalars"].shape == (contract.MAX_ENEMIES, contract.ENEMY_SCALAR_DIM)
+    assert by_name["hand_feats"].shape == (contract.HAND_MAX, contract.HAND_FEAT_DIM)
+    assert by_name["map_context"].shape == (contract.MAP_CONTEXT_DIM,)
+
+
 def test_id_fields_have_id_high():
     expected_id_high = {
         "hand_ids": contract.N_CARD_IDS - 1,
@@ -245,27 +260,48 @@ def test_info_keys_present():
         assert key in contract.INFO_KEYS
 
 
+def test_info_keys_always_vs_terminal_split():
+    # Terminal-only keys must be exactly {won, episode} and must NOT appear in
+    # the always-present set (the agent reads info every step).
+    assert set(contract.INFO_KEYS_TERMINAL) == {"won", "episode"}
+    assert set(contract.INFO_KEYS_ALWAYS).isdisjoint(contract.INFO_KEYS_TERMINAL)
+    # INFO_KEYS is the union, with no key lost or duplicated.
+    assert contract.INFO_KEYS == contract.INFO_KEYS_ALWAYS + contract.INFO_KEYS_TERMINAL
+    assert len(set(contract.INFO_KEYS)) == len(contract.INFO_KEYS)
+    # Always-present keys the agent relies on each step.
+    for key in ("action_mask", "screen", "turn", "hp"):
+        assert key in contract.INFO_KEYS_ALWAYS
+
+
 # ---------------------------------------------------------------------------
 # Engine enum validation
 # ---------------------------------------------------------------------------
 
 
-def test_validate_engine_enums_accepts_matching():
-    assert (
-        contract.validate_engine_enums(dict(contract.EXPECTED_ENUM_COUNTS)) is None
-    )
+def _max_ids_at_capacity() -> dict[str, int]:
+    """The largest engine max-id per enum that still fits (N-1 for each)."""
+    return {name: n - 1 for name, n in contract.EXPECTED_TABLE_SIZES.items()}
 
 
-def test_validate_engine_enums_rejects_mismatch():
-    counts = dict(contract.EXPECTED_ENUM_COUNTS)
-    counts["N_CARD_IDS"] = counts["N_CARD_IDS"] + 1
+def test_validate_engine_enums_accepts_max_id_within_table():
+    # max_id == N - 1 is the boundary that fits (ids run 0..N-1).
+    assert contract.validate_engine_enums(_max_ids_at_capacity()) is None
+
+
+def test_validate_engine_enums_rejects_overflow():
+    # max_id == N overflows a table of N rows (valid ids are 0..N-1).
+    max_ids = _max_ids_at_capacity()
+    max_ids["N_CARD_IDS"] = contract.N_CARD_IDS  # one past the last valid row
     with pytest.raises(contract.ContractError) as excinfo:
-        contract.validate_engine_enums(counts)
-    assert "N_CARD_IDS" in str(excinfo.value)
+        contract.validate_engine_enums(max_ids)
+    msg = str(excinfo.value)
+    assert "N_CARD_IDS" in msg
+    # Error should state the minimum N that would fit.
+    assert str(contract.N_CARD_IDS + 1) in msg
 
 
 def test_validate_engine_enums_rejects_missing_key():
-    counts = dict(contract.EXPECTED_ENUM_COUNTS)
-    counts.pop(next(iter(counts)))
+    max_ids = _max_ids_at_capacity()
+    max_ids.pop(next(iter(max_ids)))
     with pytest.raises(contract.ContractError):
-        contract.validate_engine_enums(counts)
+        contract.validate_engine_enums(max_ids)
