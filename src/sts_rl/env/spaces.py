@@ -1,8 +1,8 @@
-"""Gymnasium space builders derived from the contract registry.
+"""Gymnasium space builders derived from the shared field registry.
 
 The observation and action spaces are constructed directly from the constants
-and field registry in :mod:`sts_rl.contract`, so the spaces can never drift
-from the contract.
+and field registry in :mod:`sts_rl.interface`, so the spaces can never drift
+from those definitions.
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from sts_rl import contract
-from sts_rl.contract import ACTION_DIM, OBS_FIELDS, ObsField
+from sts_rl import interface
+from sts_rl.interface import ACTION_DIM, OBS_FIELDS, ObsField
 
 
 def build_action_space() -> gym.spaces.Discrete:
@@ -26,7 +26,7 @@ def _build_box(field: ObsField) -> gym.spaces.Box:
         return spaces.Box(low=-np.inf, high=np.inf, shape=field.shape, dtype=np.float32)
     if field.bounds == "id":
         return spaces.Box(low=0, high=field.id_high, shape=field.shape, dtype=np.int32)
-    raise contract.ContractError(
+    raise interface.InterfaceError(
         f"ObsField {field.name!r}: unknown bounds value {field.bounds!r}"
     )
 

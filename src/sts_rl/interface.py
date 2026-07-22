@@ -1,14 +1,13 @@
-"""Interface Contract for the Slay the Spire RL project.
+"""Shared interface definitions for the Slay the Spire RL environment and agent.
 
-CONTRACT_VERSION 0.1.0.
+INTERFACE_VERSION 0.1.0.
 
-This module is the single source of truth jointly owned by Track A (the
-environment) and Track B (the agent). It defines the observation shapes,
-action-index layout, dtypes, mask contract, and enum cardinalities that both
-sides depend on.
+This module is the single source of truth shared by the environment and the
+agent. It defines the observation shapes, action-index layout, dtypes, mask
+rules, and enum cardinalities that both sides depend on.
 
-Changing any constant, shape, dtype, or action index requires sign-off from
-BOTH the Track A and Track B reviewers and a bump of ``CONTRACT_VERSION``.
+Changing any constant, shape, dtype, or action index is a breaking change:
+bump ``INTERFACE_VERSION`` and update both the environment and the agent.
 
 The enum-derived table sizes below (``N_CARD_IDS``, ``N_RELIC_IDS``, and
 friends) are INITIAL placeholders except where confirmed against the engine.
@@ -24,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-CONTRACT_VERSION: str = "0.1.0"
+INTERFACE_VERSION: str = "0.1.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -41,12 +40,10 @@ N_CARD_IDS = 380  # confirm against engine enums
 N_RELIC_IDS = 180  # confirm against engine enums
 N_POTION_IDS = 40  # confirm against engine enums
 N_POWER_IDS = 60  # confirm against engine enums
-# N_MONSTER_IDS sizes the enemy embedding table for MonsterId
-# (sts_lightspeed include/constants/MonsterIds.h): INVALID=0 sentinel through
+# N_MONSTER_IDS sizes the enemy embedding table for the engine's MonsterId enum
+# (sts_lightspeed, include/constants/MonsterIds.h): INVALID=0 sentinel through
 # WRITHING_MASS=65 (the max), contiguous, 66 members. Table size = max_id + 1
 # = 66 so raw enum ids 0..65 index rows directly; INVALID=0 doubles as PAD.
-# (Absent from the original Interface-Contract.md constants table; added there
-# at CONTRACT_VERSION 0.1.0.)
 N_MONSTER_IDS = 66
 N_INTENT = 12  # confirm against engine enums
 N_NODE_TYPES = 7  # confirm against engine enums
@@ -64,8 +61,8 @@ Info = dict[str, Any]
 Mask = np.ndarray  # bool, shape (ACTION_DIM,)
 
 
-class ContractError(Exception):
-    """Raised on any contract violation (bad mask, enum mismatch)."""
+class InterfaceError(Exception):
+    """Raised when a value violates these shared definitions (bad mask, enum mismatch)."""
 
 
 # --- Action blocks ---------------------------------------------------------
@@ -83,8 +80,8 @@ class ActionBlock:
         return self.start <= index < self.stop
 
 
-# Ordered (name, count) specs. Counts are expressed in terms of the caps where
-# the doc does so. Start values are derived contiguously below.
+# Ordered (name, count) specs. Counts are expressed in terms of the caps above
+# where applicable. Start values are derived contiguously below.
 _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("END_TURN", 1),
     ("PLAY_CARD_TARGETED", HAND_MAX * MAX_ENEMIES),  # 50
@@ -119,35 +116,35 @@ ACTION_DIM: int = sum(block.count for block in ACTION_BLOCKS)
 
 _EXPECTED_ACTION_DIM = 154
 if ACTION_DIM != _EXPECTED_ACTION_DIM:
-    raise ContractError(
+    raise InterfaceError(
         f"ACTION_DIM miscount: computed {ACTION_DIM}, expected "
         f"{_EXPECTED_ACTION_DIM}. Check ACTION_BLOCKS counts."
     )
 
 ACTION_BLOCK_BY_NAME: dict[str, ActionBlock] = {b.name: b for b in ACTION_BLOCKS}
 
-# --- Mask contract ---------------------------------------------------------
+# --- Mask rules -------------------------------------------------------------
 MASK_SHAPE: tuple[int, ...] = (ACTION_DIM,)
 MASK_DTYPE = np.bool_
 
 
 def assert_valid_mask(mask: np.ndarray) -> None:
-    """Raise :class:`ContractError` unless ``mask`` is a valid action mask.
+    """Raise :class:`InterfaceError` unless ``mask`` is a valid action mask.
 
     A valid mask has shape ``MASK_SHAPE``, boolean dtype, and at least one
     legal action set. An all-False mask is a hard error: it would NaN the
     ``-inf`` softmax downstream.
     """
     if mask.shape != MASK_SHAPE:
-        raise ContractError(
+        raise InterfaceError(
             f"mask shape check failed: got {mask.shape}, expected {MASK_SHAPE}"
         )
     if mask.dtype != np.bool_:
-        raise ContractError(
+        raise InterfaceError(
             f"mask dtype check failed: got {mask.dtype}, expected {np.bool_}"
         )
     if not mask.any():
-        raise ContractError(
+        raise InterfaceError(
             "mask legality check failed: all-False mask has no legal action "
             "(would NaN the -inf softmax)"
         )
@@ -164,7 +161,7 @@ class ObsField:
 
     def __post_init__(self) -> None:
         if (self.bounds == "id") != (self.id_high is not None):
-            raise ContractError(
+            raise InterfaceError(
                 f"ObsField {self.name!r}: id_high must be set iff bounds=='id' "
                 f"(bounds={self.bounds!r}, id_high={self.id_high!r})"
             )
@@ -195,7 +192,8 @@ OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}
 # --- Reward / info surface -------------------------------------------------
 # Reward is: reward = terminal + beta(t) * sum(shaping_terms).
 # The terminal component is never annealed; only the shaping sum is scaled by
-# the schedule beta(t). Tunable coefficients live in config.py, NOT here.
+# the schedule beta(t). The tunable coefficients are part of the training
+# configuration, not these shared definitions.
 TERMINAL_WIN_REWARD: float = 1.0
 TERMINAL_LOSS_REWARD: float = -1.0
 SHAPING_TERMS: tuple[str, ...] = (
@@ -216,7 +214,7 @@ INFO_KEYS_ALWAYS: tuple[str, ...] = (
     "ascension",
     "shaping_terms",
     "seed",
-    "contract_version",
+    "interface_version",
     "rng_state",
     "engine_commit",
     "invalid_action",
@@ -231,11 +229,11 @@ INFO_KEYS_TERMINAL: tuple[str, ...] = (
 INFO_KEYS: tuple[str, ...] = INFO_KEYS_ALWAYS + INFO_KEYS_TERMINAL
 
 # --- Enum validation -------------------------------------------------------
-# Contract embedding-table sizes (N). Each id field indexes a table of N rows,
-# so valid ids run 0..N-1. The startup guard asserts the engine's highest id
-# for each enum is < N: cardinality equality is NOT sufficient, because a
-# non-contiguous or 1-based enum can have a max id >= its member count and
-# still overflow the table.
+# Embedding-table sizes (N). Each id field indexes a table of N rows, so valid
+# ids run 0..N-1. The startup guard asserts the engine's highest id for each
+# enum is < N: cardinality equality is NOT sufficient, because a non-contiguous
+# or 1-based enum can have a max id >= its member count and still overflow the
+# table.
 EXPECTED_TABLE_SIZES: dict[str, int] = {
     "N_CARD_IDS": N_CARD_IDS,
     "N_RELIC_IDS": N_RELIC_IDS,
@@ -249,15 +247,15 @@ EXPECTED_TABLE_SIZES: dict[str, int] = {
 
 
 def validate_engine_enums(engine_max_ids: Mapping[str, int]) -> None:
-    """Assert every engine enum's highest id fits its contract embedding table.
+    """Assert every engine enum's highest id fits its embedding table.
 
     ``engine_max_ids`` maps each key in :data:`EXPECTED_TABLE_SIZES` to the
-    highest id value the live engine can emit for that enum (Track A's adapter
-    reads these from the ``sts_lightspeed`` bindings at startup). Each id
-    indexes an embedding table of ``N`` rows (0..N-1), so the invariant is
+    highest id value the live engine can emit for that enum (the environment
+    adapter reads these from the ``sts_lightspeed`` bindings at startup). Each
+    id indexes an embedding table of ``N`` rows (0..N-1), so the invariant is
     ``max_id < N``.
 
-    Raise :class:`ContractError` listing every enum whose ``max_id`` would
+    Raise :class:`InterfaceError` listing every enum whose ``max_id`` would
     overflow its table (with the minimum ``N`` that would fit) or that is
     missing from ``engine_max_ids``. An overflow is a hard error, never a
     silent reshape.
@@ -266,17 +264,17 @@ def validate_engine_enums(engine_max_ids: Mapping[str, int]) -> None:
     for name, table_size in EXPECTED_TABLE_SIZES.items():
         if name not in engine_max_ids:
             problems.append(
-                f"{name}: missing from engine_max_ids (contract table size {table_size})"
+                f"{name}: missing from engine_max_ids (expected table size {table_size})"
             )
             continue
         max_id = engine_max_ids[name]
         if max_id >= table_size:
             problems.append(
-                f"{name}: engine max id {max_id} overflows contract table size "
+                f"{name}: engine max id {max_id} overflows expected table size "
                 f"{table_size} (need max_id < N, i.e. N >= {max_id + 1})"
             )
     if problems:
-        raise ContractError(
-            "engine enum ids do not fit contract embedding tables:\n  "
+        raise InterfaceError(
+            "engine enum ids do not fit their embedding tables:\n  "
             + "\n  ".join(problems)
         )
