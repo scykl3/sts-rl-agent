@@ -91,6 +91,25 @@ def test_output_is_finite():
     assert torch.isfinite(out).all()
 
 
+def test_accepts_float64_observations():
+    """Float64 obs (the common numpy default) must not break the trunk Linear.
+
+    Regression: without internal float32 coercion the concat promotes to double
+    and ``nn.Linear`` raises "mat1 and mat2 must have the same dtype". Ids stay
+    integer; every float field is recast to double to mimic
+    ``torch.as_tensor(numpy_float64_array)``.
+    """
+    enc = ObsFeatureEncoder()
+    obs64 = {
+        name: (t if name in _ID_FIELDS else t.double())
+        for name, t in _sample_batch().items()
+    }
+    out = enc(obs64)
+    assert out.shape == (BATCH, enc.output_dim)
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+
+
 def test_padding_rows_are_zero():
     enc = ObsFeatureEncoder()
     assert torch.equal(

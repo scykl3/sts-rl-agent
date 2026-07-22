@@ -40,6 +40,7 @@ from sts_rl.interface import (
     N_POWER_IDS,
     N_RELIC_IDS,
     N_SCREENS,
+    OBS_FIELDS,
     PAD_ID,
     PILE_MAX,
     PLAYER_SCALAR_DIM,
@@ -57,6 +58,11 @@ POTION_EMBED_DIM = 8
 _PILE_POOLS = 2
 _N_PILES = 3  # draw, discard, exhaust
 
+# Observation fields whose dtype is an id (embedding index), derived from the
+# interface so it tracks the registry. _coerce_dtypes casts every non-id field
+# to float32; ids keep their integer dtype and are cast to long at the lookups.
+_ID_FIELDS = frozenset(f.name for f in OBS_FIELDS if f.bounds == "id")
+
 # Default trunk width; constructor-overridable.
 HIDDEN_DIM = 512
 
@@ -67,6 +73,8 @@ class ObsFeatureEncoder(nn.Module):
     ``forward(obs)`` expects a dict of *batched* tensors keyed by the interface
     ``OBS_FIELDS`` names: float fields as ``(B, *shape)`` and id fields as
     integer ``(B, *shape)`` (cast to long internally for the embedding lookup).
+    Float fields are cast to float32 internally, so a float64 obs dict (the
+    common result of sampling via numpy) does not promote the trunk to double.
     It returns the trunk output of shape ``(B, output_dim)``.
     :meth:`encode_features` exposes the raw pre-trunk concat of shape
     ``(B, feature_dim)``.
@@ -122,8 +130,22 @@ class ObsFeatureEncoder(nn.Module):
         mx = emb.max(dim=1).values
         return torch.cat([mean, mx], dim=1)  # (B, 2*CARD_EMBED_DIM)
 
+    @staticmethod
+    def _coerce_dtypes(obs: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Cast non-id fields to float32; id fields stay integer for embedding.
+
+        Observations sampled via numpy are commonly float64; left unchanged they
+        promote the concat to double and the trunk's Linear then raises
+        "mat1 and mat2 must have the same dtype".
+        """
+        return {
+            name: (t if name in _ID_FIELDS else t.float())
+            for name, t in obs.items()
+        }
+
     def encode_features(self, obs: dict[str, Tensor]) -> Tensor:
         """Build the pre-trunk concat of shape ``(B, feature_dim)``."""
+        obs = self._coerce_dtypes(obs)
         batch = obs["hand_ids"].shape[0]
 
         # HAND: per-slot [card_embed | hand_feats], flattened over slots. Slot

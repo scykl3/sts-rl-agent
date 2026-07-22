@@ -2,7 +2,7 @@
 name = "sts_rl"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["numpy", "gymnasium", "torch==2.13.0"]
+dependencies = ["numpy", "gymnasium", "torch>=2.0,<3"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
