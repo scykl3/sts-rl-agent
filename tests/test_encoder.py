@@ -100,10 +100,7 @@ def test_accepts_float64_observations():
     ``torch.as_tensor(numpy_float64_array)``.
     """
     enc = ObsFeatureEncoder()
-    obs64 = {
-        name: (t if name in _ID_FIELDS else t.double())
-        for name, t in _sample_batch().items()
-    }
+    obs64 = {name: (t if name in _ID_FIELDS else t.double()) for name, t in _sample_batch().items()}
     out = enc(obs64)
     assert out.shape == (BATCH, enc.output_dim)
     assert out.dtype == torch.float32

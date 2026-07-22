@@ -7,7 +7,6 @@ import pytest
 import sts_rl.interface as interface
 from sts_rl.env import spaces
 
-
 # ---------------------------------------------------------------------------
 # Version and action dimension
 # ---------------------------------------------------------------------------
@@ -140,9 +139,7 @@ def test_id_fields_have_id_high():
     }
     # Pin the exact set of id fields, so silently switching one to another
     # bounds value (which __post_init__ would happily accept) is caught.
-    assert {f.name for f in interface.OBS_FIELDS if f.bounds == "id"} == set(
-        expected_id_high
-    )
+    assert {f.name for f in interface.OBS_FIELDS if f.bounds == "id"} == set(expected_id_high)
     for f in interface.OBS_FIELDS:
         if f.bounds == "id":
             assert f.id_high is not None

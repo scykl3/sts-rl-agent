@@ -25,6 +25,7 @@ def _build_box(field: ObsField) -> gym.spaces.Box:
     if field.bounds == "real":
         return spaces.Box(low=-np.inf, high=np.inf, shape=field.shape, dtype=np.float32)
     if field.bounds == "id":
+        assert field.id_high is not None  # invariant: id_high is set iff bounds == "id"
         return spaces.Box(low=0, high=field.id_high, shape=field.shape, dtype=np.int32)
     raise interface.InterfaceError(
         f"ObsField {field.name!r}: unknown bounds value {field.bounds!r}"
