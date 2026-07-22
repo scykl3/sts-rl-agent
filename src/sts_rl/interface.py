@@ -136,13 +136,9 @@ def assert_valid_mask(mask: np.ndarray) -> None:
     ``-inf`` softmax downstream.
     """
     if mask.shape != MASK_SHAPE:
-        raise InterfaceError(
-            f"mask shape check failed: got {mask.shape}, expected {MASK_SHAPE}"
-        )
+        raise InterfaceError(f"mask shape check failed: got {mask.shape}, expected {MASK_SHAPE}")
     if mask.dtype != np.bool_:
-        raise InterfaceError(
-            f"mask dtype check failed: got {mask.dtype}, expected {np.bool_}"
-        )
+        raise InterfaceError(f"mask dtype check failed: got {mask.dtype}, expected {np.bool_}")
     if not mask.any():
         raise InterfaceError(
             "mask legality check failed: all-False mask has no legal action "
@@ -275,6 +271,5 @@ def validate_engine_enums(engine_max_ids: Mapping[str, int]) -> None:
             )
     if problems:
         raise InterfaceError(
-            "engine enum ids do not fit their embedding tables:\n  "
-            + "\n  ".join(problems)
+            "engine enum ids do not fit their embedding tables:\n  " + "\n  ".join(problems)
         )
