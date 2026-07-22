@@ -4,6 +4,10 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["numpy", "gymnasium"]
 
+[project.optional-dependencies]
+# Development tooling: test runner, linter, formatter, and type checker.
+dev = ["pytest", "ruff", "black", "mypy"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
@@ -13,3 +17,4 @@ line-length = 100
 
 [tool.black]
 line-length = 100
+target-version = ["py310"]
