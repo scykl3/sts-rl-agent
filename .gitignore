@@ -11,7 +11,7 @@ build/
 dist/
 .venv/
 venv/
-env/
+/env/
 .python-version
 
 # --- Testing / coverage ---
@@ -55,4 +55,5 @@ logs/
 
 # --- Local working files (private, not published) ---
 docs/
+CLAUDE.md
 *.zip
