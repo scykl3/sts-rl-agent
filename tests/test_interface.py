@@ -13,11 +13,11 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.1.0"
+    assert interface.INTERFACE_VERSION == "0.2.0"
 
 
-def test_action_dim_is_154():
-    assert interface.ACTION_DIM == 154
+def test_action_dim_is_155():
+    assert interface.ACTION_DIM == 155
 
 
 def test_action_dim_equals_sum_of_block_counts():
@@ -54,6 +54,7 @@ def _expected_block_spec():
         ("EVENT_SELECT", 10),
         ("BOSS_RELIC_SELECT", 4),
         ("PROCEED", 1),
+        ("CONFIRM_SELECT", 1),
     ]
 
 
@@ -73,6 +74,8 @@ def test_action_block_offsets_match_spec():
 
     assert interface.ACTION_BLOCK_BY_NAME["END_TURN"].start == 0
     assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == 154
+    # CONFIRM_SELECT is the tail block, so its stop equals the full action dim.
+    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == interface.ACTION_DIM
 
 
 def test_action_block_contains():
@@ -168,10 +171,10 @@ def test_observation_space_matches_registry():
             assert sub.dtype == np.float32
 
 
-def test_action_space_is_discrete_154():
+def test_action_space_is_discrete_155():
     space = spaces.build_action_space()
     assert space == gym.spaces.Discrete(interface.ACTION_DIM)
-    assert space.n == 154
+    assert space.n == 155
 
 
 def test_build_spaces_returns_pair():
