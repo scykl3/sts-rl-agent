@@ -1,0 +1,23 @@
+# Pinned simulation-engine build.
+#
+# The Slay the Spire engine is vendored as a git submodule at
+# engine/sts_lightspeed and built out of tree (scripts/build_engine.sh). This
+# file records the exact commit and build settings so runs are reproducible and
+# the pinned commit can be reported in the environment's `engine_commit` info
+# field without shelling out to git. The submodule itself is the source of truth
+# for the checkout; this mirror is the machine-readable pin.
+
+[engine]
+repo = "https://github.com/maxy1991991/sts_lightspeed"
+branch = "portable-build"
+commit = "04f763aa880c92a2ff74cc48ba7c5d1cdc174b57"
+module = "slaythespire"
+upstream = "https://github.com/daniel-ziegler/sts_lightspeed"
+
+[build]
+# CMake >= 4 removed compatibility with the very old cmake_minimum_required
+# declared by the vendored nlohmann/json; this policy floor lets it configure.
+cmake_policy_version_minimum = "3.5"
+cxx_standard = 20
+# Nested submodules initialized for the build (CommunicationMod is not needed).
+nested_submodules = ["json", "pybind11"]
