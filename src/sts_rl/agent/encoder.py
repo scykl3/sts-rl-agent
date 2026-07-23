@@ -15,7 +15,7 @@ to the hand/enemy slot order, so do NOT reorder):
 
     hand block   HAND_MAX * (CARD_EMBED_DIM + HAND_FEAT_DIM)
     enemy block  MAX_ENEMIES * (ENEMY_EMBED_DIM + ENEMY_SCALAR_DIM
-                                + N_INTENT + N_POWER_IDS + 1)
+                                + MOVE_EMBED_DIM + 1 + N_MONSTER_POWER_IDS + 1)
     pile blocks  3 * (2 * CARD_EMBED_DIM)   (draw, discard, exhaust; mean+max)
     potion block POTION_SLOTS * POTION_EMBED_DIM + POTION_SLOTS
     passthrough  relics_multihot + player_powers + player_scalars
@@ -34,10 +34,11 @@ from sts_rl.interface import (
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
     N_CARD_IDS,
-    N_INTENT,
     N_MONSTER_IDS,
+    N_MONSTER_MOVE_IDS,
+    N_MONSTER_POWER_IDS,
+    N_PLAYER_POWER_IDS,
     N_POTION_IDS,
-    N_POWER_IDS,
     N_RELIC_IDS,
     N_SCREENS,
     OBS_FIELDS,
@@ -51,6 +52,7 @@ from sts_rl.interface import (
 # drive most decisions (widest), monsters fewer, potions fewest.
 CARD_EMBED_DIM = 32
 ENEMY_EMBED_DIM = 16
+MOVE_EMBED_DIM = 16  # enemy next-move (MonsterMoveId) embedding
 POTION_EMBED_DIM = 8
 
 # Piles are pooled with BOTH mean and max, so each pile contributes 2 vectors.
@@ -86,6 +88,7 @@ class ObsFeatureEncoder(nn.Module):
         # pad slots (ids == PAD_ID) contribute nothing and receive no gradient.
         self.card_embed = nn.Embedding(N_CARD_IDS, CARD_EMBED_DIM, padding_idx=PAD_ID)
         self.enemy_embed = nn.Embedding(N_MONSTER_IDS, ENEMY_EMBED_DIM, padding_idx=PAD_ID)
+        self.move_embed = nn.Embedding(N_MONSTER_MOVE_IDS, MOVE_EMBED_DIM, padding_idx=PAD_ID)
         self.potion_embed = nn.Embedding(N_POTION_IDS, POTION_EMBED_DIM, padding_idx=PAD_ID)
 
         self.feature_dim = self._compute_feature_dim()
@@ -103,10 +106,15 @@ class ObsFeatureEncoder(nn.Module):
     def _compute_feature_dim() -> int:
         """Concat width, derived entirely from the interface constants (no literals)."""
         hand = HAND_MAX * (CARD_EMBED_DIM + HAND_FEAT_DIM)
-        enemy = MAX_ENEMIES * (ENEMY_EMBED_DIM + ENEMY_SCALAR_DIM + N_INTENT + N_POWER_IDS + 1)
+        # per enemy: id embed | scalars | move embed | intent-hidden flag | powers | alive
+        enemy = MAX_ENEMIES * (
+            ENEMY_EMBED_DIM + ENEMY_SCALAR_DIM + MOVE_EMBED_DIM + 1 + N_MONSTER_POWER_IDS + 1
+        )
         piles = _N_PILES * (_PILE_POOLS * CARD_EMBED_DIM)
         potion = POTION_SLOTS * POTION_EMBED_DIM + POTION_SLOTS
-        passthrough = N_RELIC_IDS + N_POWER_IDS + PLAYER_SCALAR_DIM + N_SCREENS + MAP_CONTEXT_DIM
+        passthrough = (
+            N_RELIC_IDS + N_PLAYER_POWER_IDS + PLAYER_SCALAR_DIM + N_SCREENS + MAP_CONTEXT_DIM
+        )
         return hand + enemy + piles + potion + passthrough
 
     def _pool_pile(self, pile_ids: Tensor) -> Tensor:
@@ -146,13 +154,15 @@ class ObsFeatureEncoder(nn.Module):
         hand = torch.cat([hand_emb, obs["hand_feats"]], dim=2)  # (B, HAND_MAX, C+F)
         hand = hand.reshape(batch, -1)
 
-        # ENEMY: per-slot [enemy_embed | scalars | intent | powers | alive].
+        # ENEMY: per-slot [enemy_embed | scalars | move_embed | intent_hidden | powers | alive].
         enemy_emb = self.enemy_embed(obs["enemy_ids"].long())  # (B, MAX_ENEMIES, E)
+        move_emb = self.move_embed(obs["enemy_move_ids"].long())  # (B, MAX_ENEMIES, M)
         enemy = torch.cat(
             [
                 enemy_emb,
                 obs["enemy_scalars"],
-                obs["enemy_intent"],
+                move_emb,
+                obs["enemy_intent_hidden"].unsqueeze(-1),
                 obs["enemy_powers"],
                 obs["enemy_alive"].unsqueeze(-1),
             ],
