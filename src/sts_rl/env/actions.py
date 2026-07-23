@@ -9,11 +9,12 @@ the engine's ``execute`` on an invalid action is undefined (it can abort the
 process), so an action is never executed without first checking legality.
 
 Coverage in combat: end turn, playing a card (targeted or untargeted), using or
-discarding a potion, and an in-combat single-card selection. A potion is routed
-to the targeted or untargeted block by the engine's own ``potion_requires_target``,
-so nothing about potion targeting is hardcoded here. The non-combat blocks (card
-reward, map, shop, rest, event, boss relic, proceed) belong to a later run-mode
-adapter and are masked off here.
+discarding a potion, an in-combat single-card selection, and confirming a
+sequential multi-select (exhaust-many / gamble) via CONFIRM_SELECT. A potion is
+routed to the targeted or untargeted block by the engine's own
+``potion_requires_target``, so nothing about potion targeting is hardcoded here.
+The non-combat blocks (card reward, map, shop, rest, event, boss relic, proceed)
+belong to a later run-mode adapter and are masked off here.
 """
 
 from __future__ import annotations
@@ -50,12 +51,13 @@ _USE_POTION_TARGETED = ACTION_BLOCK_BY_NAME["USE_POTION_TARGETED"].start
 _USE_POTION_UNTARGETED = ACTION_BLOCK_BY_NAME["USE_POTION_UNTARGETED"].start
 _DISCARD_POTION = ACTION_BLOCK_BY_NAME["DISCARD_POTION"].start
 _CARD_SELECT = ACTION_BLOCK_BY_NAME["CARD_SELECT"].start
+_CONFIRM_SELECT = ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].start
 
 # Sequential multi-pick card-select tasks: the engine resolves these by
-# accumulating single picks and then confirming with a MULTI_CARD_SELECT that
-# carries the running selection. The binding does not expose that running
-# selection, and the contract action space has no confirm index, so these are
-# not exposed to the agent; they are auto-resolved (see auto_resolve).
+# accumulating single picks (each a SINGLE_CARD_SELECT that re-opens the screen)
+# and then confirming with a MULTI_CARD_SELECT carrying the running selection.
+# The agent drives them directly: single picks plus the CONFIRM_SELECT action,
+# whose engine move is MULTI_CARD_SELECT(card_select_selected_bits).
 _MULTI_SELECT_TASKS = (sts.CardSelectTask.EXHAUST_MANY, sts.CardSelectTask.GAMBLE)
 
 # Bound on auto-resolution steps between two agent actions; far above any real
@@ -109,6 +111,11 @@ def decode_action(index: int, bc: Any) -> Any | None:
         return sts.Action(action_type.POTION, slot, _DISCARD_TARGET)
     if _CARD_SELECT <= index < _CARD_SELECT + ACTION_BLOCK_BY_NAME["CARD_SELECT"].count:
         return sts.Action(action_type.SINGLE_CARD_SELECT, index - _CARD_SELECT)
+    if index == _CONFIRM_SELECT:
+        # Confirm a sequential multi-select by applying the engine's running
+        # selection. Only legal in an EXHAUST_MANY/GAMBLE state; the caller gates
+        # on is_valid_action, so a stray confirm elsewhere is rejected.
+        return sts.Action(action_type.MULTI_CARD_SELECT, bc.card_select_selected_bits)
     return None
 
 
@@ -147,10 +154,9 @@ def build_mask(bc: Any) -> Mask:
 
     The mask may legitimately be all-False on a *non-terminal* state whose only
     legal engine moves are not representable in the contract action space (a
-    sequential multi-select confirm, or a pile-select pick beyond ``CHOICE_MAX``).
-    Callers that hand the mask to an agent must first call :func:`auto_resolve`
-    to advance past such states; this function does not mutate ``bc`` or assert
-    the mask is non-empty.
+    pile-select pick beyond ``CHOICE_MAX``). Callers that hand the mask to an
+    agent must first call :func:`auto_resolve` to advance past such states; this
+    function does not mutate ``bc`` or assert the mask is non-empty.
     """
     mask = np.zeros(ACTION_DIM, dtype=np.bool_)
 
@@ -172,12 +178,15 @@ def build_mask(bc: Any) -> Mask:
                 action = sts.Action(sts.ActionType.CARD, hand_slot, _UNTARGETED_PLACEHOLDER_TARGET)
                 mask[_PLAY_UNTARGETED + hand_slot] = action.is_valid_action(bc)
         _mask_potions(bc, mask)
-    elif (
-        input_state == sts.InputState.CARD_SELECT and bc.card_select_task not in _MULTI_SELECT_TASKS
-    ):
+    elif input_state == sts.InputState.CARD_SELECT:
         for choice in range(CHOICE_MAX):
             action = sts.Action(sts.ActionType.SINGLE_CARD_SELECT, choice)
             mask[_CARD_SELECT + choice] = action.is_valid_action(bc)
+        # Sequential multi-select tasks also offer a confirm that applies the
+        # running selection; it is always legal (an empty selection is allowed).
+        if bc.card_select_task in _MULTI_SELECT_TASKS:
+            confirm = sts.Action(sts.ActionType.MULTI_CARD_SELECT, bc.card_select_selected_bits)
+            mask[_CONFIRM_SELECT] = confirm.is_valid_action(bc)
 
     return mask
 
@@ -185,16 +194,13 @@ def build_mask(bc: Any) -> Mask:
 def _fallback_action(bc: Any) -> Any | None:
     """Return an engine action that resolves a state with no representable move.
 
-    For a sequential multi-select (``EXHAUST_MANY``/``GAMBLE``), confirm with an
-    empty selection, which is always legal and exposes none of the sub-game to
-    the agent. For any other card-select task, take the first engine-valid pick
-    across the full pile, covering picks beyond the representable ``CHOICE_MAX``.
-    Returns ``None`` if no fallback applies (not a card-select state).
+    Multi-select tasks are agent-representable (single picks plus CONFIRM_SELECT),
+    so this only handles a single-select task whose only legal picks lie beyond
+    the representable ``CHOICE_MAX`` range: it takes the first engine-valid pick
+    across the full pile. Returns ``None`` if no fallback applies.
     """
     if bc.input_state != sts.InputState.CARD_SELECT:
         return None
-    if bc.card_select_task in _MULTI_SELECT_TASKS:
-        return sts.Action(sts.ActionType.MULTI_CARD_SELECT, 0)
     for choice in range(PILE_MAX):
         action = sts.Action(sts.ActionType.SINGLE_CARD_SELECT, choice)
         if action.is_valid_action(bc):

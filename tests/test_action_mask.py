@@ -28,9 +28,9 @@ from sts_rl.interface import ACTION_BLOCK_BY_NAME, ACTION_DIM, MAX_ENEMIES
 FUZZ_SEEDS = range(220)
 MAX_STEPS_PER_COMBAT = 500
 REGRESSION_SEED = 42
-# A seed whose first combat reaches an EXHAUST_MANY card-select that must be
-# auto-resolved rather than exposed to the agent.
-MULTI_SELECT_SEED = 150
+# Seeds whose first combat reaches an EXHAUST_MANY card-select, exercised as an
+# agent-driven pick-then-confirm sequence.
+MULTI_SELECT_SEEDS = (150, 207, 344, 349)
 
 _TARGETED = ACTION_BLOCK_BY_NAME["PLAY_CARD_TARGETED"]
 _UNTARGETED = ACTION_BLOCK_BY_NAME["PLAY_CARD_UNTARGETED"]
@@ -96,24 +96,56 @@ def test_no_false_positives_over_random_legal_rollouts() -> None:
     assert terminal_reached > 0
 
 
-def test_auto_resolve_handles_multi_select_without_empty_mask() -> None:
-    """A combat that reaches EXHAUST_MANY is driven to terminal without an empty mask.
-
-    Before auto-resolution this state produced an all-False mask on a non-terminal
-    turn; auto_resolve must confirm the multi-select and keep a legal move available.
-    """
+def _reach_multi_select(bc, rng):
+    """Drive random legal play until an EXHAUST_MANY/GAMBLE state, or return None."""
     import slaythespire as sts
 
-    rng = np.random.default_rng(MULTI_SELECT_SEED)
-    _, bc = start_combat(seed=MULTI_SELECT_SEED)
     for _ in range(MAX_STEPS_PER_COMBAT):
-        auto_resolve(bc)  # must not raise on the EXHAUST_MANY confirm state
+        auto_resolve(bc)
         if bc.outcome != sts.BattleOutcome.UNDECIDED:
-            break
+            return None
+        if bc.input_state == sts.InputState.CARD_SELECT and bc.card_select_task in (
+            sts.CardSelectTask.EXHAUST_MANY,
+            sts.CardSelectTask.GAMBLE,
+        ):
+            return bc
         legal = np.flatnonzero(build_mask(bc))
-        assert legal.size > 0
         decode_action(int(rng.choice(legal)), bc).execute(bc)
-    assert bc.outcome != sts.BattleOutcome.UNDECIDED
+    return None
+
+
+@pytest.mark.parametrize("seed", MULTI_SELECT_SEEDS)
+def test_multi_select_exposes_single_picks_and_confirm(seed: int) -> None:
+    """In an EXHAUST_MANY/GAMBLE state the agent sees single picks plus a confirm,
+    and confirm decodes to a valid MULTI_CARD_SELECT applying the running selection."""
+    import slaythespire as sts
+
+    from sts_rl.interface import ACTION_BLOCK_BY_NAME
+
+    bc = _reach_multi_select(start_combat(seed=seed)[1], np.random.default_rng(0))
+    if bc is None:
+        pytest.skip("did not reach a multi-select state for this seed")
+
+    card_select = ACTION_BLOCK_BY_NAME["CARD_SELECT"]
+    confirm = ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].start
+    mask = build_mask(bc)
+
+    assert mask[confirm]  # confirm is always available in a multi-select
+    assert mask[card_select.start : card_select.stop].any()  # at least one card to pick
+    # Confirm decodes to a MULTI applying the current selection, and is valid.
+    confirm_action = decode_action(confirm, bc)
+    assert confirm_action.is_valid_action(bc)
+
+    # Pick one card, then confirm; the task resolves and combat continues. Multi-select
+    # is fully agent-driven now, so no auto-resolution is needed between the two steps.
+    first_pick = int(np.flatnonzero(mask[card_select.start : card_select.stop])[0])
+    decode_action(card_select.start + first_pick, bc).execute(bc)
+    assert auto_resolve(bc) == 0
+    decode_action(confirm, bc).execute(bc)
+    assert bc.input_state != sts.InputState.CARD_SELECT or bc.card_select_task not in (
+        sts.CardSelectTask.EXHAUST_MANY,
+        sts.CardSelectTask.GAMBLE,
+    )
 
 
 def test_potions_are_routed_by_targeting_and_are_decodable() -> None:

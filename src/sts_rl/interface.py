@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.1.0.
+INTERFACE_VERSION 0.2.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.1.0"
+INTERFACE_VERSION: str = "0.2.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -97,6 +97,9 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("EVENT_SELECT", 10),
     ("BOSS_RELIC_SELECT", 4),
     ("PROCEED", 1),
+    # Confirm the running selection of a sequential in-combat multi-select
+    # (EXHAUST_MANY / GAMBLE); appended at the tail so all prior indices are stable.
+    ("CONFIRM_SELECT", 1),
 )
 
 
@@ -114,7 +117,7 @@ ACTION_BLOCKS: tuple[ActionBlock, ...] = _build_action_blocks()
 
 ACTION_DIM: int = sum(block.count for block in ACTION_BLOCKS)
 
-_EXPECTED_ACTION_DIM = 154
+_EXPECTED_ACTION_DIM = 155
 if ACTION_DIM != _EXPECTED_ACTION_DIM:
     raise InterfaceError(
         f"ACTION_DIM miscount: computed {ACTION_DIM}, expected "
