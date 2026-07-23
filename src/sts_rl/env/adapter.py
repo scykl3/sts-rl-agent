@@ -5,7 +5,7 @@ the Gymnasium 5-tuple. It is the combat backbone the rest of the environment
 builds on. Two parts are intentionally still stubbed and will be filled by later
 work:
 
-- Observation: ``reset``/``step`` return a contract-shaped but all-zero
+- Observation: ``reset``/``step`` return an interface-shaped but all-zero
   placeholder observation. The real observation encoder replaces
   :meth:`StsEnv._observation`; the raw engine readout is available now in
   ``info['combat']`` for debugging.
@@ -193,7 +193,7 @@ class StsEnv(gym.Env):
             assert_valid_mask(self._mask)
 
     def _observation(self) -> Obs:
-        """Return a contract-shaped placeholder observation (all zeros).
+        """Return an interface-shaped placeholder observation (all zeros).
 
         Replaced by the observation encoder; the raw readout is in
         ``info['combat']`` meanwhile. Zero is in-bounds for every field (id 0 is

@@ -117,7 +117,15 @@ def _reach_multi_select(bc, rng):
 @pytest.mark.parametrize("seed", MULTI_SELECT_SEEDS)
 def test_multi_select_exposes_single_picks_and_confirm(seed: int) -> None:
     """In an EXHAUST_MANY/GAMBLE state the agent sees single picks plus a confirm,
-    and confirm decodes to a valid MULTI_CARD_SELECT applying the running selection."""
+    a picked index becomes illegal on the next mask while the rest stay pickable,
+    and confirm decodes to a valid MULTI_CARD_SELECT applying the running selection.
+
+    The exclusion invariant (an already-picked index is masked off on the following
+    step) is the load-bearing safety property for agent-driven multi-select: the
+    mask and the execute-gate both call ``is_valid_action`` on the same move, so a
+    broken exclusion would be a false positive invisible to the fuzz rollout. This
+    test re-reads the mask *after* a pick to catch that directly.
+    """
     import slaythespire as sts
 
     from sts_rl.interface import ACTION_BLOCK_BY_NAME
@@ -130,18 +138,35 @@ def test_multi_select_exposes_single_picks_and_confirm(seed: int) -> None:
     confirm = ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].start
     mask = build_mask(bc)
 
-    assert mask[confirm]  # confirm is always available in a multi-select
-    assert mask[card_select.start : card_select.stop].any()  # at least one card to pick
+    assert mask[confirm]  # confirm is available in a multi-select
+    pickable = np.flatnonzero(mask[card_select.start : card_select.stop])
+    # Two distinct picks are needed to exercise pick -> re-check -> pick.
+    if pickable.size < 2:
+        pytest.skip("multi-select state has fewer than two pickable cards")
     # Confirm decodes to a MULTI applying the current selection, and is valid.
+    assert decode_action(confirm, bc).is_valid_action(bc)
+
+    # Pick the first card. Multi-select is fully agent-driven, so no auto-resolution
+    # happens between picks; the state stays in the same CARD_SELECT task.
+    first, second = int(pickable[0]), int(pickable[1])
+    decode_action(card_select.start + first, bc).execute(bc)
+    assert auto_resolve(bc) == 0
+
+    # Re-read the mask: the picked index is now illegal, while every other
+    # previously-legal pick and the confirm stay legal.
+    mask_after = build_mask(bc)
+    assert not mask_after[card_select.start + first]  # already picked -> excluded
+    assert mask_after[confirm]
+    for other in pickable:
+        if int(other) != first:
+            assert mask_after[card_select.start + int(other)]
+
+    # Pick a second card, then confirm; the task resolves and combat continues.
+    decode_action(card_select.start + second, bc).execute(bc)
+    assert auto_resolve(bc) == 0
     confirm_action = decode_action(confirm, bc)
     assert confirm_action.is_valid_action(bc)
-
-    # Pick one card, then confirm; the task resolves and combat continues. Multi-select
-    # is fully agent-driven now, so no auto-resolution is needed between the two steps.
-    first_pick = int(np.flatnonzero(mask[card_select.start : card_select.stop])[0])
-    decode_action(card_select.start + first_pick, bc).execute(bc)
-    assert auto_resolve(bc) == 0
-    decode_action(confirm, bc).execute(bc)
+    confirm_action.execute(bc)
     assert bc.input_state != sts.InputState.CARD_SELECT or bc.card_select_task not in (
         sts.CardSelectTask.EXHAUST_MANY,
         sts.CardSelectTask.GAMBLE,

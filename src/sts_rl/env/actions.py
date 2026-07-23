@@ -1,6 +1,6 @@
 """Decode flat action indices to engine moves and build the legal-action mask.
 
-Both the decode and the mask are derived from a single mapping from a contract
+Both the decode and the mask are derived from a single mapping from an interface
 action index to a concrete engine ``search::Action``. That shared mapping is the
 safety guarantee: the mask marks an index legal only when the exact action it
 maps to passes the engine's ``is_valid_action``, and decode returns that same
@@ -28,6 +28,7 @@ from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     ACTION_DIM,
     CHOICE_MAX,
+    HAND_MAX,
     MAX_ENEMIES,
     PILE_MAX,
     POTION_SLOTS,
@@ -40,8 +41,8 @@ from sts_rl.interface import (
 _UNTARGETED_PLACEHOLDER_TARGET = 0
 
 # A potion target index above the enemy range signals "discard" rather than
-# "drink" to the engine (it checks target_idx > 5).
-_DISCARD_TARGET = 6
+# "drink" to the engine (it checks ``target_idx > MAX_ENEMIES``).
+_DISCARD_TARGET = MAX_ENEMIES + 1
 
 # Block start offsets, resolved once from the shared action layout.
 _END_TURN = ACTION_BLOCK_BY_NAME["END_TURN"].start
@@ -126,7 +127,7 @@ def _mask_potions(bc: Any, mask: Mask) -> None:
     a targeting potion fills its ``USE_POTION_TARGETED`` sub-indices for legal
     enemies, an untargeted one its ``USE_POTION_UNTARGETED`` index; every occupied
     slot also gets its ``DISCARD_POTION`` index. Empty slots, and slots beyond the
-    contract's ``POTION_SLOTS`` cap, contribute nothing. Every bit is gated on
+    interface's ``POTION_SLOTS`` cap, contribute nothing. Every bit is gated on
     ``is_valid_action``.
     """
     for slot, potion in enumerate(bc.potions):
@@ -153,7 +154,7 @@ def build_mask(bc: Any) -> Mask:
     ``is_valid_action``, so decoding and executing any set index is safe.
 
     The mask may legitimately be all-False on a *non-terminal* state whose only
-    legal engine moves are not representable in the contract action space (a
+    legal engine moves are not representable in the interface action space (a
     pile-select pick beyond ``CHOICE_MAX``). Callers that hand the mask to an
     agent must first call :func:`auto_resolve` to advance past such states; this
     function does not mutate ``bc`` or assert the mask is non-empty.
@@ -168,6 +169,8 @@ def build_mask(bc: Any) -> Mask:
         end_turn = sts.Action(sts.ActionType.END_TURN)
         mask[_END_TURN] = end_turn.is_valid_action(bc)
         for hand_slot in range(bc.cards.cardsInHand):
+            if hand_slot >= HAND_MAX:
+                break
             card = bc.cards.hand[hand_slot]
             if card.requiresTarget():
                 base = _PLAY_TARGETED + hand_slot * MAX_ENEMIES
@@ -183,7 +186,7 @@ def build_mask(bc: Any) -> Mask:
             action = sts.Action(sts.ActionType.SINGLE_CARD_SELECT, choice)
             mask[_CARD_SELECT + choice] = action.is_valid_action(bc)
         # Sequential multi-select tasks also offer a confirm that applies the
-        # running selection; it is always legal (an empty selection is allowed).
+        # running selection; the bit is gated on the engine's is_valid_action.
         if bc.card_select_task in _MULTI_SELECT_TASKS:
             confirm = sts.Action(sts.ActionType.MULTI_CARD_SELECT, bc.card_select_selected_bits)
             mask[_CONFIRM_SELECT] = confirm.is_valid_action(bc)
