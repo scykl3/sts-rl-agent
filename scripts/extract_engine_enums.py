@@ -81,6 +81,12 @@ def header_enum_members(header: str, enum_name: str) -> dict[str, int] | None:
     if not path.is_file():
         return None
     text = path.read_text()
+    # Strip comments from the whole header before locating the enum body. The
+    # body match below is non-greedy up to the first ``}``, so a ``}`` inside a
+    # comment in the enum body would truncate the match and under-report the max
+    # id. Removing comments first makes the body match see only real code.
+    text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
     match = re.search(
         r"enum\s+class\s+" + re.escape(enum_name) + r"\s*(?::[^{]+)?\{(.*?)\}",
         text,
@@ -88,8 +94,7 @@ def header_enum_members(header: str, enum_name: str) -> dict[str, int] | None:
     )
     if not match:
         return None
-    body = re.sub(r"//[^\n]*", "", match.group(1))
-    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    body = match.group(1)
     members: dict[str, int] = {}
     value = -1
     for token in body.split(","):

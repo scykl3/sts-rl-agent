@@ -1,6 +1,7 @@
 """Single import point for the compiled Slay the Spire engine module.
 
-The engine (``daniel-ziegler/sts_lightspeed``) is a C++ project vendored as a git
+The engine (originally ``daniel-ziegler/sts_lightspeed``, vendored via a
+build-portability fork; see the README) is a C++ project vendored as a git
 submodule and built out of tree; its Python binding compiles to a ``slaythespire``
 shared module under ``engine/sts_lightspeed/build/``. That directory is not on
 ``sys.path`` by default, so every part of the environment adapter imports the
@@ -35,13 +36,13 @@ class EngineNotBuiltError(ImportError):
 
 
 def _load() -> ModuleType:
-    if ENGINE_BUILD_DIR.is_dir():
-        build_dir = str(ENGINE_BUILD_DIR)
-        # Append rather than prepend: the engine module has a unique name, so we
-        # need only make it importable, not shadow any earlier path entry.
-        if build_dir not in sys.path:
-            sys.path.append(build_dir)
     try:
+        if ENGINE_BUILD_DIR.is_dir():
+            build_dir = str(ENGINE_BUILD_DIR)
+            # Append rather than prepend: the engine module has a unique name, so
+            # we need only make it importable, not shadow any earlier path entry.
+            if build_dir not in sys.path:
+                sys.path.append(build_dir)
         return importlib.import_module(_MODULE_NAME)
     except ImportError as exc:
         raise EngineNotBuiltError(

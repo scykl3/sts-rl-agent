@@ -43,9 +43,18 @@ git -C "$ENGINE_DIR" submodule update --init json pybind11
 
 # Configure. CMAKE_POLICY_VERSION_MINIMUM=3.5 lets the vendored nlohmann/json,
 # which declares a very old cmake_minimum_required, configure under CMake >= 4.
+#
+# Pin the interpreter with every spelling CMake might consult: the legacy
+# -DPYTHON_EXECUTABLE (old FindPythonInterp) plus the modern
+# -DPython_EXECUTABLE / -DPython3_EXECUTABLE that current FindPython and pybind11
+# actually honor. Passing only the legacy name lets a newer CMake fall back to
+# autodetection and build against the wrong interpreter, producing an import or
+# ABI mismatch when the module is loaded from "$PYTHON".
 echo ">> configuring"
 "$CMAKE" -B "$ENGINE_DIR/build" -S "$ENGINE_DIR" \
     -DPYTHON_EXECUTABLE="$PYTHON" \
+    -DPython_EXECUTABLE="$PYTHON" \
+    -DPython3_EXECUTABLE="$PYTHON" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
 # Build only the Python module target (not the console sim or benchmarks).
