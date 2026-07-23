@@ -156,3 +156,38 @@ def test_iter_minibatches_rejects_nonpositive_size():
     for bad in (0, -1):
         with pytest.raises(ValueError):
             list(buffer.iter_minibatches(bad))
+
+
+def test_compute_advantages_on_empty_buffer_raises():
+    """Empty buffer gives a clear error, not an opaque torch.stack failure."""
+    buffer = RolloutBuffer()
+    with pytest.raises(RuntimeError):
+        buffer.compute_advantages(torch.zeros(()))
+
+
+def test_stored_tensors_do_not_alias_caller_memory():
+    """Mutating a passed obs/mask in place after add must not reach the buffer.
+
+    add stores .detach().clone() copies, so the buffer owns its data.
+    """
+    buffer = RolloutBuffer()
+    full = sample_observation_batch(1)
+    obs = {key: value[0] for key, value in full.items()}
+    original_field = obs[SAMPLE_FIELD].clone()
+    mask = torch.ones(ACTION_DIM, dtype=torch.bool)
+    buffer.add(
+        obs=obs,
+        action=torch.tensor(0),
+        log_prob=torch.zeros(()),
+        value=torch.zeros(()),
+        reward=0.0,
+        done=1.0,
+        mask=mask,
+    )
+    # Mutate the caller's tensors in place AFTER add; the buffer must not see it.
+    obs[SAMPLE_FIELD].add_(99.0)
+    mask[0] = False
+    buffer.compute_advantages(torch.zeros(()))
+    batch = next(iter(buffer.iter_minibatches(1, shuffle=False)))
+    assert torch.equal(batch.obs[SAMPLE_FIELD][0], original_field)
+    assert bool(batch.masks[0, 0])  # still legal despite the caller's in-place edit

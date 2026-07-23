@@ -73,23 +73,25 @@ class RolloutBuffer:
     ) -> None:
         """Append one transition.
 
-        Tensors are stored ``.detach()``ed so a buffered rollout never retains
-        the autograd graph that produced its log-probs/values: the update path
-        recomputes fresh, grad-tracked values from the stored obs, and keeping
-        the old graph alive would leak memory and risk a double-backward.
+        Tensors are stored ``.detach().clone()``d: detached so a buffered
+        rollout never retains the autograd graph that produced its
+        log-probs/values (the update path recomputes fresh grad-tracked values
+        from the stored obs, and keeping the old graph alive would leak memory
+        and risk a double-backward), and cloned so the buffer owns its copy and
+        is immune to a caller mutating the passed tensors in place after ``add``.
 
         ``done`` must be the TERMINAL flag used for bootstrapping (``1.0`` iff
         the episode truly ended at this step), NOT a time-limit truncation:
         :func:`compute_gae` zeroes the value bootstrap on a done, so a
         truncation flagged as done would wrongly discard the tail value.
         """
-        self._obs.append({key: tensor.detach() for key, tensor in obs.items()})
-        self._actions.append(action.detach())
-        self._log_probs.append(log_prob.detach())
-        self._values.append(value.detach())
+        self._obs.append({key: tensor.detach().clone() for key, tensor in obs.items()})
+        self._actions.append(action.detach().clone())
+        self._log_probs.append(log_prob.detach().clone())
+        self._values.append(value.detach().clone())
         self._rewards.append(reward)
         self._dones.append(done)
-        self._masks.append(mask.detach())
+        self._masks.append(mask.detach().clone())
 
     def __len__(self) -> int:
         return len(self._actions)
@@ -109,6 +111,10 @@ class RolloutBuffer:
         advantage normalization is the training loop's job, not the buffer's,
         matching :func:`compute_gae`'s own contract.
         """
+        if not self._actions:
+            raise RuntimeError(
+                "compute_advantages requires at least one transition; call add() first"
+            )
         rewards = torch.tensor(self._rewards, dtype=torch.float32)
         dones = torch.tensor(self._dones, dtype=torch.float32)
         values = torch.stack(self._values).to(torch.float32)
