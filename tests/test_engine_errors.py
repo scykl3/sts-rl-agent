@@ -3,17 +3,22 @@
 These do not need the native engine build. ``start_combat``'s three failure
 branches (run ended, no legal actions, navigation budget exhausted) are driven
 with a small fake engine injected in place of the real bindings, so they run on
-any machine. The loader's not-built path is exercised by forcing the underlying
-import to fail; it skips cleanly when the engine is absent.
+any machine. The loader's not-built path is exercised by loading a fresh copy of
+``_engine.py`` with the underlying import forced to fail, so it runs whether or
+not the engine is present.
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+_ENGINE_SOURCE = Path(__file__).resolve().parents[1] / "src" / "sts_rl" / "env" / "_engine.py"
 
 # Sentinel screen/outcome values for the fake engine. Their identity is all that
 # matters: ``start_combat`` only compares them against the fake's own enums.
@@ -91,19 +96,31 @@ def test_start_combat_raises_when_nav_budget_exhausted(
         engine.start_combat(seed=1, max_nav_actions=max_nav)
 
 
-def test_load_raises_engine_not_built(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The loader wraps an import failure as EngineNotBuiltError.
+def test_load_wraps_import_error_as_engine_not_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loader wraps a failed engine import as EngineNotBuiltError.
 
-    Skips when the engine is not built (importing ``_engine`` would already
-    raise), consistent with the engine binding smoke tests.
+    Build-independent: rather than importing the installed module (which only
+    fails when the engine is genuinely absent, and whose import error this
+    pytest surfaces as an error rather than a skip), load a fresh copy of
+    ``_engine.py`` from source with ``importlib.import_module`` patched to fail.
+    The module's top-level ``_load()`` then takes the error-wrapping path whether
+    or not the native engine is present.
     """
-    _engine = pytest.importorskip("sts_rl.env._engine")
 
-    def _raise(_name: str) -> ModuleType:
+    def _raise(_name: str, _package: str | None = None) -> ModuleType:
         raise ImportError("simulated missing engine module")
 
-    monkeypatch.setattr(_engine.importlib, "import_module", _raise)
-    with pytest.raises(_engine.EngineNotBuiltError) as excinfo:
-        _engine._load()
-    # The message points the user at the build script.
-    assert _engine._BUILD_COMMAND in str(excinfo.value)
+    monkeypatch.setattr(importlib, "import_module", _raise)
+
+    spec = importlib.util.spec_from_file_location("sts_rl_engine_under_test", _ENGINE_SOURCE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+
+    # EngineNotBuiltError subclasses ImportError; assert the wrapped message names
+    # the build command. _BUILD_COMMAND is assigned before _load() runs, so it is
+    # populated on the partially-initialized module even though exec_module raised.
+    with pytest.raises(ImportError) as excinfo:
+        spec.loader.exec_module(module)
+    assert module._BUILD_COMMAND in str(excinfo.value)
