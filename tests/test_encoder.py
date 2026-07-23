@@ -8,7 +8,6 @@ rather than a hardcoded literal.
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 
 from sts_rl import interface
@@ -20,12 +19,9 @@ from sts_rl.agent.encoder import (
     _N_PILES,
     _PILE_POOLS,
 )
-from sts_rl.env import spaces
+from conftest import ID_FIELDS, sample_observation_batch
 
 BATCH = 2
-
-# Field names whose dtype is an id (embedding index) -> long tensors.
-_ID_FIELDS = {f.name for f in interface.OBS_FIELDS if f.bounds == "id"}
 
 
 def _expected_feature_dim() -> int:
@@ -55,24 +51,9 @@ def _expected_feature_dim() -> int:
     return hand + enemy + piles + potion + passthrough
 
 
-def _sample_batch(batch: int = BATCH) -> dict[str, torch.Tensor]:
-    """Stack ``batch`` interface-space samples into batched torch tensors."""
-    space = spaces.build_observation_space()
-    space.seed(0)
-    samples = [space.sample() for _ in range(batch)]
-    obs: dict[str, torch.Tensor] = {}
-    for field in interface.OBS_FIELDS:
-        stacked = np.stack([s[field.name] for s in samples], axis=0)
-        if field.name in _ID_FIELDS:
-            obs[field.name] = torch.as_tensor(stacked, dtype=torch.long)
-        else:
-            obs[field.name] = torch.as_tensor(stacked, dtype=torch.float32)
-    return obs
-
-
 def test_forward_output_shape():
     enc = ObsFeatureEncoder()
-    out = enc(_sample_batch())
+    out = enc(sample_observation_batch(BATCH))
     assert out.shape == (BATCH, enc.output_dim)
 
 
@@ -81,13 +62,13 @@ def test_feature_dim_matches_interface():
     expected = _expected_feature_dim()
     assert enc.feature_dim == expected
     # And the actual concat produced at runtime has that width.
-    feats = enc.encode_features(_sample_batch())
+    feats = enc.encode_features(sample_observation_batch(BATCH))
     assert feats.shape == (BATCH, expected)
 
 
 def test_output_is_finite():
     enc = ObsFeatureEncoder()
-    out = enc(_sample_batch())
+    out = enc(sample_observation_batch(BATCH))
     assert torch.isfinite(out).all()
 
 
@@ -100,7 +81,10 @@ def test_accepts_float64_observations():
     ``torch.as_tensor(numpy_float64_array)``.
     """
     enc = ObsFeatureEncoder()
-    obs64 = {name: (t if name in _ID_FIELDS else t.double()) for name, t in _sample_batch().items()}
+    obs64 = {
+        name: (t if name in ID_FIELDS else t.double())
+        for name, t in sample_observation_batch(BATCH).items()
+    }
     out = enc(obs64)
     assert out.shape == (BATCH, enc.output_dim)
     assert out.dtype == torch.float32
@@ -133,7 +117,7 @@ def test_all_pad_id_fields_contribute_zero_embedding():
 
 def test_gradient_flows_to_embeddings():
     enc = ObsFeatureEncoder()
-    out = enc(_sample_batch())
+    out = enc(sample_observation_batch(BATCH))
     out.sum().backward()
     assert enc.card_embed.weight.grad is not None
     assert enc.enemy_embed.weight.grad is not None
@@ -143,7 +127,7 @@ def test_gradient_flows_to_embeddings():
 def test_deterministic_in_eval_mode():
     enc = ObsFeatureEncoder()
     enc.eval()
-    obs = _sample_batch()
+    obs = sample_observation_batch(BATCH)
     with torch.no_grad():
         first = enc(obs)
         second = enc(obs)
