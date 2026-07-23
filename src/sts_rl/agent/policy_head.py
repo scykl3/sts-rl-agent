@@ -22,7 +22,6 @@ NaN even the finite path once every logit is driven to the floor).
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor, nn
 from torch.distributions import Categorical
 
@@ -68,6 +67,14 @@ class MaskedPolicyHead(nn.Module):
                 f"mask shape {tuple(mask.shape)} does not match logits shape "
                 f"{tuple(logits.shape)} (no broadcasting allowed)"
             )
+        # Both tensors must be on the same device or masked_fill raises a raw
+        # torch error. Surface it as a domain error rather than moving the mask
+        # silently: a hidden host<->device copy on the hot rollout path would
+        # mask a real device-placement bug.
+        if mask.device != logits.device:
+            raise InterfaceError(
+                f"mask device {mask.device} does not match logits device {logits.device}"
+            )
         legal = mask.bool()
         # Every row needs at least one legal action; a fully-masked row would
         # drive all its logits to the floor and yield a uniform distribution
@@ -77,10 +84,10 @@ class MaskedPolicyHead(nn.Module):
                 "mask has a fully-masked row with no legal action "
                 "(would sample uniformly over illegal actions)"
             )
-        # torch.where keeps this differentiable w.r.t. the legal logits while
-        # replacing (not adding to) the illegal ones with the finite floor.
-        floor = torch.full_like(logits, MASKED_LOGIT)
-        return torch.where(legal, logits, floor)
+        # masked_fill overwrites the illegal positions with the finite floor in
+        # one fused op (no full_like allocation on the hot rollout path) and
+        # stays differentiable w.r.t. the untouched legal logits.
+        return logits.masked_fill(~legal, MASKED_LOGIT)
 
     def forward(self, features: Tensor, mask: Tensor) -> Tensor:
         """Return masked logits of shape ``(B, action_dim)``.

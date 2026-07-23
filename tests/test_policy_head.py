@@ -200,6 +200,19 @@ def test_unbatched_mask_raises_instead_of_broadcasting():
         head(_features(), unbatched)
 
 
+def test_device_mismatch_raises_domain_error():
+    """A mask on a different device raises InterfaceError, not a raw torch error.
+
+    Uses the ``meta`` device (no real allocation, no GPU needed) so the guard
+    is exercised on a CPU-only machine; shape matches so the device check, not
+    the shape check, is what fires.
+    """
+    head = MaskedPolicyHead()
+    meta_mask = torch.ones(BATCH, interface.ACTION_DIM, dtype=torch.bool, device="meta")
+    with pytest.raises(InterfaceError):
+        head(_features(), meta_mask)
+
+
 def test_non_bool_mask_is_coerced():
     """An int/float 0/1 mask is accepted and matches the bool-mask result."""
     head = MaskedPolicyHead()
