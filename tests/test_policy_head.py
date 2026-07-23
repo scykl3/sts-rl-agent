@@ -16,34 +16,16 @@ import torch
 from sts_rl import interface
 from sts_rl.agent.encoder import HIDDEN_DIM, ObsFeatureEncoder
 from sts_rl.agent.policy_head import MASKED_LOGIT, MaskedPolicyHead
-from sts_rl.env import spaces
 from sts_rl.interface import InterfaceError
+from conftest import sample_observation_batch
 
 BATCH = 3
-
-# Field names whose dtype is an id (embedding index) -> long tensors.
-_ID_FIELDS = {f.name for f in interface.OBS_FIELDS if f.bounds == "id"}
-
-
-def _sample_batch(batch: int = BATCH) -> dict[str, torch.Tensor]:
-    """Stack ``batch`` interface-space samples into batched torch tensors."""
-    space = spaces.build_observation_space()
-    space.seed(0)
-    samples = [space.sample() for _ in range(batch)]
-    obs: dict[str, torch.Tensor] = {}
-    for field in interface.OBS_FIELDS:
-        stacked = np.stack([s[field.name] for s in samples], axis=0)
-        if field.name in _ID_FIELDS:
-            obs[field.name] = torch.as_tensor(stacked, dtype=torch.long)
-        else:
-            obs[field.name] = torch.as_tensor(stacked, dtype=torch.float32)
-    return obs
 
 
 def _features(batch: int = BATCH) -> torch.Tensor:
     """Trunk features for a sampled batch (detached from the encoder graph)."""
     enc = ObsFeatureEncoder()
-    return enc(_sample_batch(batch)).detach()
+    return enc(sample_observation_batch(batch)).detach()
 
 
 def _random_valid_mask(batch: int, seed: int = 0) -> torch.Tensor:
