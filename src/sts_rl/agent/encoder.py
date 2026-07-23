@@ -88,6 +88,7 @@ class ObsFeatureEncoder(nn.Module):
         # pad slots (ids == PAD_ID) contribute nothing and receive no gradient.
         self.card_embed = nn.Embedding(N_CARD_IDS, CARD_EMBED_DIM, padding_idx=PAD_ID)
         self.enemy_embed = nn.Embedding(N_MONSTER_IDS, ENEMY_EMBED_DIM, padding_idx=PAD_ID)
+        # MonsterMoveId INVALID=0, so PAD_ID doubles as the empty-slot / hidden-intent row.
         self.move_embed = nn.Embedding(N_MONSTER_MOVE_IDS, MOVE_EMBED_DIM, padding_idx=PAD_ID)
         self.potion_embed = nn.Embedding(N_POTION_IDS, POTION_EMBED_DIM, padding_idx=PAD_ID)
 

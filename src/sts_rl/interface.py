@@ -51,7 +51,8 @@ N_MONSTER_POWER_IDS = 42  # MonsterStatus; engine max id 41
 N_MONSTER_IDS = 66
 # The engine has no Intent enum; an enemy's next move is its raw MonsterMoveId,
 # fed through a learned embedding (like card/relic/monster ids). Predicted base
-# damage and hit count stay as scalars in enemy_scalars.
+# damage and hit count stay as scalars in enemy_scalars. MonsterMoveId INVALID=0
+# so id 0 doubles as PAD (empty slot / hidden intent), like the other id tables.
 N_MONSTER_MOVE_IDS = 197  # MonsterMoveId; engine max id 196
 N_NODE_TYPES = 8  # Room (real node types); engine max id 7
 N_SCREENS = 12  # ScreenState; engine max id 9
