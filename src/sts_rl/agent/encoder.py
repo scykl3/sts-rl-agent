@@ -42,7 +42,6 @@ from sts_rl.interface import (
     N_SCREENS,
     OBS_FIELDS,
     PAD_ID,
-    PILE_MAX,
     PLAYER_SCALAR_DIM,
     POTION_SLOTS,
 )
@@ -104,14 +103,10 @@ class ObsFeatureEncoder(nn.Module):
     def _compute_feature_dim() -> int:
         """Concat width, derived entirely from the interface constants (no literals)."""
         hand = HAND_MAX * (CARD_EMBED_DIM + HAND_FEAT_DIM)
-        enemy = MAX_ENEMIES * (
-            ENEMY_EMBED_DIM + ENEMY_SCALAR_DIM + N_INTENT + N_POWER_IDS + 1
-        )
+        enemy = MAX_ENEMIES * (ENEMY_EMBED_DIM + ENEMY_SCALAR_DIM + N_INTENT + N_POWER_IDS + 1)
         piles = _N_PILES * (_PILE_POOLS * CARD_EMBED_DIM)
         potion = POTION_SLOTS * POTION_EMBED_DIM + POTION_SLOTS
-        passthrough = (
-            N_RELIC_IDS + N_POWER_IDS + PLAYER_SCALAR_DIM + N_SCREENS + MAP_CONTEXT_DIM
-        )
+        passthrough = N_RELIC_IDS + N_POWER_IDS + PLAYER_SCALAR_DIM + N_SCREENS + MAP_CONTEXT_DIM
         return hand + enemy + piles + potion + passthrough
 
     def _pool_pile(self, pile_ids: Tensor) -> Tensor:
@@ -138,10 +133,7 @@ class ObsFeatureEncoder(nn.Module):
         promote the concat to double and the trunk's Linear then raises
         "mat1 and mat2 must have the same dtype".
         """
-        return {
-            name: (t if name in _ID_FIELDS else t.float())
-            for name, t in obs.items()
-        }
+        return {name: (t if name in _ID_FIELDS else t.float()) for name, t in obs.items()}
 
     def encode_features(self, obs: dict[str, Tensor]) -> Tensor:
         """Build the pre-trunk concat of shape ``(B, feature_dim)``."""
@@ -180,9 +172,7 @@ class ObsFeatureEncoder(nn.Module):
 
         # POTION: embed each slot, flatten, then append the usable flags.
         potion_emb = self.potion_embed(obs["potion_ids"].long())  # (B, SLOTS, P)
-        potion = torch.cat(
-            [potion_emb.reshape(batch, -1), obs["potion_usable"]], dim=1
-        )
+        potion = torch.cat([potion_emb.reshape(batch, -1), obs["potion_usable"]], dim=1)
 
         # Pass-through float vectors (already fixed-width per the interface).
         passthrough = torch.cat(
