@@ -59,6 +59,28 @@ evidence section filled in from real results (benchmarks, learning curves) as th
 corresponding phase lands. It is not in the repository yet because implementation
 is just starting.
 
+## Engine dependency and fork
+
+The engine originates from
+[`daniel-ziegler/sts_lightspeed`](https://github.com/daniel-ziegler/sts_lightspeed).
+The submodule under `engine/sts_lightspeed` does not point at upstream directly:
+it tracks a light fork
+([`maxy1991991/sts_lightspeed`](https://github.com/maxy1991991/sts_lightspeed),
+branch `portable-build`) that carries a build-portability patch. No simulation
+logic is changed, so runs stay RNG-accurate against upstream. Relative to the
+upstream `heart1` tag, the pinned commit adds one change:
+
+- **Portable macOS SDK path.** Upstream hardcodes an absolute SDK path
+  (`/Library/Developer/CommandLineTools/SDKs/MacOSX15.2.sdk`) before the
+  `project()` command, which fails to configure on any machine without that exact
+  SDK. The fork pins that path only when it exists and otherwise lets CMake
+  auto-detect the active SDK.
+
+The patch is kept on a branch (rather than pinning upstream and patching at build
+time) so the exact vendored source is a single submodule checkout. If it lands
+upstream, the submodule can be repointed at `daniel-ziegler/sts_lightspeed` with
+no other change.
+
 ## License and attribution
 
 The `sts_lightspeed` engine is MIT licensed and used as an external dependency.
