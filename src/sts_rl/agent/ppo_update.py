@@ -66,6 +66,7 @@ class PPOStats:
     total_loss: float
     approx_kl: float
     clip_fraction: float
+    grad_norm: float
     n_updates: int
 
 
@@ -91,6 +92,7 @@ def ppo_update(
     total_loss_sum = 0.0
     approx_kl_sum = 0.0
     clip_fraction_sum = 0.0
+    grad_norm_sum = 0.0
     n_updates = 0
 
     for _ in range(config.n_epochs):
@@ -122,13 +124,21 @@ def ppo_update(
 
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(actor_critic.parameters(), config.max_grad_norm)
+            # clip_grad_norm_ returns the pre-clip global grad norm - a free
+            # training-health diagnostic (a spike flags instability).
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                actor_critic.parameters(), config.max_grad_norm
+            )
             optimizer.step()
 
             # Diagnostics only; no_grad so these never retain the autograd graph.
             with torch.no_grad():
-                approx_kl = (mb.old_log_probs - log_prob).mean()
-                ratio = (log_prob - mb.old_log_probs).exp()
+                # Schulman's k3 KL estimator: non-negative and lower-variance
+                # than (old - new).mean(), and the signal a later target_kl
+                # early-stop would read.
+                logratio = log_prob - mb.old_log_probs
+                ratio = logratio.exp()
+                approx_kl = ((ratio - 1.0) - logratio).mean()
                 clip_fraction = ((ratio - 1.0).abs() > config.clip_coef).float().mean()
 
             policy_loss_sum += policy_loss.item()
@@ -137,10 +147,20 @@ def ppo_update(
             total_loss_sum += total_loss.item()
             approx_kl_sum += approx_kl.item()
             clip_fraction_sum += clip_fraction.item()
+            grad_norm_sum += grad_norm.item()
             n_updates += 1
 
     if n_updates == 0:  # empty buffer / no minibatches: avoid divide-by-zero
-        return PPOStats(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        return PPOStats(
+            policy_loss=0.0,
+            value_loss=0.0,
+            entropy=0.0,
+            total_loss=0.0,
+            approx_kl=0.0,
+            clip_fraction=0.0,
+            grad_norm=0.0,
+            n_updates=0,
+        )
 
     return PPOStats(
         policy_loss=policy_loss_sum / n_updates,
@@ -149,5 +169,6 @@ def ppo_update(
         total_loss=total_loss_sum / n_updates,
         approx_kl=approx_kl_sum / n_updates,
         clip_fraction=clip_fraction_sum / n_updates,
+        grad_norm=grad_norm_sum / n_updates,
         n_updates=n_updates,
     )

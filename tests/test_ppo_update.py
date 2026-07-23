@@ -69,6 +69,7 @@ def test_n_updates_matches_epochs_times_minibatches():
         stats.total_loss,
         stats.approx_kl,
         stats.clip_fraction,
+        stats.grad_norm,
     ):
         assert math.isfinite(field)
 
@@ -100,6 +101,8 @@ def test_stats_are_sane():
     )
     assert stats.entropy >= 0.0
     assert 0.0 <= stats.clip_fraction <= 1.0
+    assert stats.approx_kl >= 0.0  # Schulman's k3 estimator is non-negative
+    assert stats.grad_norm >= 0.0
     assert math.isfinite(stats.policy_loss)
     assert math.isfinite(stats.value_loss)
 
