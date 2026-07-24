@@ -25,22 +25,43 @@ EXPECTED_SIZES = [4, 4, 2]
 SAMPLE_FIELD = "player_scalars"
 
 
-def _fill_buffer(buffer: RolloutBuffer, length: int = T) -> dict[str, torch.Tensor]:
+def _fill_buffer(
+    buffer: RolloutBuffer,
+    length: int = T,
+    value_device: str = "cpu",
+    all_device: str | None = None,
+) -> dict[str, torch.Tensor]:
     """Add ``length`` transitions with deterministic actions and random rest.
 
     Actions are ``arange(length)`` so a covering set is trivially identifiable.
-    Returns the batched obs used, for shape assertions on the sample field.
+    ``value_device`` places just the stored value scalars off the CPU default
+    (the rewards/dones colocation test uses ``meta``); everything else stays on
+    CPU. ``all_device``, when set, overrides it and places EVERY stored per-step
+    tensor (obs fields, mask, action, log_prob, value) on that device - the
+    minibatch colocation test uses ``meta``. Returns the batched obs used, for
+    shape assertions on the sample field.
     """
     torch.manual_seed(0)
     full = sample_observation_batch(length)
+    if all_device is not None:
+        value_device = all_device
     mask = torch.ones(ACTION_DIM, dtype=torch.bool)
+    if all_device is not None:
+        mask = mask.to(all_device)
     for t in range(length):
         obs = {key: value[t] for key, value in full.items()}
+        action = torch.tensor(t)
+        log_prob = torch.randn(())
+        if all_device is not None:
+            # sample_observation_batch yields CPU tensors; coerce each field first.
+            obs = {key: tensor.to(all_device) for key, tensor in obs.items()}
+            action = action.to(all_device)
+            log_prob = log_prob.to(all_device)
         buffer.add(
             obs=obs,
-            action=torch.tensor(t),
-            log_prob=torch.randn(()),
-            value=torch.randn(()),
+            action=action,
+            log_prob=log_prob,
+            value=torch.randn((), device=value_device),
             reward=float(torch.randn(())),
             done=1.0 if t == length - 1 else 0.0,
             mask=mask,
@@ -69,6 +90,49 @@ def test_compute_advantages_matches_direct_gae():
     assert buffer.advantages is not None and buffer.returns is not None
     assert torch.allclose(buffer.advantages, expected_adv)
     assert torch.allclose(buffer.returns, expected_ret)
+
+
+def test_compute_advantages_colocates_rewards_on_values_device():
+    """values off the CPU default must not crash GAE on a device mismatch.
+
+    Stored value scalars live on ``meta`` (a CPU-runnable stand-in for a
+    non-default device, as in the policy-head device guard); compute_advantages
+    must build rewards/dones and the last_value bootstrap on that device so
+    compute_gae's delta never mixes a CPU accumulator with on-device values (the
+    latent GPU bug). Only device is asserted - meta tensors carry no real data.
+    """
+    buffer = RolloutBuffer()
+    _fill_buffer(buffer, value_device="meta")
+    buffer.compute_advantages(last_value=torch.tensor(0.0, device="meta"))
+    assert buffer.advantages is not None and buffer.returns is not None
+    assert buffer.advantages.device.type == "meta"
+    assert buffer.returns.device.type == "meta"
+
+
+def test_iter_minibatches_keeps_all_fields_on_data_device():
+    """The shuffle index must live on the data's device, not the CPU default.
+
+    Every stored per-step tensor lives on ``meta`` (a CPU-runnable stand-in for a
+    non-default device). iter_minibatches builds a permutation index and
+    advanced-indexes the stacked tensors with it, so a CPU index would gather
+    off-device on a real GPU; assert every MiniBatch field stays on ``meta``.
+    Only device is checked - meta tensors carry no real data.
+    """
+    buffer = RolloutBuffer()
+    _fill_buffer(buffer, all_device="meta")
+    buffer.compute_advantages(last_value=torch.tensor(0.0, device="meta"))
+
+    batches = list(buffer.iter_minibatches(MINIBATCH))
+    assert batches  # guard against a vacuous pass if no minibatch is yielded
+    for mb in batches:
+        for key, tensor in mb.obs.items():
+            assert tensor.device.type == "meta", key
+        assert mb.masks.device.type == "meta"
+        assert mb.actions.device.type == "meta"
+        assert mb.old_log_probs.device.type == "meta"
+        assert mb.old_values.device.type == "meta"
+        assert mb.advantages.device.type == "meta"
+        assert mb.returns.device.type == "meta"
 
 
 def test_iter_minibatches_covers_every_index_once():
