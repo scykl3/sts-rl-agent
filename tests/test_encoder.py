@@ -15,6 +15,7 @@ from sts_rl import interface
 from sts_rl.agent.encoder import (
     CARD_EMBED_DIM,
     ENEMY_EMBED_DIM,
+    MOVE_EMBED_DIM,
     POTION_EMBED_DIM,
     ObsFeatureEncoder,
     _N_PILES,
@@ -39,15 +40,16 @@ def _expected_feature_dim() -> int:
     enemy = interface.MAX_ENEMIES * (
         ENEMY_EMBED_DIM
         + interface.ENEMY_SCALAR_DIM
-        + interface.N_INTENT
-        + interface.N_POWER_IDS
-        + 1
+        + MOVE_EMBED_DIM
+        + 1  # enemy_intent_hidden
+        + interface.N_MONSTER_POWER_IDS
+        + 1  # enemy_alive
     )
     piles = _N_PILES * (_PILE_POOLS * CARD_EMBED_DIM)
     potion = interface.POTION_SLOTS * POTION_EMBED_DIM + interface.POTION_SLOTS
     passthrough = (
         interface.N_RELIC_IDS
-        + interface.N_POWER_IDS
+        + interface.N_PLAYER_POWER_IDS
         + interface.PLAYER_SCALAR_DIM
         + interface.N_SCREENS
         + interface.MAP_CONTEXT_DIM

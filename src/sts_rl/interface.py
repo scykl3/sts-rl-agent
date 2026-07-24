@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.2.0.
+INTERFACE_VERSION 0.3.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.2.0"
+INTERFACE_VERSION: str = "0.3.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -36,18 +36,26 @@ PILE_MAX = 64
 CHOICE_MAX = 10
 
 # --- Enum cardinalities (confirm against engine enums at startup) ----------
-N_CARD_IDS = 380  # confirm against engine enums
-N_RELIC_IDS = 180  # confirm against engine enums
-N_POTION_IDS = 40  # confirm against engine enums
-N_POWER_IDS = 60  # confirm against engine enums
+N_CARD_IDS = 380  # CardId; engine max id 370
+N_RELIC_IDS = 180  # RelicId; engine max id 179
+N_POTION_IDS = 44  # Potion; engine max id 43
+# Player and monster statuses are two disjoint 0-based enums, so they get
+# separate embedding tables (matching the player_powers / enemy_powers split)
+# rather than one shared id space.
+N_PLAYER_POWER_IDS = 87  # PlayerStatus; engine max id 86
+N_MONSTER_POWER_IDS = 42  # MonsterStatus; engine max id 41
 # N_MONSTER_IDS sizes the enemy embedding table for the engine's MonsterId enum
 # (sts_lightspeed, include/constants/MonsterIds.h): INVALID=0 sentinel through
 # WRITHING_MASS=65 (the max), contiguous, 66 members. Table size = max_id + 1
 # = 66 so raw enum ids 0..65 index rows directly; INVALID=0 doubles as PAD.
 N_MONSTER_IDS = 66
-N_INTENT = 12  # confirm against engine enums
-N_NODE_TYPES = 7  # confirm against engine enums
-N_SCREENS = 12  # confirm against engine enums
+# The engine has no Intent enum; an enemy's next move is its raw MonsterMoveId,
+# fed through a learned embedding (like card/relic/monster ids). Predicted base
+# damage and hit count stay as scalars in enemy_scalars. MonsterMoveId INVALID=0
+# so id 0 doubles as PAD (empty slot / hidden intent), like the other id tables.
+N_MONSTER_MOVE_IDS = 197  # MonsterMoveId; engine max id 196
+N_NODE_TYPES = 8  # Room (real node types); engine max id 7
+N_SCREENS = 12  # ScreenState; engine max id 9
 
 # --- Observation feature widths (named so OBS_FIELDS carries no magic ints) -
 PLAYER_SCALAR_DIM = 8  # hp_cur, hp_max, block, energy, gold, floor, ascension, turn
@@ -169,7 +177,7 @@ class ObsField:
 OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("player_scalars", np.float32, (PLAYER_SCALAR_DIM,), "real"),
     ObsField("relics_multihot", np.float32, (N_RELIC_IDS,), "unit"),
-    ObsField("player_powers", np.float32, (N_POWER_IDS,), "real"),
+    ObsField("player_powers", np.float32, (N_PLAYER_POWER_IDS,), "real"),
     ObsField("potion_ids", np.int32, (POTION_SLOTS,), "id", id_high=N_POTION_IDS - 1),
     ObsField("potion_usable", np.float32, (POTION_SLOTS,), "unit"),
     ObsField("hand_ids", np.int32, (HAND_MAX,), "id", id_high=N_CARD_IDS - 1),
@@ -179,8 +187,9 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("exhaust_ids", np.int32, (PILE_MAX,), "id", id_high=N_CARD_IDS - 1),
     ObsField("enemy_ids", np.int32, (MAX_ENEMIES,), "id", id_high=N_MONSTER_IDS - 1),
     ObsField("enemy_scalars", np.float32, (MAX_ENEMIES, ENEMY_SCALAR_DIM), "real"),
-    ObsField("enemy_intent", np.float32, (MAX_ENEMIES, N_INTENT), "unit"),
-    ObsField("enemy_powers", np.float32, (MAX_ENEMIES, N_POWER_IDS), "real"),
+    ObsField("enemy_move_ids", np.int32, (MAX_ENEMIES,), "id", id_high=N_MONSTER_MOVE_IDS - 1),
+    ObsField("enemy_intent_hidden", np.float32, (MAX_ENEMIES,), "unit"),
+    ObsField("enemy_powers", np.float32, (MAX_ENEMIES, N_MONSTER_POWER_IDS), "real"),
     ObsField("enemy_alive", np.float32, (MAX_ENEMIES,), "unit"),
     ObsField("screen_onehot", np.float32, (N_SCREENS,), "unit"),
     ObsField("map_context", np.float32, (MAP_CONTEXT_DIM,), "real"),
@@ -237,9 +246,10 @@ EXPECTED_TABLE_SIZES: dict[str, int] = {
     "N_CARD_IDS": N_CARD_IDS,
     "N_RELIC_IDS": N_RELIC_IDS,
     "N_POTION_IDS": N_POTION_IDS,
-    "N_POWER_IDS": N_POWER_IDS,
+    "N_PLAYER_POWER_IDS": N_PLAYER_POWER_IDS,
+    "N_MONSTER_POWER_IDS": N_MONSTER_POWER_IDS,
     "N_MONSTER_IDS": N_MONSTER_IDS,
-    "N_INTENT": N_INTENT,
+    "N_MONSTER_MOVE_IDS": N_MONSTER_MOVE_IDS,
     "N_NODE_TYPES": N_NODE_TYPES,
     "N_SCREENS": N_SCREENS,
 }
