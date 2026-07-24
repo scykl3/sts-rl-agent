@@ -115,11 +115,17 @@ class RolloutBuffer:
             raise RuntimeError(
                 "compute_advantages requires at least one transition; call add() first"
             )
-        rewards = torch.tensor(self._rewards, dtype=torch.float32)
-        dones = torch.tensor(self._dones, dtype=torch.float32)
+        # Co-locate rewards/dones with values so compute_gae never mixes devices on GPU.
         values = torch.stack(self._values).to(torch.float32)
+        rewards = torch.tensor(self._rewards, dtype=torch.float32, device=values.device)
+        dones = torch.tensor(self._dones, dtype=torch.float32, device=values.device)
         self.advantages, self.returns = compute_gae(
-            rewards, values, dones, last_value.detach(), gamma=gamma, gae_lambda=gae_lambda
+            rewards,
+            values,
+            dones,
+            last_value.detach().to(values.device),
+            gamma=gamma,
+            gae_lambda=gae_lambda,
         )
 
     def iter_minibatches(self, minibatch_size: int, shuffle: bool = True) -> Iterator[MiniBatch]:
@@ -151,7 +157,12 @@ class RolloutBuffer:
         # Match the float32 of advantages/returns so the value loss sees one dtype.
         values = torch.stack(self._values).to(torch.float32)
 
-        order = torch.randperm(length) if shuffle else torch.arange(length)
+        # Co-locate the shuffle index with the data so the gather stays on-device on GPU.
+        order = (
+            torch.randperm(length, device=values.device)
+            if shuffle
+            else torch.arange(length, device=values.device)
+        )
         for start in range(0, length, minibatch_size):
             idx = order[start : start + minibatch_size]
             yield MiniBatch(
