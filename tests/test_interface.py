@@ -13,11 +13,11 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.1.0"
+    assert interface.INTERFACE_VERSION == "0.3.0"
 
 
-def test_action_dim_is_154():
-    assert interface.ACTION_DIM == 154
+def test_action_dim_is_155():
+    assert interface.ACTION_DIM == 155
 
 
 def test_action_dim_equals_sum_of_block_counts():
@@ -54,6 +54,7 @@ def _expected_block_spec():
         ("EVENT_SELECT", 10),
         ("BOSS_RELIC_SELECT", 4),
         ("PROCEED", 1),
+        ("CONFIRM_SELECT", 1),
     ]
 
 
@@ -73,6 +74,8 @@ def test_action_block_offsets_match_spec():
 
     assert interface.ACTION_BLOCK_BY_NAME["END_TURN"].start == 0
     assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == 154
+    # CONFIRM_SELECT is the tail block, so its stop equals the full action dim.
+    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == interface.ACTION_DIM
 
 
 def test_action_block_contains():
@@ -90,7 +93,7 @@ def test_action_block_contains():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 17
+    assert len(fields) == 18
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:
@@ -103,8 +106,9 @@ def test_obs_field_shapes_match_constants():
     assert by_name["enemy_scalars"].shape == (interface.MAX_ENEMIES, 5)
     assert by_name["draw_ids"].shape == (interface.PILE_MAX,)
     assert by_name["player_scalars"].shape == (8,)
-    assert by_name["enemy_intent"].shape == (interface.MAX_ENEMIES, interface.N_INTENT)
-    assert by_name["enemy_powers"].shape == (interface.MAX_ENEMIES, interface.N_POWER_IDS)
+    assert by_name["enemy_move_ids"].shape == (interface.MAX_ENEMIES,)
+    assert by_name["enemy_intent_hidden"].shape == (interface.MAX_ENEMIES,)
+    assert by_name["enemy_powers"].shape == (interface.MAX_ENEMIES, interface.N_MONSTER_POWER_IDS)
     assert by_name["relics_multihot"].shape == (interface.N_RELIC_IDS,)
     assert by_name["map_context"].shape == (40,)
     # Pin the per-card feature width (6) directly; the space-vs-registry test is
@@ -136,6 +140,7 @@ def test_id_fields_have_id_high():
         "exhaust_ids": interface.N_CARD_IDS - 1,
         "potion_ids": interface.N_POTION_IDS - 1,
         "enemy_ids": interface.N_MONSTER_IDS - 1,
+        "enemy_move_ids": interface.N_MONSTER_MOVE_IDS - 1,
     }
     # Pin the exact set of id fields, so silently switching one to another
     # bounds value (which __post_init__ would happily accept) is caught.
@@ -168,10 +173,10 @@ def test_observation_space_matches_registry():
             assert sub.dtype == np.float32
 
 
-def test_action_space_is_discrete_154():
+def test_action_space_is_discrete_155():
     space = spaces.build_action_space()
     assert space == gym.spaces.Discrete(interface.ACTION_DIM)
-    assert space.n == 154
+    assert space.n == 155
 
 
 def test_build_spaces_returns_pair():

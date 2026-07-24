@@ -8,25 +8,17 @@ Each embedding table holds ids `0..N-1`, so the invariant is `engine max_id < N`
 |---|---|---|---|---|
 | `N_CARD_IDS` | 380 | 370 | OK | CardId (module)=370 |
 | `N_RELIC_IDS` | 180 | 179 | OK | RelicId (module)=179 [excl. sentinel INVALID=180] |
-| `N_POTION_IDS` | 40 | 43 | OVERFLOW (need N >= 44) | Potion (Potions.h)=43 |
-| `N_POWER_IDS` | 60 | 86 | OVERFLOW (need N >= 87) | PlayerStatus (module)=86, MonsterStatus (module)=41 |
+| `N_POTION_IDS` | 44 | 43 | OK | Potion (Potions.h)=43 |
+| `N_PLAYER_POWER_IDS` | 87 | 86 | OK | PlayerStatus (module)=86 |
+| `N_MONSTER_POWER_IDS` | 42 | 41 | OK | MonsterStatus (module)=41 |
 | `N_MONSTER_IDS` | 66 | 65 | OK | MonsterId (module)=65 |
-| `N_INTENT` | 12 | - | NO ENGINE SOURCE | no engine source |
-| `N_NODE_TYPES` | 7 | 7 | OVERFLOW (need N >= 8) | Room (module)=7 [excl. sentinel NONE=8, INVALID=9] |
+| `N_MONSTER_MOVE_IDS` | 197 | 196 | OK | MonsterMoveId (module)=196 |
+| `N_NODE_TYPES` | 8 | 7 | OK | Room (module)=7 [excl. sentinel NONE=8, INVALID=9] |
 | `N_SCREENS` | 12 | 9 | OK | ScreenState (module)=9 |
-
-## Notes
-
-- `N_POWER_IDS`: player and monster statuses are two disjoint 0-based enums; the reported minimum assumes one shared id space, which cannot distinguish same-id player vs monster powers. Distinguishing them (separate tables or a concatenated id space) needs about the sum of both cardinalities.
-- `N_INTENT`: no Intent enum exists in the engine; intent must be derived from MonsterMoveId (classify moves into categories)
 
 ## What the contract's startup guard reports
 
 ```
-engine enum ids do not fit their embedding tables:
-  N_POTION_IDS: engine max id 43 overflows expected table size 40 (need max_id < N, i.e. N >= 44)
-  N_POWER_IDS: engine max id 86 overflows expected table size 60 (need max_id < N, i.e. N >= 87)
-  N_INTENT: missing from engine_max_ids (expected table size 12)
-  N_NODE_TYPES: engine max id 7 overflows expected table size 7 (need max_id < N, i.e. N >= 8)
+validate_engine_enums() passed: every measured id fits.
 ```
 

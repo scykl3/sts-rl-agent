@@ -156,30 +156,18 @@ class EnumProbe:
         return best, ", ".join(used) if used else "no engine source"
 
 
-# One probe per contract table. N_POWER_IDS covers two disjoint engine enums
-# (player and monster statuses); N_INTENT has no backing enum at all.
+# One probe per contract table. Player and monster statuses are separate enums
+# with their own tables; enemy intent is the raw MonsterMoveId (no Intent enum).
 PROBES: tuple[EnumProbe, ...] = (
     EnumProbe("N_CARD_IDS", (("CardId", "Cards.h", "CardId"),)),
     EnumProbe("N_RELIC_IDS", (("RelicId", "Relics.h", "RelicId"),)),
     EnumProbe("N_POTION_IDS", (("PotionId", "Potions.h", "Potion"),)),
+    EnumProbe("N_PLAYER_POWER_IDS", (("PlayerStatus", "PlayerStatusEffects.h", "PlayerStatus"),)),
     EnumProbe(
-        "N_POWER_IDS",
-        (
-            ("PlayerStatus", "PlayerStatusEffects.h", "PlayerStatus"),
-            ("MonsterStatus", "MonsterStatusEffects.h", "MonsterStatus"),
-        ),
-        note="player and monster statuses are two disjoint 0-based enums; the "
-        "reported minimum assumes one shared id space, which cannot distinguish "
-        "same-id player vs monster powers. Distinguishing them (separate tables "
-        "or a concatenated id space) needs about the sum of both cardinalities.",
+        "N_MONSTER_POWER_IDS", (("MonsterStatus", "MonsterStatusEffects.h", "MonsterStatus"),)
     ),
     EnumProbe("N_MONSTER_IDS", (("MonsterId", "MonsterIds.h", "MonsterId"),)),
-    EnumProbe(
-        "N_INTENT",
-        (("Intent", "", ""),),
-        note="no Intent enum exists in the engine; intent must be derived from "
-        "MonsterMoveId (classify moves into categories)",
-    ),
+    EnumProbe("N_MONSTER_MOVE_IDS", (("MonsterMoveId", "MonsterMoves.h", "MonsterMoveId"),)),
     EnumProbe("N_NODE_TYPES", (("Room", "Rooms.h", "Room"),)),
     EnumProbe("N_SCREENS", (("ScreenState", "", ""),)),
 )
@@ -251,12 +239,12 @@ def _write_report(rows: list[dict[str, object]], guard_output: str) -> None:
         lines.append(
             f"| `{r['key']}` | {r['contract_n']} | {mid} | {r['verdict']} | {r['source']} |"
         )
-    lines.append("")
-    lines.append("## Notes")
-    lines.append("")
-    for r in rows:
-        if r["note"]:
-            lines.append(f"- `{r['key']}`: {r['note']}")
+    notes = [f"- `{r['key']}`: {r['note']}" for r in rows if r["note"]]
+    if notes:
+        lines.append("")
+        lines.append("## Notes")
+        lines.append("")
+        lines.extend(notes)
     lines.append("")
     lines.append("## What the contract's startup guard reports")
     lines.append("")
