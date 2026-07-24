@@ -14,10 +14,12 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
     pytest.skip(f"engine not built ({exc})", allow_module_level=True)
 
 from sts_rl.env.adapter import StsEnv
+from sts_rl.env.reward import RewardConfig, beta
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     INFO_KEYS_ALWAYS,
     INTERFACE_VERSION,
+    SHAPING_TERMS,
     TERMINAL_LOSS_REWARD,
     TERMINAL_WIN_REWARD,
 )
@@ -61,9 +63,146 @@ def test_scripted_combat_reaches_terminal_with_win_or_loss() -> None:
     obs_info = env.reset(seed=REGRESSION_SEED)
     reward, terminated, truncated, info = _greedy_to_terminal(env, obs_info)
     assert terminated and not truncated
-    assert reward in (TERMINAL_WIN_REWARD, TERMINAL_LOSS_REWARD)
-    assert info["won"] == (reward == TERMINAL_WIN_REWARD)
+    # The terminal step also carries a bounded shaping delta (|shaping| < 1), so
+    # the terminal +1/-1 dominates the sign.
+    assert info["won"] == (reward > 0)
     assert info["episode"]["l"] > 0
+    env.close()
+
+
+def test_reward_equals_terminal_plus_annealed_shaping() -> None:
+    # Ties the adapter's per-step reward to the reward module: on every step,
+    # reward == terminal + beta(t) * sum(info['shaping_terms']).
+    cfg = RewardConfig()
+    env = StsEnv(reward_config=cfg)
+    _, info = env.reset(seed=REGRESSION_SEED)
+    assert set(info["shaping_terms"]) == set(SHAPING_TERMS)
+    assert all(v == 0.0 for v in info["shaping_terms"].values())  # no delta at reset
+
+    # t stays in lockstep with the env clock because every step below is legal
+    # (each step advances the env's global step by exactly one); the invalid
+    # path is covered separately by test_invalid_action_advances_anneal_clock.
+    t = 0
+    saw_shaping = False
+    for _ in range(MAX_SCRIPTED_STEPS):
+        legal = np.flatnonzero(info["action_mask"])
+        play = [i for i in legal if i != _END_TURN]
+        action = int(play[0]) if play else _END_TURN
+        _, reward, terminated, truncated, info = env.step(action)
+        terms = info["shaping_terms"]
+        assert set(terms) == set(SHAPING_TERMS)
+        terminal = 0.0
+        if terminated:
+            terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
+        assert reward == pytest.approx(terminal + beta(t, cfg) * sum(terms.values()))
+        saw_shaping = saw_shaping or any(v != 0.0 for v in terms.values())
+        t += 1
+        if terminated or truncated:
+            break
+    assert saw_shaping  # a real combat moves HP, so shaping must fire at least once
+    env.close()
+
+
+def test_annealed_shaping_vanishes_while_terminal_pays_full() -> None:
+    # End-to-end anneal: with a short horizon the schedule reaches beta == 0
+    # partway through a real combat. From that point every step's shaping
+    # contribution must be exactly zero (reward == terminal component), while a
+    # terminal step still pays the full +/-1. The raw terms stay nonzero, so it
+    # is beta that removes them, not an absence of shaping.
+    cfg = RewardConfig(beta_min=0.0, t_anneal=3.0)
+    env = StsEnv(reward_config=cfg)
+    _, info = env.reset(seed=REGRESSION_SEED)
+
+    t = 0
+    saw_shaping_before_anneal = False
+    saw_nonzero_raw_after_anneal = False
+    terminated = truncated = False
+    for _ in range(MAX_SCRIPTED_STEPS):
+        action = _first_playable_action(info)
+        _, reward, terminated, truncated, info = env.step(action)
+        raw = sum(info["shaping_terms"].values())
+        if beta(t, cfg) > 0.0 and raw != 0.0:
+            saw_shaping_before_anneal = True
+        if beta(t, cfg) == 0.0:
+            if raw != 0.0:
+                saw_nonzero_raw_after_anneal = True
+            terminal = 0.0
+            if terminated:
+                terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
+            # beta == 0 wipes the shaping regardless of the raw terms.
+            assert reward == pytest.approx(terminal)
+        t += 1
+        if terminated or truncated:
+            break
+
+    assert terminated and not truncated
+    assert saw_shaping_before_anneal  # shaping was live before the horizon
+    # A step past the horizon still produced nonzero raw shaping, so it is beta
+    # that zeroed the contribution, not an absence of shaping (guards against a
+    # future combat shift making every post-anneal check vacuous).
+    assert saw_nonzero_raw_after_anneal
+    # The final step lands past the horizon, so its reward is the bare terminal.
+    assert reward == (TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD)
+    env.close()
+
+
+def _first_playable_action(info: dict) -> int:
+    legal = np.flatnonzero(info["action_mask"])
+    play = [i for i in legal if i != _END_TURN]
+    return int(play[0]) if play else _END_TURN
+
+
+def test_invalid_action_advances_anneal_clock() -> None:
+    # An illegal step takes no engine action but counts as one env interaction,
+    # so the next legal step's beta index reflects it (beta(1), not beta(0)).
+    cfg = RewardConfig()
+    env = StsEnv(reward_config=cfg)
+    _, info = env.reset(seed=REGRESSION_SEED)
+    _, _, _, _, info = env.step(_PROCEED)  # illegal in combat: state unchanged
+    assert info["invalid_action"] is True
+
+    action = _first_playable_action(info)
+    _, reward, terminated, _, info = env.step(action)
+    terminal = 0.0
+    if terminated:
+        terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
+    assert reward == pytest.approx(terminal + beta(1, cfg) * sum(info["shaping_terms"].values()))
+    env.close()
+
+
+def test_set_global_step_overrides_anneal_clock() -> None:
+    cfg = RewardConfig()
+    env = StsEnv(reward_config=cfg)
+    _, info = env.reset(seed=REGRESSION_SEED)
+    env.set_global_step(1000)
+    action = _first_playable_action(info)
+    _, reward, terminated, _, info = env.step(action)
+    terminal = 0.0
+    if terminated:
+        terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
+    assert reward == pytest.approx(terminal + beta(1000, cfg) * sum(info["shaping_terms"].values()))
+
+    # The override sets the clock, it does not pin it: the following step must
+    # advance to beta(1001), not re-read beta(1000).
+    if not terminated:
+        action = _first_playable_action(info)
+        _, reward, terminated, _, info = env.step(action)
+        terminal = 0.0
+        if terminated:
+            terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
+        assert reward == pytest.approx(
+            terminal + beta(1001, cfg) * sum(info["shaping_terms"].values())
+        )
+    env.close()
+
+
+def test_set_global_step_rejects_negative() -> None:
+    from sts_rl.interface import InterfaceError
+
+    env = StsEnv()
+    env.reset(seed=REGRESSION_SEED)
+    with pytest.raises(InterfaceError):
+        env.set_global_step(-1)
     env.close()
 
 
