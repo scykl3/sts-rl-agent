@@ -291,4 +291,4 @@ def test_evaluate_requires_device_for_paramless_policy() -> None:
     bare = nn.Module()
     env = _ScriptedEnv({0: (True, 1, 1, 1, 1.0)})
     with pytest.raises(ValueError):
-        evaluate(bare, env, seeds=[0])  # type: ignore[arg-type]
+        evaluate(bare, env, seeds=[0])
