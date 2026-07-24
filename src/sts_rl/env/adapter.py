@@ -2,17 +2,14 @@
 
 ``StsEnv`` starts a seeded Ironclad combat, applies decoded actions, and reports
 the Gymnasium 5-tuple. It is the combat backbone the rest of the environment
-builds on. One part is intentionally still stubbed and will be filled by later
-work:
+builds on.
 
-- Observation: ``reset``/``step`` return an interface-shaped but all-zero
-  placeholder observation. The real observation encoder replaces
-  :meth:`StsEnv._observation`; the raw engine readout is available now in
-  ``info['combat']`` for debugging.
-
-Reward is the terminal win/loss signal plus annealed per-step shaping (see
-:mod:`sts_rl.env.reward`): ``reward = terminal + beta(t) * sum(shaping_terms)``,
-where ``t`` is the env's cumulative step count across episodes.
+Observations are encoded from the live engine state by
+:func:`sts_rl.env.observation.encode_observation`; the raw readout also stays in
+``info['combat']`` for debugging. Reward is the terminal win/loss signal plus
+annealed per-step shaping (see :mod:`sts_rl.env.reward`):
+``reward = terminal + beta(t) * sum(shaping_terms)``, where ``t`` is the env's
+cumulative step count across episodes.
 
 Action legality is enforced through :func:`sts_rl.env.actions.build_mask`: an
 action is decoded and executed only after it is confirmed legal, so an invalid
@@ -30,6 +27,7 @@ from gymnasium.utils import seeding
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.actions import auto_resolve, build_mask, decode_action
 from sts_rl.env.engine import CombatSnapshot, engine_commit, read_combat, start_combat
+from sts_rl.env.observation import encode_observation
 from sts_rl.env.reward import (
     RewardConfig,
     combat_shaping_terms,
@@ -40,7 +38,6 @@ from sts_rl.env.spaces import build_spaces
 from sts_rl.interface import (
     ACTION_DIM,
     INTERFACE_VERSION,
-    OBS_FIELDS,
     TERMINAL_LOSS_REWARD,
     TERMINAL_WIN_REWARD,
     InterfaceError,
@@ -253,13 +250,8 @@ class StsEnv(gym.Env):
             assert_valid_mask(self._mask)
 
     def _observation(self) -> Obs:
-        """Return an interface-shaped placeholder observation (all zeros).
-
-        Replaced by the observation encoder; the raw readout is in
-        ``info['combat']`` meanwhile. Zero is in-bounds for every field (id 0 is
-        the PAD id), so this is a valid member of the observation space.
-        """
-        return {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
+        """Encode the live engine state into the interface observation dict."""
+        return encode_observation(self._gc, self._bc)
 
     def _build_info(
         self,
