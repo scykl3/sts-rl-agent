@@ -2,15 +2,10 @@
 
 ``StsEnv`` starts a seeded Ironclad combat, applies decoded actions, and reports
 the Gymnasium 5-tuple. It is the combat backbone the rest of the environment
-builds on. Two parts are intentionally still stubbed and will be filled by later
-work:
-
-- Observation: ``reset``/``step`` return an interface-shaped but all-zero
-  placeholder observation. The real observation encoder replaces
-  :meth:`StsEnv._observation`; the raw engine readout is available now in
-  ``info['combat']`` for debugging.
-- Reward: only the terminal win/loss signal is emitted; per-step shaping is not
-  applied yet.
+builds on. Observations are encoded from the live engine state by
+:func:`sts_rl.env.observation.encode_observation`; the raw readout also stays in
+``info['combat']`` for debugging. Reward is intentionally still terminal-only
+(win/loss); per-step shaping is applied by later work.
 
 Action legality is enforced through :func:`sts_rl.env.actions.build_mask`: an
 action is decoded and executed only after it is confirmed legal, so an invalid
@@ -28,11 +23,11 @@ from gymnasium.utils import seeding
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.actions import auto_resolve, build_mask, decode_action
 from sts_rl.env.engine import engine_commit, read_combat, start_combat
+from sts_rl.env.observation import encode_observation
 from sts_rl.env.spaces import build_spaces
 from sts_rl.interface import (
     ACTION_DIM,
     INTERFACE_VERSION,
-    OBS_FIELDS,
     SHAPING_TERMS,
     TERMINAL_LOSS_REWARD,
     TERMINAL_WIN_REWARD,
@@ -193,13 +188,8 @@ class StsEnv(gym.Env):
             assert_valid_mask(self._mask)
 
     def _observation(self) -> Obs:
-        """Return an interface-shaped placeholder observation (all zeros).
-
-        Replaced by the observation encoder; the raw readout is in
-        ``info['combat']`` meanwhile. Zero is in-bounds for every field (id 0 is
-        the PAD id), so this is a valid member of the observation space.
-        """
-        return {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
+        """Encode the live engine state into the interface observation dict."""
+        return encode_observation(self._gc, self._bc)
 
     def _build_info(self, *, invalid_action: bool) -> Info:
         snapshot = read_combat(self._bc)
