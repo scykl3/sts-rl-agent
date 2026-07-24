@@ -28,9 +28,8 @@ if TYPE_CHECKING:
     # by attribute and work on any object with the same fields.
     from sts_rl.env.engine import CombatSnapshot
 
-# Default shaping coefficients (see the Reward Spec). Positive coefficients
-# reward progress; the damage coefficient is negative so taking damage is
-# penalized.
+# Default shaping coefficients. Positive coefficients reward progress; the
+# damage coefficient is negative so taking damage is penalized.
 DEFAULT_ENEMY_HP_REMOVED_COEF = 0.05
 DEFAULT_DAMAGE_TAKEN_COEF = -0.02
 DEFAULT_FLOOR_PROGRESS_COEF = 0.02

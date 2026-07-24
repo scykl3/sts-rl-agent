@@ -97,7 +97,7 @@ def test_default_t_anneal_matches_spec() -> None:
 # --- shaping terms ---------------------------------------------------------
 
 
-def test_zero_shaping_terms_covers_every_contract_term() -> None:
+def test_zero_shaping_terms_covers_every_interface_term() -> None:
     terms = zero_shaping_terms()
     assert set(terms) == set(SHAPING_TERMS)
     assert all(v == 0.0 for v in terms.values())
