@@ -5,11 +5,15 @@ to them over pipes. Each worker owns a single :class:`StsEnv`; the parent
 batches observations, rewards, masks, and done flags across workers so the
 learner consumes stacked arrays.
 
-Workers auto-reset on episode end (Gymnasium vector convention): the observation
-returned for a done env is the first observation of the *next* episode, while
-the terminal observation and info are preserved under ``final_observation`` and
-``final_info`` in that env's info dict, and the ``terminated``/``truncated``
-flags still refer to the step that ended.
+Workers auto-reset on episode end using the pre-1.0 Gymnasium "same-step"
+idiom: the observation returned for a done env is the first observation of the
+*next* episode, while the terminal observation and info are preserved under
+``final_observation`` and ``final_info`` in that env's info dict, and the
+``terminated``/``truncated`` flags still refer to the step that ended. This is
+not the Gymnasium 1.0 "next-step" reset semantics, and ``infos`` is a per-env
+list of dicts, not a batched dict-of-arrays with a ``_final_observation`` mask.
+Everything placed in an ``info`` (or observation) must be picklable, since it
+crosses the pipe from worker to parent.
 
 The engine is a native extension, so workers use the ``spawn`` start method
 (safe with C++ state), and ``make_env`` is shipped to workers via cloudpickle so
@@ -151,30 +155,38 @@ class SubprocVecEnv:
         self.remotes = tuple(p[0] for p in pipes)
         work_remotes: tuple[Connection, ...] = tuple(p[1] for p in pipes)
         wrapped = _CloudpickleWrapper(make_env)
-        for index, (work_remote, remote) in enumerate(zip(work_remotes, self.remotes)):
-            process = ctx.Process(
-                target=_worker, args=(work_remote, remote, wrapped, index), daemon=True
-            )
-            process.start()
-            # The child owns its end; closing the parent's copy lets the child
-            # observe EOF (and thus exit) if the parent dies.
-            work_remote.close()
-            self.processes.append(process)
-
-        # Query spaces from every worker (not just one) so a make_env that raises
-        # in any worker surfaces here at construction rather than silently later.
         try:
+            for index, (work_remote, remote) in enumerate(zip(work_remotes, self.remotes)):
+                process = ctx.Process(
+                    target=_worker, args=(work_remote, remote, wrapped, index), daemon=True
+                )
+                process.start()
+                # The child owns its end; closing the parent's copy lets the child
+                # observe EOF (and thus exit) if the parent dies.
+                work_remote.close()
+                self.processes.append(process)
+
+            # Query spaces from every worker (not just one) so a make_env that
+            # raises in any worker surfaces here at construction, not later.
             self._command_all(_CMD_GET_SPACES, [None] * num_envs)
             spaces = self._recv_all()
-        except Exception:
+            # All workers must expose the same spaces; a heterogeneous make_env is
+            # a configuration error and should fail loudly rather than silently
+            # batch mismatched shapes.
+            if any(worker_spaces != spaces[0] for worker_spaces in spaces[1:]):
+                raise InterfaceError("workers reported mismatched observation/action spaces")
+        except BaseException:
+            # If start() fails partway, the parent still holds the write end of
+            # every work_remote it has not closed yet; leaving them open would make
+            # close()'s drain block forever (no worker to reply, no EOF). Close
+            # them all so close() sees EOF, then tear down.
+            for work_remote in work_remotes:
+                try:
+                    work_remote.close()
+                except OSError:
+                    pass
             self.close()
             raise
-        # All workers must expose the same spaces; a heterogeneous make_env is a
-        # configuration error and should fail loudly rather than silently batch
-        # mismatched shapes.
-        if any(worker_spaces != spaces[0] for worker_spaces in spaces[1:]):
-            self.close()
-            raise InterfaceError("workers reported mismatched observation/action spaces")
         self.observation_space, self.action_space = spaces[0]
 
     # -- Vector API ---------------------------------------------------------
@@ -232,14 +244,24 @@ class SubprocVecEnv:
                 pass  # worker already gone
         for index, remote in enumerate(self.remotes):
             try:
-                self._recv(remote, index)
+                # poll() before recv() so a worker that never started (write end
+                # already closed -> EOF) or one that is wedged (poll times out)
+                # can never block the drain; only reply or EOF/error get here.
+                if remote.poll(_JOIN_TIMEOUT_S):
+                    self._recv(remote, index)
             except (EOFError, OSError, RuntimeError):
                 pass
-            remote.close()
+            try:
+                remote.close()
+            except OSError:
+                pass
         for process in self.processes:
             process.join(timeout=_JOIN_TIMEOUT_S)
             if process.is_alive():  # pragma: no cover - only on a hung worker
                 process.terminate()
+                process.join(timeout=_JOIN_TIMEOUT_S)
+            if process.is_alive():  # pragma: no cover - worker ignored SIGTERM
+                process.kill()
                 process.join()
         self.closed = True
 

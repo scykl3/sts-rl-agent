@@ -220,3 +220,38 @@ def test_worker_death_raises_instead_of_hanging() -> None:
         vec.reset(seeds=[REGRESSION_SEED, REGRESSION_SEED + 1])
         with pytest.raises(RuntimeError, match="died without sending a reply"):
             vec.step(_end_turn_actions(2))
+
+
+def test_start_failure_does_not_hang_close(monkeypatch) -> None:
+    # If process.start() fails partway through construction, __init__ must close
+    # the still-parent-held pipe ends so its cleanup close() drains via EOF and
+    # returns, rather than blocking forever on a worker that never started.
+    from multiprocessing.context import SpawnProcess
+
+    real_start = SpawnProcess.start
+    state = {"starts": 0}
+
+    def flaky_start(self: SpawnProcess) -> None:
+        state["starts"] += 1
+        if state["starts"] == 2:
+            raise OSError("simulated start() failure")
+        real_start(self)
+
+    monkeypatch.setattr(SpawnProcess, "start", flaky_start)
+    # Reaching the assertion without hanging is the real test.
+    with pytest.raises(OSError, match="simulated start"):
+        SubprocVecEnv(_make_env, 3)
+
+
+def test_dead_worker_surfaces_on_next_step() -> None:
+    # A worker killed between calls must surface as an error on the next command
+    # (send failure -> teardown, or EOF on recv), never a silent desync or hang.
+    vec = SubprocVecEnv(_make_env, 2)
+    try:
+        vec.reset(seeds=[REGRESSION_SEED, REGRESSION_SEED + 1])
+        vec.processes[0].terminate()
+        vec.processes[0].join()
+        with pytest.raises(RuntimeError):
+            vec.step(_end_turn_actions(2))
+    finally:
+        vec.close()
