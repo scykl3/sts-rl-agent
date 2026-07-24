@@ -52,6 +52,8 @@ logs/
 .vscode/
 .kiro/
 *.log
+# Scaffold written by external agent tooling, not part of this project.
+AGENTS.md
 
 # --- Local working files (private, not published) ---
 docs/
