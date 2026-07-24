@@ -122,6 +122,16 @@ class RolloutCollector:
         device: torch.device | None = None,
         seed: int | None = None,
     ) -> None:
+        """Bind an env and network, resetting the env once to prime the stream.
+
+        ``seed`` seeds ONLY the environment's reset stream (its instance-local
+        Generator); it deliberately does not touch the global torch/numpy RNGs.
+        Reproducible action sampling and buffer shuffling therefore require
+        seeding the global torch RNG once at the training entry point
+        (``torch.manual_seed``), per CleanRL/SB3 - so constructing a collector
+        never clobbers another collector's RNG. ``device`` is inferred from the
+        network's parameters when omitted.
+        """
         self._env = env
         self._actor_critic = actor_critic
         if device is None:
@@ -134,14 +144,18 @@ class RolloutCollector:
                 ) from exc
         self._device = device
 
-        # Seed the whole stream once. torch drives act()'s action sampling and np
-        # is seeded for reproducibility of any downstream numpy use; the env is
-        # seeded via its first (and only construction-time) reset. Subsequent
-        # in-collect resets are NOT reseeded - the rollout is one continuous
-        # stream, and reseeding each episode would replay identical episodes.
+        # Seed only the env, once, via its construction-time reset: the env owns
+        # an instance-local Generator (gymnasium's self.np_random), so this can't
+        # affect any other collector. The process-global RNGs are deliberately
+        # NOT reseeded here - torch's default generator drives act()'s
+        # dist.sample() and the buffer's randperm shuffle, so a torch.manual_seed
+        # side effect in this constructor would let a second seeded collector
+        # silently break an earlier one's reproducibility. Seeding the global
+        # generators is the training entry point's job, done once at startup (per
+        # CleanRL/SB3). In-collect resets are NOT reseeded - the rollout is one
+        # continuous stream, and reseeding each episode would replay identical
+        # episodes.
         if seed is not None:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
             obs, info = env.reset(seed=seed)
         else:
             obs, info = env.reset()

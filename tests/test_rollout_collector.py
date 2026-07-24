@@ -265,6 +265,34 @@ def test_determinism_same_seed_same_actions() -> None:
     assert first[0] == second[0]  # identical first action specifically
 
 
+def test_constructor_does_not_mutate_global_rng_state() -> None:
+    """A seeded constructor must not reseed the process-global RNGs.
+
+    torch's default generator drives act()'s dist.sample() and the buffer's
+    randperm shuffle, so calling torch.manual_seed() as a construction side
+    effect would let a second seeded collector silently break an earlier one's
+    reproducibility - the cross-instance clobber the single-collector
+    determinism test cannot reach. The env is seeded through its own
+    instance-local Generator, so a seeded construction must leave both the global
+    torch and the legacy global numpy generators untouched.
+    """
+    env = _make_env()
+    actor_critic = _make_ac()  # weight init consumes global torch RNG; snapshot AFTER
+
+    torch_before = torch.random.get_rng_state()
+    numpy_before = np.random.get_state()
+
+    RolloutCollector(env, actor_critic, seed=12345)
+
+    assert torch.equal(
+        torch.random.get_rng_state(), torch_before
+    ), "constructor reseeded the global torch RNG (torch.manual_seed side effect)"
+    numpy_after = np.random.get_state()
+    assert numpy_before[0] == numpy_after[0]
+    assert np.array_equal(numpy_before[1], numpy_after[1])
+    assert numpy_before[2:] == numpy_after[2:]
+
+
 def test_stored_tensors_have_no_grad_history() -> None:
     """act runs under no_grad and the buffer clones detached, so nothing tracks grad."""
     collector = RolloutCollector(_make_env(), _make_ac(), seed=0)
