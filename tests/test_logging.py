@@ -71,6 +71,16 @@ def test_metrics_stream_round_trip(tmp_path: Path) -> None:
     ]
 
 
+def test_positional_step_overrides_metrics_step(tmp_path: Path) -> None:
+    # The positional step is the authoritative record index; a stray "step" key
+    # in the metrics payload must not override it.
+    with run_logging.RunLogger(tmp_path, {}, seed=0) as logger:
+        logger.log_metrics(42, {"step": -1, "loss": 0.5})
+    (record,) = run_logging.read_metrics(tmp_path)
+    assert record["step"] == 42
+    assert record["loss"] == 0.5
+
+
 def test_log_after_close_raises(tmp_path: Path) -> None:
     logger = run_logging.RunLogger(tmp_path, {}, seed=0)
     logger.close()

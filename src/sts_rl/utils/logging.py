@@ -179,14 +179,16 @@ class RunLogger:
         )
 
     def log_metrics(self, step: int, metrics: Mapping[str, float]) -> None:
-        """Append one ``{"step": step, **metrics}`` record to ``metrics.jsonl``.
+        """Append one ``{**metrics, "step": step}`` record to ``metrics.jsonl``.
 
         Flushed per call so a run interrupted mid-training still leaves every
-        already-logged step on disk.
+        already-logged step on disk. The positional ``step`` is authoritative:
+        it is applied last so a stray ``"step"`` key in ``metrics`` cannot
+        override the record's index.
         """
         if self._metrics_file is None or self._metrics_file.closed:
             raise ValueError("cannot log metrics after the logger is closed")
-        record = {"step": step, **dict(metrics)}
+        record = {**dict(metrics), "step": step}
         self._metrics_file.write(json.dumps(record, default=str) + "\n")
         self._metrics_file.flush()
 
