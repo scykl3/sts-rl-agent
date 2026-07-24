@@ -14,12 +14,10 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
     pytest.skip(f"engine not built ({exc})", allow_module_level=True)
 
 from sts_rl.env.adapter import StsEnv
-from sts_rl.env.reward import RewardConfig, beta
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     INFO_KEYS_ALWAYS,
     INTERFACE_VERSION,
-    SHAPING_TERMS,
     TERMINAL_LOSS_REWARD,
     TERMINAL_WIN_REWARD,
 )
@@ -63,91 +61,9 @@ def test_scripted_combat_reaches_terminal_with_win_or_loss() -> None:
     obs_info = env.reset(seed=REGRESSION_SEED)
     reward, terminated, truncated, info = _greedy_to_terminal(env, obs_info)
     assert terminated and not truncated
-    # The terminal step also carries a bounded shaping delta (|shaping| < 1), so
-    # the terminal +1/-1 dominates the sign.
-    assert info["won"] == (reward > 0)
+    assert reward in (TERMINAL_WIN_REWARD, TERMINAL_LOSS_REWARD)
+    assert info["won"] == (reward == TERMINAL_WIN_REWARD)
     assert info["episode"]["l"] > 0
-    env.close()
-
-
-def test_reward_equals_terminal_plus_annealed_shaping() -> None:
-    # Ties the adapter's per-step reward to the reward module: on every step,
-    # reward == terminal + beta(t) * sum(info['shaping_terms']).
-    cfg = RewardConfig()
-    env = StsEnv(reward_config=cfg)
-    _, info = env.reset(seed=REGRESSION_SEED)
-    assert set(info["shaping_terms"]) == set(SHAPING_TERMS)
-    assert all(v == 0.0 for v in info["shaping_terms"].values())  # no delta at reset
-
-    # t stays in lockstep with the env clock because every step below is legal
-    # (each step advances the env's global step by exactly one); the invalid
-    # path is covered separately by test_invalid_action_advances_anneal_clock.
-    t = 0
-    saw_shaping = False
-    for _ in range(MAX_SCRIPTED_STEPS):
-        legal = np.flatnonzero(info["action_mask"])
-        play = [i for i in legal if i != _END_TURN]
-        action = int(play[0]) if play else _END_TURN
-        _, reward, terminated, truncated, info = env.step(action)
-        terms = info["shaping_terms"]
-        assert set(terms) == set(SHAPING_TERMS)
-        terminal = 0.0
-        if terminated:
-            terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
-        assert reward == pytest.approx(terminal + beta(t, cfg) * sum(terms.values()))
-        saw_shaping = saw_shaping or any(v != 0.0 for v in terms.values())
-        t += 1
-        if terminated or truncated:
-            break
-    assert saw_shaping  # a real combat moves HP, so shaping must fire at least once
-    env.close()
-
-
-def _first_playable_action(info: dict) -> int:
-    legal = np.flatnonzero(info["action_mask"])
-    play = [i for i in legal if i != _END_TURN]
-    return int(play[0]) if play else _END_TURN
-
-
-def test_invalid_action_advances_anneal_clock() -> None:
-    # An illegal step takes no engine action but counts as one env interaction,
-    # so the next legal step's beta index reflects it (beta(1), not beta(0)).
-    cfg = RewardConfig()
-    env = StsEnv(reward_config=cfg)
-    _, info = env.reset(seed=REGRESSION_SEED)
-    _, _, _, _, info = env.step(_PROCEED)  # illegal in combat: state unchanged
-    assert info["invalid_action"] is True
-
-    action = _first_playable_action(info)
-    _, reward, terminated, _, info = env.step(action)
-    terminal = 0.0
-    if terminated:
-        terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
-    assert reward == pytest.approx(terminal + beta(1, cfg) * sum(info["shaping_terms"].values()))
-    env.close()
-
-
-def test_set_global_step_overrides_anneal_clock() -> None:
-    cfg = RewardConfig()
-    env = StsEnv(reward_config=cfg)
-    _, info = env.reset(seed=REGRESSION_SEED)
-    env.set_global_step(1000)
-    action = _first_playable_action(info)
-    _, reward, terminated, _, info = env.step(action)
-    terminal = 0.0
-    if terminated:
-        terminal = TERMINAL_WIN_REWARD if info["won"] else TERMINAL_LOSS_REWARD
-    assert reward == pytest.approx(terminal + beta(1000, cfg) * sum(info["shaping_terms"].values()))
-    env.close()
-
-
-def test_set_global_step_rejects_negative() -> None:
-    from sts_rl.interface import InterfaceError
-
-    env = StsEnv()
-    env.reset(seed=REGRESSION_SEED)
-    with pytest.raises(InterfaceError):
-        env.set_global_step(-1)
     env.close()
 
 
