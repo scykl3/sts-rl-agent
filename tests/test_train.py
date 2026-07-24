@@ -160,7 +160,10 @@ def test_diagnostics_finite_and_sane(standard_history: TrainHistory) -> None:
         assert ppo.approx_kl >= 0.0  # Schulman's k3 estimator is non-negative
         assert ppo.grad_norm >= 0.0
         assert 0.0 <= ppo.clip_fraction <= 1.0
-        assert record.collect.steps_per_second > 0.0
+        # Finite (not just positive): the collector floors a zero-elapsed collect
+        # to inf, which would slip past a bare > 0 check.
+        sps = record.collect.steps_per_second
+        assert math.isfinite(sps) and sps > 0.0
         if record.collect.n_episodes > 0:
             saw_episode = True
             assert record.collect.mean_episode_return is not None
