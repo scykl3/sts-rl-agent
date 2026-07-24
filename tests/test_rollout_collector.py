@@ -124,6 +124,43 @@ def test_forced_truncation_keeps_done_zero() -> None:
     assert stats.n_episodes == n_steps // max_steps  # 10 // 4 -> 2 completed
 
 
+def test_final_step_truncation_bootstraps_tail() -> None:
+    """A truncation as the FINAL collected step still bootstraps a finite tail.
+
+    Picking n_steps an exact multiple of max_steps lands the last iteration on a
+    truncation boundary, so it takes the collector's RESET branch - unlike
+    test_forced_truncation_keeps_done_zero, whose final step lands mid-episode on
+    the advance branch. The tail then bootstraps get_value off the post-reset
+    cursor obs, so this pins that the reset-on-final-iteration -> tail path yields
+    finite GAE targets rather than erroring.
+    """
+    max_steps = 4
+    # Exact multiple -> the final iteration truncates and resets, so the tail
+    # bootstrap runs off the post-reset cursor (the branch the sibling misses).
+    n_steps = 2 * max_steps
+    assert n_steps % max_steps == 0
+    collector = RolloutCollector(
+        _make_env(terminate_prob=0.0, max_episode_steps=max_steps), _make_ac(), seed=0
+    )
+    buffer = RolloutBuffer()
+
+    stats = collector.collect(buffer, n_steps)
+
+    assert len(buffer) == n_steps
+    # terminate_prob=0 -> no step may be flagged done, and the final step is a
+    # truncation (done=0), not a terminal.
+    assert all(done == 0.0 for done in buffer._dones)
+    assert buffer._dones[-1] == 0.0
+    # Each episode is a full cap, so completed episodes tile n_steps exactly.
+    assert stats.n_episodes == n_steps // max_steps
+
+    # The tail bootstrap fed compute_advantages without error: one in-order batch
+    # exposes finite advantages and returns off the post-reset cursor value.
+    (batch,) = buffer.iter_minibatches(n_steps, shuffle=False)
+    assert torch.isfinite(batch.advantages).all()
+    assert torch.isfinite(batch.returns).all()
+
+
 def test_tail_bootstrap_matches_independent_gae() -> None:
     """The tail last_value is V(cursor obs) and the reward/value/done wiring is exact.
 
