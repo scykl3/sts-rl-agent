@@ -178,3 +178,48 @@ def test_singleton_tail_minibatch_does_not_nan():
     assert math.isfinite(stats.policy_loss)
     # The update must leave the WHOLE network finite, not NaN-poisoned.
     assert all(torch.isfinite(p).all() for p in ac.parameters())
+
+
+def test_target_kl_early_stops_after_first_epoch():
+    """A near-zero target_kl trips the end-of-epoch guard, halting after epoch 1.
+
+    The k3 approx_kl is >= 0 and strictly positive once an optimizer step has
+    moved the policy (the second minibatch onward), so epoch 1's mean exceeds
+    target_kl=0.0 and the epoch loop breaks before epoch 2. Only one epoch's
+    minibatches run: n_updates == ceil(T / MINIBATCH) < EXPECTED_UPDATES.
+
+    Revert-verify: delete the early-stop break in ppo_update and every epoch
+    runs, so n_updates == EXPECTED_UPDATES and this assertion fails.
+    """
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    config = PPOConfig(n_epochs=N_EPOCHS, minibatch_size=MINIBATCH, target_kl=0.0)
+
+    stats = ppo_update(ac, buffer, optimizer, config)
+
+    one_epoch_updates = math.ceil(T / MINIBATCH)
+    assert stats.n_updates == one_epoch_updates
+    assert stats.n_updates < EXPECTED_UPDATES
+
+
+def test_target_kl_none_runs_all_epochs():
+    """target_kl=None (the default) disables the guard: every epoch runs."""
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    config = PPOConfig(n_epochs=N_EPOCHS, minibatch_size=MINIBATCH, target_kl=None)
+
+    stats = ppo_update(ac, buffer, optimizer, config)
+    assert stats.n_updates == EXPECTED_UPDATES
+
+
+def test_high_target_kl_never_triggers():
+    """A target_kl far above any realistic approx_kl never trips: all epochs run."""
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    config = PPOConfig(n_epochs=N_EPOCHS, minibatch_size=MINIBATCH, target_kl=1e9)
+
+    stats = ppo_update(ac, buffer, optimizer, config)
+    assert stats.n_updates == EXPECTED_UPDATES
