@@ -1,4 +1,4 @@
-"""Tests for the observation encoder (raw engine state -> contract obs dict).
+"""Tests for the observation encoder (raw engine state -> interface obs dict).
 
 Requires the built engine; skips cleanly otherwise.
 """
@@ -27,7 +27,7 @@ def _combat(seed: int = REGRESSION_SEED):
     return start_combat(seed, ascension=0)
 
 
-def test_encoded_obs_matches_contract_dtype_shape_and_is_finite() -> None:
+def test_encoded_obs_matches_interface_dtype_shape_and_is_finite() -> None:
     gc, bc = _combat()
     obs = encode_observation(gc, bc)
     # Every declared field is present, correctly typed/shaped, and finite.

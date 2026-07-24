@@ -45,17 +45,23 @@ from sts_rl.interface import (
 
 # Precomputed (table_index, status) pairs, filtered to those that fit their
 # embedding table. Built once at import: the enum membership is fixed for a given
-# engine build. INVALID (player id 0) is skipped -- it is the "no status"
-# sentinel, not a real power. MonsterStatus has no INVALID member.
+# engine build. Keyed by index so enum aliases (a second name for the same id)
+# collapse to one entry, avoiding a redundant duplicate write per encode. INVALID
+# (player id 0) is skipped -- it is the "no status" sentinel, not a real power.
+# MonsterStatus has no INVALID member.
 _PLAYER_STATUSES: tuple[tuple[int, Any], ...] = tuple(
-    (int(status), status)
-    for status in sts.PlayerStatus.__members__.values()
-    if status != sts.PlayerStatus.INVALID and int(status) < N_PLAYER_POWER_IDS
+    {
+        int(status): status
+        for status in sts.PlayerStatus.__members__.values()
+        if status != sts.PlayerStatus.INVALID and int(status) < N_PLAYER_POWER_IDS
+    }.items()
 )
 _MONSTER_STATUSES: tuple[tuple[int, Any], ...] = tuple(
-    (int(status), status)
-    for status in sts.MonsterStatus.__members__.values()
-    if int(status) < N_MONSTER_POWER_IDS
+    {
+        int(status): status
+        for status in sts.MonsterStatus.__members__.values()
+        if int(status) < N_MONSTER_POWER_IDS
+    }.items()
 )
 
 # CardType ids for the hand one-hot features (bound enum: ATTACK/SKILL/POWER).
@@ -69,7 +75,7 @@ _POTION_INVALID = sts.Potion.INVALID
 
 
 def _empty_obs() -> Obs:
-    """Zero-filled observation with every field's contract dtype and shape."""
+    """Zero-filled observation with every field's interface dtype and shape."""
     return {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
 
 
@@ -83,6 +89,13 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
     obs = _empty_obs()
     player = bc.player
     monsters = bc.monsters
+
+    # Card, monster, and potion ids below are written straight from engine enums
+    # with no per-write clamp: validate_engine_enums asserts each enum's max id
+    # fits its table (max_id < N) at startup, so a held id is always in bounds.
+    # The relic multi-hot, enemy move id, and screen one-hot guard explicitly
+    # because their raw value can be an out-of-range sentinel (e.g. an empty
+    # RelicId.INVALID or a not-yet-rolled move).
 
     # -- player_scalars: hp_cur, hp_max, block, energy, gold, floor, ascension, turn
     obs["player_scalars"][:] = (
