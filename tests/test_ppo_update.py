@@ -70,6 +70,7 @@ def test_n_updates_matches_epochs_times_minibatches():
         stats.approx_kl,
         stats.clip_fraction,
         stats.grad_norm,
+        stats.explained_variance,
     ):
         assert math.isfinite(field)
 
@@ -223,3 +224,47 @@ def test_high_target_kl_never_triggers():
 
     stats = ppo_update(ac, buffer, optimizer, config)
     assert stats.n_updates == EXPECTED_UPDATES
+
+
+def test_explained_variance_is_one_when_values_match_returns():
+    """old_values == returns over the full rollout -> explained_variance == 1.0.
+
+    EV reads the buffer's stored collection-time values (``_values``, no public
+    setter) and GAE returns, so overwrite both to identical real-variance arrays:
+    the residual variance is 0 and EV is exactly 1.0 regardless of the update.
+    """
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    target = torch.arange(T, dtype=torch.float32)  # genuine variance in y_true
+    buffer.returns = target.clone()
+    buffer._values = [target[t].clone() for t in range(T)]
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+
+    stats = ppo_update(
+        ac, buffer, optimizer, PPOConfig(n_epochs=N_EPOCHS, minibatch_size=MINIBATCH)
+    )
+    assert math.isfinite(stats.explained_variance)
+    assert stats.explained_variance == 1.0
+
+
+def test_explained_variance_is_finite_zero_on_constant_returns():
+    """All-equal returns (Var == 0) -> explained_variance is a finite 0.0, not nan.
+
+    On a constant-return target the EV ratio divides by ~0; SB3/CleanRL yield nan
+    there. The EXPLAINED_VAR_EPS guard clamps it to 0.0 so a near-constant-return
+    stub does not break training-loop finite-value assertions.
+
+    Revert-verify: remove the ``var_y < EXPLAINED_VAR_EPS`` guard in
+    ``_explained_variance`` and EV becomes 0/0 -> nan, failing isfinite below.
+    """
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    buffer.returns = torch.full((T,), 3.0)  # zero-variance y_true
+    buffer._values = [torch.tensor(1.0) for _ in range(T)]
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+
+    stats = ppo_update(
+        ac, buffer, optimizer, PPOConfig(n_epochs=N_EPOCHS, minibatch_size=MINIBATCH)
+    )
+    assert math.isfinite(stats.explained_variance)
+    assert stats.explained_variance == 0.0

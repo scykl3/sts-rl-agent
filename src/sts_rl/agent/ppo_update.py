@@ -30,6 +30,9 @@ DEFAULT_MAX_GRAD_NORM: float = 0.5
 # Denominator floor for per-minibatch advantage normalization; avoids a blow-up
 # when a minibatch has near-zero advantage spread.
 ADV_NORM_EPS: float = 1e-8
+# Return-variance floor below which explained variance is ill-conditioned; we
+# return a finite 0.0 rather than SB3/CleanRL's nan (see _explained_variance).
+EXPLAINED_VAR_EPS: float = 1e-8
 
 
 @dataclass(frozen=True)
@@ -60,8 +63,9 @@ class PPOConfig:
 class PPOStats:
     """Mean-over-minibatches diagnostics from one :func:`ppo_update` call.
 
-    Every float is averaged across all ``n_updates`` minibatch steps; an empty
-    buffer yields all-zero fields with ``n_updates == 0``.
+    Every float is averaged across all ``n_updates`` minibatch steps EXCEPT
+    ``explained_variance``, which is computed once over the whole rollout; an
+    empty buffer yields all-zero fields with ``n_updates == 0``.
     """
 
     policy_loss: float
@@ -71,7 +75,28 @@ class PPOStats:
     approx_kl: float
     clip_fraction: float
     grad_norm: float
+    # Fraction of the return's variance the value function predicts: 1.0 is
+    # perfect, 0.0 is no better than predicting the mean, and it can be negative.
+    explained_variance: float
     n_updates: int
+
+
+def _explained_variance(y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
+    """Fraction of the return variance the value function explains (SB3 idiom).
+
+    ``1 - Var(y_true - y_pred) / Var(y_true)``. Uses POPULATION variance
+    (``unbiased=False``) to match the ``np.var`` SB3/CleanRL use, not torch's
+    default sample variance. On a (near-)constant-return target ``Var(y_true)``
+    is ~0 and the ratio is ill-conditioned: SB3/CleanRL divide through and yield
+    nan, but we clamp to a finite 0.0 so the diagnostic never poisons a
+    downstream finite-value assertion. EV is only meaningful on state-dependent
+    returns anyway.
+    """
+    var_y = torch.var(y_true, unbiased=False)
+    if float(var_y) < EXPLAINED_VAR_EPS:
+        return 0.0
+    # Divide as tensors so the guarded-out zero-variance path matches SB3's nan.
+    return float(1.0 - torch.var(y_true - y_pred, unbiased=False) / var_y)
 
 
 def ppo_update(
@@ -178,8 +203,16 @@ def ppo_update(
             approx_kl=0.0,
             clip_fraction=0.0,
             grad_norm=0.0,
+            explained_variance=0.0,
             n_updates=0,
         )
+
+    # Explained variance is a property of the collection-time values vs the GAE
+    # returns (both fixed across the update), so compute it ONCE over the full
+    # rollout, not as a per-minibatch average. One unshuffled full-width pass
+    # yields a single batch carrying the whole rollout's old_values/returns.
+    (full_batch,) = buffer.iter_minibatches(len(buffer), shuffle=False)
+    explained_variance = _explained_variance(full_batch.old_values, full_batch.returns)
 
     return PPOStats(
         policy_loss=policy_loss_sum / n_updates,
@@ -189,5 +222,6 @@ def ppo_update(
         approx_kl=approx_kl_sum / n_updates,
         clip_fraction=clip_fraction_sum / n_updates,
         grad_norm=grad_norm_sum / n_updates,
+        explained_variance=explained_variance,
         n_updates=n_updates,
     )
