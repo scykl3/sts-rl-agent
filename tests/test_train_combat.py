@@ -15,6 +15,7 @@ forwards it to the stubbed ``evaluate`` (recompute path).
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from typing import cast
@@ -34,6 +35,17 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import train_combat  # noqa: E402  (imported after the sys.path insert above)
+
+# _parse_encounters imports the native engine lazily, so its test needs a build;
+# the rest of this module is engine-free and must still run without one. Probe
+# once and skip just that test when the engine is absent (matching the suite's
+# ImportError -> skip idiom; importorskip would miss a broken-build ImportError).
+try:
+    import sts_rl.env._engine  # noqa: F401,E402
+
+    _ENGINE_BUILT = True
+except ImportError:  # pragma: no cover - exercised only without a build
+    _ENGINE_BUILT = False
 
 # Arbitrary holdout band the recompute path would request. Small; the stubbed
 # evaluate never runs it, so the values only feed the seed-band assertion.
@@ -131,3 +143,24 @@ def test_final_eval_report_evaluates_when_no_periodic_eval(
     # and greedily (deterministic=True is passed explicitly, not defaulted).
     assert seen_seeds == make_holdout_seeds(_EVAL_SEED_BASE, _EVAL_EPISODES)
     assert seen_kwargs.get("deterministic") is True
+
+
+@pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")
+def test_parse_encounters_validates_against_enum_members() -> None:
+    """The --encounters parser accepts a real member, rejects a bogus name, and
+    rejects the engine's INVALID sentinel (which dir()-based validation, admitting
+    every attribute name, wrongly accepted).
+    """
+    from sts_rl.env._engine import slaythespire as sts
+
+    # A real member parses to exactly that enum value.
+    assert train_combat._parse_encounters("GREMLIN_NOB") == (sts.MonsterEncounter.GREMLIN_NOB,)
+
+    # A genuinely unknown name is still rejected (unchanged behavior).
+    with pytest.raises(argparse.ArgumentTypeError):
+        train_combat._parse_encounters("NOT_A_REAL_ENCOUNTER")
+
+    # INVALID is a real __members__ entry but the engine's sentinel, so the parser
+    # must reject it explicitly rather than build a battle from it.
+    with pytest.raises(argparse.ArgumentTypeError):
+        train_combat._parse_encounters("INVALID")

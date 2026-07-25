@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from typing import Any
 
 import gymnasium as gym
 
@@ -58,6 +59,33 @@ DEFAULT_EVAL_EPISODES = 256
 # guaranteed disjoint, so overlap is possible but negligible over a run.
 DEFAULT_SEED = 0
 DEFAULT_EVAL_BASE_SEED = 1_000_000
+
+
+def _parse_encounters(spec: str) -> tuple[Any, ...]:
+    """argparse ``type`` for --encounters: parse "A,B,C" into MonsterEncounter values.
+
+    The engine is imported lazily (only when the CLI is actually parsed) so this
+    module still imports engine-free. Raises ``argparse.ArgumentTypeError`` naming
+    any unknown encounter, validated against ``sts.MonsterEncounter.__members__``
+    (the real enum members: unlike ``dir()`` this excludes Python attributes such
+    as ``name``/``value`` and the engine's ``INVALID`` sentinel).
+    """
+    from sts_rl.env._engine import slaythespire as sts
+
+    members = sts.MonsterEncounter.__members__
+    names = [part.strip() for part in spec.split(",") if part.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("--encounters given but names an empty set")
+    chosen = []
+    for name in names:
+        if name == "INVALID":
+            raise argparse.ArgumentTypeError(
+                "INVALID is the engine's sentinel, not a real MonsterEncounter"
+            )
+        if name not in members:
+            raise argparse.ArgumentTypeError(f"unknown MonsterEncounter {name!r}")
+        chosen.append(members[name])
+    return tuple(chosen)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -151,6 +179,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM, help="encoder trunk width")
     parser.add_argument("--ascension", type=int, default=DEFAULT_ASCENSION, help="ascension level")
     parser.add_argument(
+        "--encounters",
+        type=_parse_encounters,
+        default=None,
+        help=(
+            "comma-separated MonsterEncounter names to sample each combat from "
+            "(e.g. GREMLIN_NOB,LAGAVULIN,THREE_SENTRIES); unset uses the run's "
+            "first combat"
+        ),
+    )
+    parser.add_argument(
         "--max-episode-steps",
         type=int,
         default=DEFAULT_MAX_EPISODE_STEPS,
@@ -222,8 +260,16 @@ def main() -> None:
     # instance for greedy holdout eval - both the in-loop periodic eval and the
     # final eval - so evaluate() resetting per seed never disturbs the training
     # collector's rollout stream.
-    env = StsEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
-    eval_env = StsEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
+    env = StsEnv(
+        ascension=args.ascension,
+        max_episode_steps=args.max_episode_steps,
+        encounters=args.encounters,
+    )
+    eval_env = StsEnv(
+        ascension=args.ascension,
+        max_episode_steps=args.max_episode_steps,
+        encounters=args.encounters,
+    )
 
     # Provenance for reproducibility: engine_commit and interface_version are
     # always-present info keys. Read them from an initial reset; train() re-resets

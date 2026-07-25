@@ -13,6 +13,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without a build
     pytest.skip(f"engine not built ({exc})", allow_module_level=True)
 
+from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.adapter import StsEnv
 from sts_rl.env.reward import RewardConfig, beta
 from sts_rl.interface import (
@@ -28,6 +29,18 @@ REGRESSION_SEED = 42
 MAX_SCRIPTED_STEPS = 400
 _END_TURN = ACTION_BLOCK_BY_NAME["END_TURN"].start
 _PROCEED = ACTION_BLOCK_BY_NAME["PROCEED"].start  # a non-combat index, always illegal here
+
+# Chosen-encounter fixtures: a single elite and the sampled elite pool the
+# headroom training run uses. GREMLIN_NOB is the single-monster elite asserted on.
+GREMLIN_NOB = sts.MonsterEncounter.GREMLIN_NOB
+ELITE_ENCOUNTERS = (
+    GREMLIN_NOB,
+    sts.MonsterEncounter.LAGAVULIN,
+    sts.MonsterEncounter.THREE_SENTRIES,
+)
+ELITE_ROLLOUT_STEPS = 8
+# Seeds to sample the elite pool across when locking multi-encounter variety.
+ELITE_SAMPLE_SEEDS = 40
 
 
 def _greedy_to_terminal(env: StsEnv, obs_info):
@@ -250,4 +263,80 @@ def test_truncation_when_step_cap_hit() -> None:
     _, reward, terminated, truncated, info = env.step(_END_TURN)
     assert truncated and not terminated
     assert "episode" in info
+    env.close()
+
+
+def _encounter_ids(info: dict) -> tuple[str, ...]:
+    """The monster-id tuple of the current battle, for encounter-identity checks."""
+    return tuple(m.monster_id for m in info["combat"].monsters)
+
+
+def _assert_obs_finite(env: StsEnv, obs) -> None:
+    """The observation is in-space and every channel is finite."""
+    assert env.observation_space.contains(obs)
+    for key, value in obs.items():
+        arr = np.asarray(value, dtype=np.float64)
+        assert np.all(np.isfinite(arr)), f"non-finite values in obs[{key!r}]"
+
+
+def test_chosen_encounter_builds_that_battle() -> None:
+    # A single-encounter pool builds exactly that elite (no navigation): the
+    # battle is one monster, the Gremlin Nob.
+    env = StsEnv(encounters=[GREMLIN_NOB])
+    _, info = env.reset(seed=REGRESSION_SEED)
+    snap = info["combat"]
+    assert snap.monster_count == 1
+    assert snap.monsters[0].monster_id == GREMLIN_NOB.name  # engine ids "GREMLIN_NOB"
+    env.close()
+
+
+def test_sampled_encounter_is_deterministic_given_seed() -> None:
+    # The pool is sampled from self.np_random, seeded by reset(seed=...), so two
+    # resets on the same seed pick the same encounter.
+    env = StsEnv(encounters=ELITE_ENCOUNTERS)
+    _, info_a = env.reset(seed=REGRESSION_SEED)
+    _, info_b = env.reset(seed=REGRESSION_SEED)
+    assert _encounter_ids(info_a) == _encounter_ids(info_b)
+    env.close()
+
+
+def test_sampled_encounter_pool_yields_more_than_one_encounter() -> None:
+    # Variety lock: across many seeds the pool must build more than one distinct
+    # encounter, guarding against a regression that always returns the first pool
+    # element. env._bc.encounter is the engine's built-encounter enum. These 40
+    # seeds sample all three elites in practice, but we assert only ">1 distinct"
+    # (not "== 3") so the test stays robust to any RNG-stream shift while still
+    # failing hard on a first-element-only regression.
+    env = StsEnv(encounters=ELITE_ENCOUNTERS)
+    sampled = set()
+    for seed in range(ELITE_SAMPLE_SEEDS):
+        env.reset(seed=seed)
+        sampled.add(env._bc.encounter)
+    env.close()
+    assert sampled <= set(ELITE_ENCOUNTERS)  # only pool members are ever built
+    assert len(sampled) > 1
+
+
+def test_empty_encounters_rejected() -> None:
+    from sts_rl.interface import InterfaceError
+
+    with pytest.raises(InterfaceError):
+        StsEnv(encounters=[])
+
+
+def test_elite_rollout_runs_with_finite_observations() -> None:
+    # A short random-legal rollout on the sampled elite pool runs without error
+    # and every observation stays finite (exercises encode_observation on the
+    # directly-built elite battle).
+    env = StsEnv(encounters=ELITE_ENCOUNTERS)
+    obs, info = env.reset(seed=REGRESSION_SEED)
+    _assert_obs_finite(env, obs)
+    rng = np.random.default_rng(0)
+    for _ in range(ELITE_ROLLOUT_STEPS):
+        action = int(rng.choice(np.flatnonzero(info["action_mask"])))
+        obs, reward, terminated, truncated, info = env.step(action)
+        _assert_obs_finite(env, obs)
+        assert np.isfinite(reward)
+        if terminated or truncated:
+            break
     env.close()
