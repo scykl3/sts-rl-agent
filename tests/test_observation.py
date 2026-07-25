@@ -5,6 +5,8 @@ Requires the built engine; skips cleanly otherwise.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -16,15 +18,74 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.adapter import StsEnv
 from sts_rl.env.engine import start_combat
-from sts_rl.env.observation import encode_observation
+from sts_rl.env.observation import (
+    MAP_COLS,
+    MAP_ROWS,
+    _MAP_CUR_BLOCK,
+    _MAP_CUR_POS,
+    _MAP_CUR_ROOM_ONEHOT,
+    _MAP_NEXT_BLOCK,
+    _MAP_PER_COL_FEATS,
+    _empty_obs,
+    _fill_map_context,
+    encode_observation,
+)
+from sts_rl.env.run import execute_overworld_action, overworld_actions, start_run
 from sts_rl.env.spaces import build_observation_space
-from sts_rl.interface import OBS_FIELDS, OBS_FIELD_BY_NAME
+from sts_rl.interface import (
+    ACTION_BLOCK_BY_NAME,
+    MAP_CONTEXT_DIM,
+    N_NODE_TYPES,
+    OBS_FIELDS,
+    OBS_FIELD_BY_NAME,
+)
 
 REGRESSION_SEED = 42
+
+# Overworld screen name and a safety cap for driving the run to its first map.
+_MAP_SCREEN = "MAP_SCREEN"
+_MAX_DRIVE = 50
+
+# Fields populated only in combat; every one must stay zero in an overworld obs.
+_COMBAT_ONLY_FIELDS = (
+    "player_powers",
+    "potion_ids",
+    "potion_usable",
+    "hand_ids",
+    "hand_feats",
+    "draw_ids",
+    "discard_ids",
+    "exhaust_ids",
+    "enemy_ids",
+    "enemy_scalars",
+    "enemy_move_ids",
+    "enemy_intent_hidden",
+    "enemy_powers",
+    "enemy_alive",
+)
 
 
 def _combat(seed: int = REGRESSION_SEED):
     return start_combat(seed, ascension=0)
+
+
+def _drive_to_first_map_screen(seed: int = REGRESSION_SEED):
+    """Return a run positioned at its first map screen (still before the first row)."""
+    gc = start_run(seed=seed)
+    for _ in range(_MAX_DRIVE):
+        if gc.screen_state.name == _MAP_SCREEN:
+            return gc
+        execute_overworld_action(gc, overworld_actions(gc)[0])
+    raise AssertionError("run never reached a map screen")
+
+
+def _encoded_reachable_cols(map_context) -> set[int]:
+    """Columns flagged reachable in a map_context vector."""
+    return {
+        col
+        for col in range(MAP_COLS)
+        if map_context[_MAP_CUR_BLOCK + col * _MAP_PER_COL_FEATS] == 1.0
+    }
 
 
 def test_encoded_obs_matches_interface_dtype_shape_and_is_finite() -> None:
@@ -193,3 +254,129 @@ def test_adapter_returns_encoded_not_placeholder_observation() -> None:
     assert np.count_nonzero(obs["hand_ids"]) > 0
     assert obs["enemy_alive"].sum() >= 1
     env.close()
+
+
+def test_map_context_layout_fills_dim_and_aligns_to_map_select() -> None:
+    # The named sub-widths tile map_context exactly, and the per-column block is
+    # keyed to the MAP_SELECT action index (one column per selectable map move).
+    assert _MAP_CUR_BLOCK + _MAP_NEXT_BLOCK == MAP_CONTEXT_DIM
+    assert MAP_COLS == ACTION_BLOCK_BY_NAME["MAP_SELECT"].count
+
+
+def test_overworld_obs_is_valid_with_bc_none() -> None:
+    # bc=None yields a space-valid, finite observation whose run-level scalars come
+    # from the GameContext and whose combat-only fields are all zero.
+    gc = _drive_to_first_map_screen()
+    obs = encode_observation(gc, None)
+
+    assert build_observation_space().contains(obs)
+    for field in OBS_FIELDS:
+        assert np.isfinite(obs[field.name]).all(), field.name
+
+    # player_scalars: hp_cur, hp_max, block, energy, gold, floor, ascension, turn
+    scalars = obs["player_scalars"]
+    assert scalars[0] == gc.cur_hp > 0
+    assert scalars[1] == gc.max_hp > 0
+    assert scalars[2] == 0.0  # no block out of combat
+    assert scalars[3] == 0.0  # no energy out of combat
+    assert scalars[4] == gc.gold
+    assert scalars[5] == gc.floor_num
+    assert scalars[7] == 0.0  # no turn counter out of combat
+
+    # Screen one-hot marks exactly the map screen; Ironclad keeps Burning Blood.
+    assert obs["screen_onehot"][int(sts.ScreenState.MAP_SCREEN)] == 1.0
+    assert obs["screen_onehot"].sum() == 1.0
+    assert obs["relics_multihot"][int(sts.RelicId.BURNING_BLOOD)] == 1.0
+
+    for name in _COMBAT_ONLY_FIELDS:
+        assert not np.any(obs[name]), name
+
+
+def test_map_context_reachable_matches_legal_map_moves_pre_map() -> None:
+    # Before the first row, the reachable columns encoded in map_context equal the
+    # engine's legal map moves, and each column's features match its room type.
+    gc = _drive_to_first_map_screen()
+    assert gc.cur_map_node_y < 0  # standing before the first map row
+
+    mc = encode_observation(gc, None)["map_context"]
+    legal_cols = {action.idx1 for action in overworld_actions(gc)}
+    assert _encoded_reachable_cols(mc) == legal_cols
+
+    elite = int(sts.Room.ELITE)
+    combat_rooms = (int(sts.Room.MONSTER), elite)
+    for col in legal_cols:
+        slot = _MAP_CUR_BLOCK + col * _MAP_PER_COL_FEATS
+        room_id = int(gc.map.get_room_type(col, 0))
+        assert mc[slot + 1] == (1.0 if room_id in combat_rooms else 0.0)
+        assert mc[slot + 2] == (1.0 if room_id == elite else 0.0)
+        assert mc[slot + 3] == room_id / (N_NODE_TYPES - 1)
+
+    # Pre-map: current-room one-hot is empty and the position is the negative
+    # sentinel (cur == (-1, -1)); act 1 / floor 0 give a zero progress block.
+    assert not np.any(mc[:_MAP_CUR_ROOM_ONEHOT])
+    assert mc[_MAP_CUR_ROOM_ONEHOT] < 0.0
+    assert mc[_MAP_CUR_ROOM_ONEHOT + 1] < 0.0
+    progress = _MAP_CUR_ROOM_ONEHOT + _MAP_CUR_POS
+    assert mc[progress] == 0.0  # (act 1 - 1) / (MAX_ACTS - 1)
+    assert mc[progress + 1] == 0.0  # floor 0
+
+
+def test_map_context_edges_branch_after_first_choice() -> None:
+    # After stepping onto the first row, the reachable set is the engine's edge list
+    # from the current node, and the current-node block reflects the entered node.
+    gc = _drive_to_first_map_screen()
+    execute_overworld_action(gc, overworld_actions(gc)[0])
+    cur_x, cur_y = gc.cur_map_node_x, gc.cur_map_node_y
+    assert cur_y >= 0
+
+    obs = _empty_obs()
+    _fill_map_context(obs, gc)
+    mc = obs["map_context"]
+
+    assert _encoded_reachable_cols(mc) == {int(c) for c in gc.map.edges(cur_x, cur_y)}
+    # Current-node one-hot marks the entered room; position is normalized in [0, 1].
+    assert mc[int(gc.cur_room)] == 1.0
+    assert mc[_MAP_CUR_ROOM_ONEHOT] == cur_x / (MAP_COLS - 1)
+    assert mc[_MAP_CUR_ROOM_ONEHOT + 1] == cur_y / (MAP_ROWS - 1)
+
+
+def test_map_context_encodes_act_boss_above_top_row() -> None:
+    # The act boss is not stored in the map grid: it sits above the top row and is
+    # reached by that row's edges, so the next-row room lookup returns INVALID. It
+    # must still encode as a combat node (BOSS), not read as SHOP (room id 0).
+    # Driving a real run to the top row means clearing a whole act, so we encode a
+    # synthetic cursor over the real generated map (only _fill_map_context's inputs).
+    spire_map = start_run(seed=REGRESSION_SEED).map
+
+    def _real(x: int, y: int) -> bool:
+        return 0 <= int(spire_map.get_room_type(x, y)) < N_NODE_TYPES
+
+    top_row = max(y for y in range(MAP_ROWS) for x in range(MAP_COLS) if _real(x, y))
+    src_x = next(
+        x for x in range(MAP_COLS) if _real(x, top_row) and len(spire_map.edges(x, top_row)) > 0
+    )
+    boss_cols = {int(c) for c in spire_map.edges(src_x, top_row)}
+    # Precondition the fix depends on: the boss node is genuinely unstored, so the
+    # naive next-row lookup would misencode it as SHOP (room id 0 -> all-zero features).
+    assert boss_cols and all(not _real(c, top_row + 1) for c in boss_cols)
+
+    fake_gc = SimpleNamespace(
+        map=spire_map,
+        cur_map_node_x=src_x,
+        cur_map_node_y=top_row,
+        cur_room=int(spire_map.get_room_type(src_x, top_row)),
+        act=1,
+        floor_num=top_row,
+    )
+    obs = _empty_obs()
+    _fill_map_context(obs, fake_gc)
+    mc = obs["map_context"]
+
+    assert _encoded_reachable_cols(mc) == boss_cols
+    boss_norm = int(sts.Room.BOSS) / (N_NODE_TYPES - 1)
+    for col in boss_cols:
+        slot = _MAP_CUR_BLOCK + col * _MAP_PER_COL_FEATS
+        assert mc[slot] == 1.0  # reachable
+        assert mc[slot + 1] == 1.0  # is_combat: the boss is a fight
+        assert mc[slot + 2] == 0.0  # is_elite: the boss is not an elite
+        assert mc[slot + 3] == boss_norm  # room type is BOSS, not SHOP (id 0)
