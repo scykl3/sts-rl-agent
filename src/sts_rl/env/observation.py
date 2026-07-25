@@ -79,6 +79,18 @@ def _empty_obs() -> Obs:
     return {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
 
 
+def _read_status(player: Any, status: Any) -> float:
+    """Read one player status as a float, tolerating bit-only powers."""
+    try:
+        return float(player.getStatus(status))
+    except IndexError:
+        # Engine quirk: a bit-only status (e.g. BARRICADE) sets its presence bit
+        # but has no statusMap entry, so getStatus (statusMap.at) throws. Encode
+        # such a binary power as presence 1.0; amount-bearing statuses (STRENGTH,
+        # etc.) take the map value, absent ones 0.0.
+        return 1.0 if player.hasStatus(status) else 0.0
+
+
 def encode_observation(gc: Any, bc: Any) -> Obs:
     """Encode a live ``GameContext``/``BattleContext`` into the observation dict.
 
@@ -119,7 +131,7 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
     # -- player_powers: dense amount per player status id
     powers = obs["player_powers"]
     for idx, status in _PLAYER_STATUSES:
-        powers[idx] = player.getStatus(status)
+        powers[idx] = _read_status(player, status)
 
     # -- potions: id + usable per belt slot (empty slots stay PAD/0)
     potion_ids = obs["potion_ids"]
