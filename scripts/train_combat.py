@@ -41,6 +41,7 @@ from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
+from sts_rl.env.encounters import act1_encounter_pool
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -184,8 +185,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "comma-separated MonsterEncounter names to sample each combat from "
-            "(e.g. GREMLIN_NOB,LAGAVULIN,THREE_SENTRIES); unset uses the run's "
-            "first combat"
+            "(e.g. GREMLIN_NOB,LAGAVULIN,THREE_SENTRIES); unset samples the "
+            "canonical full Act 1 pool (hallway fights + the three elites)"
         ),
     )
     parser.add_argument(
@@ -255,6 +256,13 @@ def main() -> None:
     # Same lazy import as build_arg_parser, keeping this module's import engine-free.
     from sts_rl.env.adapter import StsEnv
 
+    # Default the combat pool to the canonical full sampled Act 1 set (hallway
+    # fights + the three elites) when --encounters is unset; an explicit
+    # --encounters list overrides it. Resolved here rather than as the argparse
+    # default so --help stays readable (the default would otherwise render as the
+    # full enum tuple) and the pool is built once, at the point of use.
+    encounters = args.encounters if args.encounters is not None else act1_encounter_pool()
+
     # Two env instances: `env` is the training env (its reset stream is seeded via
     # TrainConfig.seed through the collector), and `eval_env` is a SEPARATE
     # instance for greedy holdout eval - both the in-loop periodic eval and the
@@ -263,12 +271,12 @@ def main() -> None:
     env = StsEnv(
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
-        encounters=args.encounters,
+        encounters=encounters,
     )
     eval_env = StsEnv(
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
-        encounters=args.encounters,
+        encounters=encounters,
     )
 
     # Provenance for reproducibility: engine_commit and interface_version are
