@@ -49,6 +49,7 @@ import torch
 from torch import Tensor
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.rollout_buffer import RolloutBuffer
 from sts_rl.interface import (
     OBS_FIELDS,
@@ -121,6 +122,8 @@ class RolloutCollector:
         actor_critic: ActorCritic,
         device: torch.device | None = None,
         seed: int | None = None,
+        gamma: float = DEFAULT_GAMMA,
+        gae_lambda: float = DEFAULT_GAE_LAMBDA,
     ) -> None:
         """Bind an env and network, resetting the env once to prime the stream.
 
@@ -130,7 +133,9 @@ class RolloutCollector:
         seeding the global torch RNG once at the training entry point
         (``torch.manual_seed``), per CleanRL/SB3 - so constructing a collector
         never clobbers another collector's RNG. ``device`` is inferred from the
-        network's parameters when omitted.
+        network's parameters when omitted. ``gamma``/``gae_lambda`` are the GAE
+        discount and trace-decay forwarded to ``compute_advantages`` on every
+        collect, defaulting to the shared ``DEFAULT_GAMMA``/``DEFAULT_GAE_LAMBDA``.
         """
         self._env = env
         self._actor_critic = actor_critic
@@ -143,6 +148,8 @@ class RolloutCollector:
                     "pass device explicitly"
                 ) from exc
         self._device = device
+        self._gamma = gamma
+        self._gae_lambda = gae_lambda
 
         # Seed only the env, once, via its construction-time reset: the env owns
         # an instance-local Generator (gymnasium's self.np_random), so this can't
@@ -231,7 +238,9 @@ class RolloutCollector:
                 last_value = self._actor_critic.get_value(
                     observation_to_batched_tensors(self._obs, self._device)
                 )
-                buffer.compute_advantages(last_value.squeeze(0))
+                buffer.compute_advantages(
+                    last_value.squeeze(0), gamma=self._gamma, gae_lambda=self._gae_lambda
+                )
         finally:
             self._actor_critic.train(was_training)
 
