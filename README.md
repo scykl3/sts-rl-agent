@@ -35,19 +35,22 @@ not implement).
 
 ## Status
 
-Implementation is just beginning. The next step is **Phase 0**: repo scaffold,
-engine build, enum validation, and interface sign-off.
+Phases 0-2 are implemented. The engine build, interface, observation encoder, and
+action masking are in place, and the from-scratch PPO stack trains against the
+live engine on single Act 1 combats. On sampled Act 1 elites (Gremlin Nob,
+Lagavulin, Three Sentries) the greedy win rate climbs from near the random-legal
+floor (0-3.5%) to ~99%. Phase 3 (full Act 1 clear) is next.
 
 ## Roadmap
 
-| Phase | Milestone |
-|---|---|
-| 0 | Repo scaffold, engine build, enum validation, interface sign-off |
-| 1 | Observation encoder + action masking against the live engine |
-| 2 | Self-implemented PPO on single Act 1 combats (>90% on sampled combats) |
-| 3 | Full Act 1 clear (>80% clear rate) |
-| 4 | Full-run training, Acts 1-3, toward the 50-70% primary band |
-| 5 | RL + MCTS search extension (deferred; needs a trained policy/value first) |
+| Phase | Milestone | Status |
+|---|---|---|
+| 0 | Repo scaffold, engine build, enum validation, interface sign-off | Done |
+| 1 | Observation encoder + action masking against the live engine | Done |
+| 2 | Self-implemented PPO on single Act 1 combats (>90% on sampled combats) | Done |
+| 3 | Full Act 1 clear (>80% clear rate) | Next |
+| 4 | Full-run training, Acts 1-3, toward the 50-70% primary band | Planned |
+| 5 | RL + MCTS search extension (deferred; needs a trained policy/value first) | Planned |
 
 ## Design decisions
 
@@ -56,8 +59,8 @@ evidence behind each choice are recorded as
 [Architecture Decision Records](https://adr.github.io/) (ADRs). The decision log
 will be published under `decisions/` as the project matures - each record's
 evidence section filled in from real results (benchmarks, learning curves) as the
-corresponding phase lands. It is not in the repository yet because implementation
-is just starting.
+corresponding phase lands. It is not in the repository yet; it will be published
+once its evidence sections are backfilled from the landed phases.
 
 ## Engine dependency and fork
 
@@ -66,20 +69,27 @@ The engine originates from
 The submodule under `engine/sts_lightspeed` does not point at upstream directly:
 it tracks a light fork
 ([`maxy1991991/sts_lightspeed`](https://github.com/maxy1991991/sts_lightspeed),
-branch `portable-build`) that carries a build-portability patch. No simulation
-logic is changed, so runs stay RNG-accurate against upstream. Relative to the
-upstream `heart1` tag, the pinned commit adds one change:
+branch `master`) that carries a build-portability patch and a few
+Python-binding additions. No simulation logic is changed, so runs stay
+RNG-accurate against upstream. Relative to the upstream `heart1` tag, the pinned
+commit adds:
 
 - **Portable macOS SDK path.** Upstream hardcodes an absolute SDK path
   (`/Library/Developer/CommandLineTools/SDKs/MacOSX15.2.sdk`) before the
   `project()` command, which fails to configure on any machine without that exact
   SDK. The fork pins that path only when it exists and otherwise lets CMake
   auto-detect the active SDK.
+- **Read-only `BattleContext` bindings** exposing the potion belt and the
+  card-select selected bits for observation encoding.
+- **Optional encounter selection.** `create_battle_context` accepts an optional
+  `MonsterEncounter`, so a caller can spawn a chosen combat by reusing the
+  engine's existing `BattleContext::init(gc, encounter)` path. It defaults to the
+  rolled encounter, so existing callers are unchanged.
 
-The patch is kept on a branch (rather than pinning upstream and patching at build
-time) so the exact vendored source is a single submodule checkout. If it lands
-upstream, the submodule can be repointed at `daniel-ziegler/sts_lightspeed` with
-no other change.
+The fork carries these changes so the exact vendored source is a single submodule
+checkout, rather than pinning upstream and re-applying a patch at build time. If
+they land upstream, the submodule can be repointed at
+`daniel-ziegler/sts_lightspeed` with no other change.
 
 ## License and attribution
 

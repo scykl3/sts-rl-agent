@@ -9,7 +9,7 @@
 
 [engine]
 repo = "https://github.com/maxy1991991/sts_lightspeed"
-branch = "portable-build"
+branch = "master"
 commit = "c1a777f3c60badf86b94469045075f021cc86e85"
 module = "slaythespire"
 upstream = "https://github.com/daniel-ziegler/sts_lightspeed"
