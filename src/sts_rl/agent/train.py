@@ -41,7 +41,6 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
 
 import gymnasium as gym
 import numpy as np
@@ -218,7 +217,9 @@ class TrainHistory:
         return max(self.eval_reports, key=lambda record: record.report.win_rate)
 
 
-def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None) -> TrainHistory:
+def train(
+    env: gym.Env | VecEnvProtocol, config: TrainConfig, *, eval_env: gym.Env | None = None
+) -> TrainHistory:
     """Run ``config.num_iterations`` collect->update iterations; return the history.
 
     Seeds the process-global RNGs once up front (the reproducibility contract:
@@ -272,6 +273,9 @@ def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None)
     single_buffer: RolloutBuffer | None = None
     vec_buffer: VecRolloutBuffer | None = None
     if config.num_envs == 1:
+        # Single-env path: env is a plain gym.Env. isinstance narrows the union for
+        # mypy (a vectorized env is not a gym.Env), so no cast is needed.
+        assert isinstance(env, gym.Env)
         single_collector = RolloutCollector(
             env,
             actor_critic,
@@ -281,14 +285,17 @@ def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None)
         )
         single_buffer = RolloutBuffer()
     else:
-        vec_env = cast(VecEnvProtocol, env)
-        if vec_env.num_envs != config.num_envs:
+        # Vectorized path: env is a VecEnvProtocol (e.g. SubprocVecEnv), which is
+        # not a gym.Env, so this narrows the union to VecEnvProtocol for mypy
+        # (mirroring the single-env branch) without a cast.
+        assert not isinstance(env, gym.Env)
+        if env.num_envs != config.num_envs:
             raise ValueError(
                 f"config.num_envs={config.num_envs} but the passed vectorized env "
-                f"reports num_envs={vec_env.num_envs}; they must match"
+                f"reports num_envs={env.num_envs}; they must match"
             )
         vec_collector = VecRolloutCollector(
-            vec_env,
+            env,
             actor_critic,
             seed=config.seed,
             gamma=config.gamma,

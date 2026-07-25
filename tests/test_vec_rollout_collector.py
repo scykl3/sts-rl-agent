@@ -52,6 +52,30 @@ def _legal_bool_mask(num_envs: int) -> torch.Tensor:
     return mask
 
 
+def _add_transition(sub: RolloutBuffer) -> None:
+    """Append one interface-valid transition to a single-env sub-buffer.
+
+    Used by the caller-bug guard tests, which build a VecRolloutBuffer's
+    sub-buffers directly to reach paths add_batch's lockstep fill cannot produce
+    (e.g. unequal per-env lengths).
+    """
+    obs = {
+        field.name: torch.zeros(
+            field.shape, dtype=torch.long if field.bounds == "id" else torch.float32
+        )
+        for field in OBS_FIELDS
+    }
+    sub.add(
+        obs=obs,
+        action=torch.zeros((), dtype=torch.long),
+        log_prob=torch.zeros(()),
+        value=torch.zeros(()),
+        reward=0.0,
+        done=0.0,
+        mask=torch.zeros(ACTION_DIM, dtype=torch.bool),
+    )
+
+
 # -- Buffer layout / shapes --------------------------------------------------
 
 
@@ -396,3 +420,87 @@ def test_vec_buffer_reset_clears() -> None:
 
     buffer.reset()
     assert len(buffer) == 0
+
+
+@pytest.mark.parametrize("bad_field", ["obs", "log_probs", "values", "rewards", "dones", "masks"])
+def test_add_batch_guards_every_batched_field_leading_dim(bad_field: str) -> None:
+    """add_batch asserts the num_envs leading dim on EVERY batched field.
+
+    The existing guard covers only actions; a wrong leading dim on any obs tensor,
+    mask, reward, done, log_prob, or value must fail loudly too, rather than
+    silently drop or misalign rows through the per-env indexing.
+    """
+    num_envs = 2
+    bad = num_envs + 1
+    obs = {field.name: torch.zeros((num_envs, *field.shape)) for field in OBS_FIELDS}
+    actions = torch.zeros(num_envs, dtype=torch.long)
+    log_probs = torch.zeros(num_envs)
+    values = torch.zeros(num_envs)
+    rewards = torch.zeros(num_envs)
+    dones = torch.zeros(num_envs)
+    masks = _legal_bool_mask(num_envs)
+
+    # Corrupt exactly the field under test to a wrong leading dim; the raised
+    # message must name it (obs fields report as "obs[<name>]").
+    if bad_field == "obs":
+        corrupted = OBS_FIELDS[0]
+        obs[corrupted.name] = torch.zeros((bad, *corrupted.shape))
+        expected_match = corrupted.name
+    elif bad_field == "log_probs":
+        log_probs = torch.zeros(bad)
+        expected_match = "log_probs"
+    elif bad_field == "values":
+        values = torch.zeros(bad)
+        expected_match = "values"
+    elif bad_field == "rewards":
+        rewards = torch.zeros(bad)
+        expected_match = "rewards"
+    elif bad_field == "dones":
+        dones = torch.zeros(bad)
+        expected_match = "dones"
+    else:  # masks
+        masks = torch.zeros((bad, ACTION_DIM), dtype=torch.bool)
+        expected_match = "masks"
+
+    with pytest.raises(ValueError, match=expected_match):
+        VecRolloutBuffer(num_envs).add_batch(
+            obs=obs,
+            actions=actions,
+            log_probs=log_probs,
+            values=values,
+            rewards=rewards,
+            dones=dones,
+            masks=masks,
+        )
+
+
+def test_iter_minibatches_rejects_unequal_sub_buffer_lengths() -> None:
+    """iter_minibatches fails loudly when envs were stepped an unequal number of times.
+
+    A caller bug (e.g. add_batch skipped an env) leaves sub-buffers of different
+    lengths; the flattened cat would otherwise silently weight envs unequally.
+    Built directly on the sub-buffers because add_batch's lockstep fill cannot
+    produce this. Advantages ARE computed first, so the ONLY thing left to raise
+    is the length guard - reverting it makes the mismatched cat succeed silently.
+    """
+    buffer = VecRolloutBuffer(2)
+    _add_transition(buffer._buffers[0])
+    _add_transition(buffer._buffers[0])  # env 0: 2 steps
+    _add_transition(buffer._buffers[1])  # env 1: 1 step
+    buffer.compute_advantages(torch.zeros(2))
+
+    with pytest.raises(RuntimeError, match="unequal"):
+        list(buffer.iter_minibatches(MINIBATCH))
+
+
+def test_iter_minibatches_empty_buffer_yields_nothing() -> None:
+    """A never-filled buffer yields no minibatches instead of crashing on the empty cat."""
+    buffer = VecRolloutBuffer(NUM_ENVS)
+    assert list(buffer.iter_minibatches(MINIBATCH)) == []
+
+
+def test_compute_advantages_rejects_wrong_last_values_leading_dim() -> None:
+    """compute_advantages asserts last_values carries the num_envs leading dim."""
+    buffer = VecRolloutBuffer(2)
+    with pytest.raises(ValueError, match="last_values"):
+        buffer.compute_advantages(torch.zeros(3))  # 3 != num_envs (2)

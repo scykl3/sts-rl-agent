@@ -258,7 +258,17 @@ class VecRolloutBuffer:
         truncation), matching :meth:`RolloutBuffer.add`; the per-step
         ``.detach().clone()`` ownership is inherited from the sub-buffers' ``add``.
         """
+        # Assert the num_envs leading axis on EVERY batched field (not just
+        # actions): a mismatch must fail loudly here rather than silently drop or
+        # misalign rows through the per-env indexing below.
+        for name, tensor in obs.items():
+            _assert_leading_dim(tensor, self.num_envs, f"obs[{name}]")
         _assert_leading_dim(actions, self.num_envs, "actions")
+        _assert_leading_dim(log_probs, self.num_envs, "log_probs")
+        _assert_leading_dim(values, self.num_envs, "values")
+        _assert_leading_dim(rewards, self.num_envs, "rewards")
+        _assert_leading_dim(dones, self.num_envs, "dones")
+        _assert_leading_dim(masks, self.num_envs, "masks")
         for i, buffer in enumerate(self._buffers):
             buffer.add(
                 obs={name: tensor[i] for name, tensor in obs.items()},
