@@ -201,6 +201,25 @@ def test_different_seed_changes_run() -> None:
     assert _param_checksum(base.actor_critic) != _param_checksum(other.actor_critic)
 
 
+def test_different_gamma_changes_run() -> None:
+    """TrainConfig.gamma reaches GAE end to end: a different gamma retrains differently.
+
+    Same seed/env/config but a different ``gamma`` changes the discounted GAE
+    returns -> different value targets and advantages -> different updates ->
+    different trained params. Guards the train->collector gamma wire end to end:
+    dropping ``gamma=config.gamma`` from the ``RolloutCollector`` call silently
+    falls back to ``DEFAULT_GAMMA`` for both runs, collapsing the checksums to
+    equal and failing this assertion (revert-verified). Uses the multi-step task
+    env, not the single-step bandit where every transition is terminal and gamma
+    cancels out of the returns.
+    """
+    # 0.5 is far from the 0.99 default, so the discounted returns differ enough
+    # to move the trained params observably.
+    base = train(_task_env(), _config(num_iterations=3, gamma=DEFAULT_GAMMA))
+    other = train(_task_env(), _config(num_iterations=3, gamma=0.5))
+    assert _param_checksum(base.actor_critic) != _param_checksum(other.actor_critic)
+
+
 @pytest.mark.parametrize(
     "field, value",
     [

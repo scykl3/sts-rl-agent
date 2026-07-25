@@ -184,9 +184,13 @@ def ppo_update(
             n_updates += 1
             epoch_minibatches += 1
 
-        # CleanRL end-of-epoch early stop: once this epoch's mean approx_kl
-        # exceeds target_kl, halt before further epochs so a single update does
-        # not push the policy too far from the data-collection policy.
+        # End-of-epoch early stop: once this epoch's mean approx_kl exceeds
+        # target_kl, halt before further epochs so a single update does not push
+        # the policy too far from the data-collection policy. The end-of-epoch
+        # TIMING follows CleanRL; the statistic is our own choice - we break on
+        # the epoch-mean approx_kl (a lower-variance stop signal), whereas CleanRL
+        # reads the last minibatch's approx_kl and SB3 checks each minibatch
+        # against 1.5 * target_kl.
         if (
             config.target_kl is not None
             and epoch_minibatches > 0

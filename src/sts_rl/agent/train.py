@@ -22,10 +22,9 @@ shared interface (an observation dict plus ``info['action_mask']``), so the same
 ``train`` drives the engine-free stub today and the real engine env later - it
 never imports or references a concrete env.
 
-Now wired in as opt-in add-ons: ``target_kl`` early-stop (via ``PPOConfig``),
-learning-rate annealing (``anneal_lr``), and ``explained_variance`` logging.
-Still deferred, each an isolated add-on not required for a correct first loop:
-checkpointing and periodic evaluation.
+Opt-in add-ons: ``target_kl`` early-stop (via ``PPOConfig``) and learning-rate
+annealing (``anneal_lr``). ``explained_variance`` is now logged every iteration
+(always on, not opt-in). Still deferred: checkpointing and periodic evaluation.
 """
 
 from __future__ import annotations
