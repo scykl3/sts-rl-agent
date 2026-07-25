@@ -34,12 +34,13 @@ import argparse
 import logging
 from pathlib import Path
 
+import gymnasium as gym
+
 from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
-from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, train
-from sts_rl.env.adapter import DEFAULT_MAX_EPISODE_STEPS, StsEnv
-from sts_rl.eval import evaluate, make_holdout_seeds
+from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
+from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +62,12 @@ DEFAULT_EVAL_BASE_SEED = 1_000_000
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI parser; every knob has a sane default and is overridable."""
+    # Imported here (and in main) rather than at module scope so importing this
+    # module stays engine-free: the adapter pulls in the native engine, and keeping
+    # it out of module scope lets the pure helpers here (e.g. _final_eval_report) be
+    # unit-tested without a built engine.
+    from sts_rl.env.adapter import DEFAULT_MAX_EPISODE_STEPS
+
     parser = argparse.ArgumentParser(
         description="Train the Ironclad agent on single Act 1 combats (live engine).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -176,6 +183,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _final_eval_report(
+    history: TrainHistory,
+    eval_env: gym.Env,
+    eval_seed_base: int,
+    eval_episodes: int,
+) -> EvalReport:
+    """Return the final policy's holdout EvalReport for the RESULT line.
+
+    When periodic eval ran, train() already evaluated the final iteration over
+    this same holdout band on this same eval_env, so reuse that record rather
+    than recomputing an identical greedy eval (saves a full holdout pass on the
+    real engine). Otherwise evaluate the final net here, passing
+    ``deterministic=True`` explicitly so the recompute matches train()'s greedy
+    eval even if evaluate()'s default ever changes. The reused and recomputed
+    bands match because main() passes the same eval_seed_base/eval_episodes into
+    both TrainConfig and this call.
+    """
+    if history.eval_reports:
+        return history.eval_reports[-1].report
+    holdout_seeds = make_holdout_seeds(eval_seed_base, eval_episodes)
+    return evaluate(history.actor_critic, eval_env, holdout_seeds, deterministic=True)
+
+
 def main() -> None:
     # INFO level so train()'s per-iteration diagnostics (its module logger) surface.
     logging.basicConfig(
@@ -183,6 +213,9 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = build_arg_parser().parse_args()
+
+    # Same lazy import as build_arg_parser, keeping this module's import engine-free.
+    from sts_rl.env.adapter import StsEnv
 
     # Two env instances: `env` is the training env (its reset stream is seeded via
     # TrainConfig.seed through the collector), and `eval_env` is a SEPARATE
@@ -235,8 +268,7 @@ def main() -> None:
     # (its in-collect resets are unseeded), so the band is not guaranteed disjoint
     # - overlap is possible but negligible over a run - giving a stable,
     # reproducible win-rate readout.
-    holdout_seeds = make_holdout_seeds(args.eval_base_seed, args.eval_episodes)
-    report = evaluate(history.actor_critic, eval_env, holdout_seeds)
+    report = _final_eval_report(history, eval_env, args.eval_base_seed, args.eval_episodes)
     env.close()
     eval_env.close()
 
