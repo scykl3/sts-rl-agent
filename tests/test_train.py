@@ -33,6 +33,7 @@ import dataclasses
 import inspect
 import logging
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -50,6 +51,8 @@ from sts_rl.agent.train import (
     train,
 )
 from sts_rl.env.stub_env import StubEnv
+from sts_rl.eval import EvalReport
+from sts_rl.interface import INTERFACE_VERSION
 
 # Small, fast, deterministic settings for the loop under test. HIDDEN is well
 # below the interface default so a run is cheap; it is a training knob, not an
@@ -60,6 +63,9 @@ NUM_ITERATIONS = 5
 N_STEPS = 128
 LEARNING_RATE = 1e-2
 CARD_REWARD_BLOCK = "CARD_REWARD_SELECT"
+# Tiny holdout for the eval/checkpoint tests: the bandit eval env terminates every
+# episode in one step, so a handful of episodes keeps these tests fast.
+EVAL_EPISODES = 4
 
 # Minibatch-step count per iteration is a function of the rollout length and the
 # PPO schedule, recomputed rather than hardcoded so a default change propagates.
@@ -274,6 +280,18 @@ def test_config_accepts_inclusive_discount_endpoints(field: str, value: float) -
     assert getattr(config, field) == value
 
 
+@pytest.mark.parametrize("value", [0, -1, -8])
+def test_config_rejects_non_positive_eval_every(value: int) -> None:
+    """eval_every, when set, must be a positive cadence; None (disabled) is fine.
+
+    Revert-verify: drop the __post_init__ eval_every guard and this fails -
+    eval_every=0 constructs without raising (and would make the loop's modulo
+    cadence a divide-by-zero).
+    """
+    with pytest.raises(ValueError, match="eval_every"):
+        dataclasses.replace(_BASE_CONFIG, eval_every=value)
+
+
 def test_config_defaults_are_symbolic() -> None:
     """Defaults come from the shared constants, not re-declared literals."""
     config = TrainConfig(num_iterations=1, n_steps=1)
@@ -283,6 +301,12 @@ def test_config_defaults_are_symbolic() -> None:
     assert config.gae_lambda == DEFAULT_GAE_LAMBDA
     assert config.anneal_lr is False  # constant LR is the default first cut
     assert config.ppo == PPOConfig()
+    # Eval + checkpointing default OFF, so an unset config is behaviour-identical
+    # to the pre-feature loop; the band defaults come from the module constants.
+    assert config.eval_every is None
+    assert config.checkpoint_dir is None
+    assert config.eval_episodes == train_module.DEFAULT_EVAL_EPISODES
+    assert config.eval_seed_base == train_module.DEFAULT_EVAL_SEED_BASE
 
 
 def test_anneal_lr_decays_learning_rate() -> None:
@@ -391,3 +415,234 @@ def test_critic_value_loss_decreases() -> None:
     # Locked under this seed at ratio ~0.57; 0.8 leaves clear headroom so a minor
     # numeric perturbation (torch build) does not flip it.
     assert trained_tail < 0.8 * initial
+
+
+def _expected_eval_iterations(num_iterations: int, eval_every: int) -> list[int]:
+    """Iterations that trigger an eval: the cadence hits plus the final iteration.
+
+    Mirrors train()'s predicate symbolically so the cadence assertions never
+    hardcode a count.
+    """
+    return [
+        i for i in range(num_iterations) if (i + 1) % eval_every == 0 or (i + 1) == num_iterations
+    ]
+
+
+@pytest.mark.parametrize("eval_every", [1, 2, 3, 5])
+def test_periodic_eval_populates_eval_reports(eval_every: int) -> None:
+    """eval_every + a separate eval_env records one EvalReport per eval iteration.
+
+    Locks the cadence (every eval_every iterations plus always the final one, so
+    eval_every > num_iterations still evaluates at least once) and that each
+    report is a well-formed win rate over the configured band. The eval env is a
+    SEPARATE instance from the training env, per train()'s contract.
+    """
+    num_iterations = 3
+    config = _config(
+        num_iterations=num_iterations,
+        eval_every=eval_every,
+        eval_episodes=EVAL_EPISODES,
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    expected_iters = _expected_eval_iterations(num_iterations, eval_every)
+    assert expected_iters  # every parametrization evaluates at least once
+    assert [rec.iteration for rec in history.eval_reports] == expected_iters
+    for rec in history.eval_reports:
+        assert 0.0 <= rec.report.win_rate <= 1.0
+        assert rec.report.n_episodes == EVAL_EPISODES
+        # global_step is the single-env running step count at the eval iteration.
+        assert rec.global_step == (rec.iteration + 1) * config.n_steps
+
+
+def test_periodic_eval_requires_separate_eval_env() -> None:
+    """eval_every set without an eval_env raises: eval must not share the train env.
+
+    Revert-verify: drop the eval_env guard in train() and this no longer raises
+    (evaluate() would then reset the training env mid-run and corrupt the
+    collector's rollout stream).
+    """
+    config = _config(num_iterations=2, eval_every=1, eval_episodes=EVAL_EPISODES)
+    with pytest.raises(ValueError, match="eval_env"):
+        train(_bandit_env(), config)  # no eval_env passed
+
+
+def test_periodic_eval_does_not_perturb_training() -> None:
+    """Periodic eval is side-effect-free on training: eval-on and eval-off match.
+
+    Greedy (deterministic) eval takes the masked argmax and draws no samples, so
+    running periodic eval must not consume the training torch RNG - the trained
+    params are bit-identical with eval ON and OFF given the same seed/config. Locks
+    the RNG-safety property that makes eval a pure readout. eval ON uses a SEPARATE
+    eval_env (per train()'s contract); checkpoint_dir is omitted so nothing is
+    written.
+
+    Revert-verify: switch the periodic evaluate() call to deterministic=False and
+    the sampling consumes the shared torch RNG, diverging the two checksums and
+    failing this.
+    """
+    eval_on = train(
+        _bandit_env(),
+        _config(num_iterations=3, eval_every=1, eval_episodes=EVAL_EPISODES),
+        eval_env=_bandit_env(),
+    )
+    eval_off = train(_bandit_env(), _config(num_iterations=3))
+    # Equal => periodic eval did not perturb the training RNG stream.
+    assert _param_checksum(eval_on.actor_critic) == _param_checksum(eval_off.actor_critic)
+
+
+def test_checkpointing_writes_best_and_last(tmp_path: Path) -> None:
+    """checkpoint_dir + eval writes reloadable best.pt/last.pt, atomically.
+
+    Asserts both files exist, no *.tmp is left behind (atomic temp->replace), the
+    payload carries the state_dict + hidden_dim + interface_version + iteration +
+    win_rate schema, a fresh ActorCritic rebuilt from the SAVED hidden_dim can load
+    the saved state_dict, best.pt records the max eval win rate, and last.pt records
+    the final iteration's eval win rate. Loading with weights_only=True also proves
+    we saved a state_dict, not a pickled module.
+    """
+    num_iterations = 3
+    config = _config(
+        num_iterations=num_iterations,
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        checkpoint_dir=str(tmp_path),
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    best_path = tmp_path / train_module.BEST_CHECKPOINT_NAME
+    last_path = tmp_path / train_module.LAST_CHECKPOINT_NAME
+    assert best_path.exists()
+    assert last_path.exists()
+    # Atomic write leaves no temp behind on the success path.
+    assert list(tmp_path.glob("*" + train_module.CHECKPOINT_TMP_SUFFIX)) == []
+
+    best_ckpt = torch.load(best_path, weights_only=True)
+    assert train_module.CHECKPOINT_MODEL_KEY in best_ckpt
+    assert train_module.CHECKPOINT_WIN_RATE_KEY in best_ckpt
+    assert train_module.CHECKPOINT_ITERATION_KEY in best_ckpt
+    # Self-describing: the checkpoint records the trunk width and interface
+    # provenance, so a reload needs no external --hidden-dim.
+    assert best_ckpt[train_module.CHECKPOINT_HIDDEN_DIM_KEY] == HIDDEN
+    assert best_ckpt[train_module.CHECKPOINT_INTERFACE_VERSION_KEY] == INTERFACE_VERSION
+
+    # A fresh network rebuilt from the SAVED hidden_dim (not a hardcoded literal)
+    # loads the saved state_dict without error - the checkpoint reloads itself
+    # (state_dict, not a pickled module).
+    fresh = ActorCritic(hidden_dim=best_ckpt[train_module.CHECKPOINT_HIDDEN_DIM_KEY])
+    fresh.load_state_dict(best_ckpt[train_module.CHECKPOINT_MODEL_KEY])
+
+    # best.pt records the max win rate across the eval curve; TrainHistory.best_eval
+    # agrees with the saved best.
+    max_win = max(rec.report.win_rate for rec in history.eval_reports)
+    best_eval = history.best_eval()
+    assert best_eval is not None
+    assert best_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] == max_win
+    assert best_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] == best_eval.report.win_rate
+
+    # last.pt captures the final iteration's weights and its eval win rate.
+    last_ckpt = torch.load(last_path, weights_only=True)
+    assert last_ckpt[train_module.CHECKPOINT_ITERATION_KEY] == num_iterations - 1
+    assert (
+        last_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] == history.eval_reports[-1].report.win_rate
+    )
+
+
+@pytest.mark.parametrize(
+    "win_seq",
+    [
+        [0.1, 0.5, 0.3],  # unique peak mid-run: best is the peak iteration, not the last
+        [0.5, 0.5],  # tie at the max: first-maximal (earliest) iteration keeps best.pt
+    ],
+)
+def test_best_checkpoint_tracks_increasing_win_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, win_seq: list[float]
+) -> None:
+    """best.pt holds the max eval win rate (strictly-greater overwrite); last.pt the final.
+
+    StubEnv's win outcome is drawn from env RNG and is policy-independent, so its
+    eval win rate is constant across iterations and cannot exercise the "new best
+    overwrites" path. Stub evaluate() with a scripted win-rate sequence to lock it:
+    best.pt must settle on the max captured at its FIRST-maximal iteration and NOT
+    be overwritten by a later equal-or-lower value, while last.pt tracks the final
+    eval. The tie sequence ([0.5, 0.5]) pins the strictly-greater rule specifically:
+    under a >= overwrite best.pt would move to the later iteration, so this fails
+    if ties overwrite.
+    """
+    reports = iter(win_seq)
+
+    def _fake_evaluate(
+        _policy: object, _env: object, seeds: object, **_kwargs: object
+    ) -> EvalReport:
+        win_rate = next(reports)
+        return EvalReport(
+            n_episodes=EVAL_EPISODES,
+            win_rate=win_rate,
+            avg_floor=0.0,
+            avg_hp=0.0,
+            avg_ep_len=1.0,
+            avg_return=win_rate,
+        )
+
+    monkeypatch.setattr(train_module, "evaluate", _fake_evaluate)
+
+    config = _config(
+        num_iterations=len(win_seq),
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        checkpoint_dir=str(tmp_path),
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    # Expectations derived from the sequence, not hardcoded.
+    expected_best = max(win_seq)
+    expected_best_iter = win_seq.index(expected_best)
+    expected_last = win_seq[-1]
+
+    best_ckpt = torch.load(tmp_path / train_module.BEST_CHECKPOINT_NAME, weights_only=True)
+    last_ckpt = torch.load(tmp_path / train_module.LAST_CHECKPOINT_NAME, weights_only=True)
+    assert best_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] == expected_best
+    assert best_ckpt[train_module.CHECKPOINT_ITERATION_KEY] == expected_best_iter
+    assert last_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] == expected_last
+
+    best_eval = history.best_eval()
+    assert best_eval is not None
+    assert best_eval.report.win_rate == expected_best
+    assert best_eval.iteration == expected_best_iter
+
+
+def test_checkpoint_dir_without_eval_writes_only_last(tmp_path: Path) -> None:
+    """checkpoint_dir set but eval_every None writes only last.pt (no eval win rates).
+
+    Documents the checkpoint-without-eval case: no eval runs (no eval_env needed),
+    so there is no win rate to rank a best - best.pt is absent and last.pt records
+    win_rate None.
+    """
+    config = _config(num_iterations=2, checkpoint_dir=str(tmp_path))  # eval_every None
+    history = train(_bandit_env(), config)  # no eval_env required when eval is off
+
+    assert history.eval_reports == []
+    last_path = tmp_path / train_module.LAST_CHECKPOINT_NAME
+    best_path = tmp_path / train_module.BEST_CHECKPOINT_NAME
+    assert last_path.exists()
+    assert not best_path.exists()  # best requires eval win rates
+    assert list(tmp_path.glob("*" + train_module.CHECKPOINT_TMP_SUFFIX)) == []
+
+    last_ckpt = torch.load(last_path, weights_only=True)
+    assert last_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] is None
+    assert last_ckpt[train_module.CHECKPOINT_ITERATION_KEY] == config.num_iterations - 1
+
+
+def test_eval_and_checkpoint_default_off(tmp_path: Path) -> None:
+    """Unset eval_every/checkpoint_dir: no eval records and no files written.
+
+    The default-OFF contract - an unset config runs the prior loop unchanged (the
+    existing loop tests cover behaviour equivalence). No eval_env is needed.
+    """
+    config = _config(num_iterations=3, checkpoint_dir=None)  # eval_every None by default
+    history = train(_bandit_env(), config)
+
+    assert history.eval_reports == []
+    assert history.best_eval() is None
+    # checkpoint_dir was None, so nothing is written anywhere (tmp_path stays empty).
+    assert list(tmp_path.iterdir()) == []
