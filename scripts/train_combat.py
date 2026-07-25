@@ -22,6 +22,10 @@ Usage:
     # Short end-to-end smoke (plumbing only; win rate is near-random):
     PYTHONPATH=src python scripts/train_combat.py \\
         --num-iterations 2 --n-steps 64 --hidden-dim 32 --eval-episodes 4
+
+    # Periodic eval every 10 iterations + best/last checkpoints, tuned entropy:
+    PYTHONPATH=src python scripts/train_combat.py \\
+        --eval-every 10 --checkpoint-dir /tmp/sts_ckpt --ent-coef 0.02
 """
 
 from __future__ import annotations
@@ -31,7 +35,8 @@ import logging
 from pathlib import Path
 
 from sts_rl.agent.encoder import HIDDEN_DIM
-from sts_rl.agent.ppo import DEFAULT_GAMMA
+from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
+from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, train
 from sts_rl.env.adapter import DEFAULT_MAX_EPISODE_STEPS, StsEnv
 from sts_rl.eval import evaluate, make_holdout_seeds
@@ -85,6 +90,57 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="linearly decay the learning rate across the run",
     )
     parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA, help="GAE discount factor")
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=DEFAULT_GAE_LAMBDA,
+        help="GAE trace-decay lambda",
+    )
+    # PPO objective/schedule knobs. Defaults are read from PPOConfig() so they
+    # track the canonical source instead of restating its literals here.
+    ppo_defaults = PPOConfig()
+    parser.add_argument(
+        "--clip-coef",
+        type=float,
+        default=ppo_defaults.clip_coef,
+        help="PPO surrogate/value clip coefficient",
+    )
+    parser.add_argument(
+        "--vf-coef",
+        type=float,
+        default=ppo_defaults.vf_coef,
+        help="value-loss weight in the PPO objective",
+    )
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=ppo_defaults.ent_coef,
+        help="entropy-bonus weight in the PPO objective",
+    )
+    parser.add_argument(
+        "--n-epochs",
+        type=int,
+        default=ppo_defaults.n_epochs,
+        help="PPO epochs per collected rollout",
+    )
+    parser.add_argument(
+        "--minibatch-size",
+        type=int,
+        default=ppo_defaults.minibatch_size,
+        help="PPO minibatch size",
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=ppo_defaults.max_grad_norm,
+        help="global grad-norm clip",
+    )
+    parser.add_argument(
+        "--target-kl",
+        type=float,
+        default=ppo_defaults.target_kl,
+        help="approximate-KL early-stop threshold (unset disables the early stop)",
+    )
     parser.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM, help="encoder trunk width")
     parser.add_argument("--ascension", type=int, default=DEFAULT_ASCENSION, help="ascension level")
     parser.add_argument(
@@ -105,6 +161,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_EVAL_BASE_SEED,
         help="first seed of the reproducible eval band (distinct from --seed)",
     )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=None,
+        help="run a greedy holdout eval every N iterations (unset disables periodic eval)",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="directory for best.pt/last.pt checkpoints (unset disables checkpointing)",
+    )
     return parser
 
 
@@ -116,10 +184,13 @@ def main() -> None:
     )
     args = build_arg_parser().parse_args()
 
-    # One env instance serves both phases: training seeds its reset stream via
-    # TrainConfig.seed (through the collector), and evaluate() resets it once per
-    # holdout seed.
+    # Two env instances: `env` is the training env (its reset stream is seeded via
+    # TrainConfig.seed through the collector), and `eval_env` is a SEPARATE
+    # instance for greedy holdout eval - both the in-loop periodic eval and the
+    # final eval - so evaluate() resetting per seed never disturbs the training
+    # collector's rollout stream.
     env = StsEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
+    eval_env = StsEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
 
     # Provenance for reproducibility: engine_commit and interface_version are
     # always-present info keys. Read them from an initial reset; train() re-resets
@@ -128,26 +199,52 @@ def main() -> None:
     engine_commit = reset_info["engine_commit"]
     interface_version = reset_info["interface_version"]
 
+    ppo_config = PPOConfig(
+        clip_coef=args.clip_coef,
+        vf_coef=args.vf_coef,
+        ent_coef=args.ent_coef,
+        n_epochs=args.n_epochs,
+        minibatch_size=args.minibatch_size,
+        max_grad_norm=args.max_grad_norm,
+        target_kl=args.target_kl,
+    )
+
     config = TrainConfig(
         num_iterations=args.num_iterations,
         n_steps=args.n_steps,
         learning_rate=args.learning_rate,
         anneal_lr=args.anneal_lr,
         gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
         seed=args.seed,
         hidden_dim=args.hidden_dim,
+        ppo=ppo_config,
+        eval_every=args.eval_every,
+        eval_episodes=args.eval_episodes,
+        eval_seed_base=args.eval_base_seed,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
-    # Train, then hand the trained network straight to the greedy evaluator.
-    history = train(env, config)
+    # Train (periodic eval + checkpoints run in-loop when enabled), then hand the
+    # trained network to the final greedy eval on the same holdout band.
+    history = train(env, config, eval_env=eval_env)
 
-    # Eval uses a distinct, reproducible seed band from --eval-base-seed. Training
-    # samples the full engine-seed range (its in-collect resets are unseeded), so
-    # the band is not guaranteed disjoint - overlap is possible but negligible over
-    # a run - giving a stable, reproducible win-rate readout.
+    # Eval uses a distinct, reproducible seed band from --eval-base-seed, the SAME
+    # band the in-loop periodic eval uses, so the training curve and this final
+    # number measure the same holdout. Training samples the full engine-seed range
+    # (its in-collect resets are unseeded), so the band is not guaranteed disjoint
+    # - overlap is possible but negligible over a run - giving a stable,
+    # reproducible win-rate readout.
     holdout_seeds = make_holdout_seeds(args.eval_base_seed, args.eval_episodes)
-    report = evaluate(history.actor_critic, env, holdout_seeds)
+    report = evaluate(history.actor_critic, eval_env, holdout_seeds)
     env.close()
+    eval_env.close()
+
+    if args.checkpoint_dir is not None:
+        # best.pt is written only when periodic eval is enabled (it needs eval win
+        # rates to rank a best); last.pt is always written.
+        written = "best.pt, last.pt" if args.eval_every is not None else "last.pt"
+        logger.info("checkpoints written to %s (%s)", args.checkpoint_dir, written)
 
     logger.info(
         "eval avg_floor=%.2f avg_hp=%.2f avg_ep_len=%.2f avg_return=%.3f",
