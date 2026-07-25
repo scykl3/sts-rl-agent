@@ -33,6 +33,10 @@ MINIBATCH = 4
 # A single multi-action block: a legal mask every step, non-degenerate learnable
 # task (count 5 > 1, so no degenerate-task warning).
 ACTIVE_BLOCK = "CARD_REWARD_SELECT"
+# GAE knobs distinct from the ppo defaults (0.99 / 0.95) so a forwarded override
+# visibly changes the advantages/returns from the buffer-default result.
+DISTINCT_GAMMA = 0.5
+DISTINCT_GAE_LAMBDA = 0.5
 
 
 def _make_ac() -> ActorCritic:
@@ -193,6 +197,53 @@ def test_tail_bootstrap_matches_independent_gae() -> None:
     (batch,) = buffer.iter_minibatches(N_STEPS, shuffle=False)
     assert torch.allclose(batch.advantages, expected_adv)
     assert torch.allclose(batch.returns, expected_ret)
+
+
+def test_collect_forwards_gamma_and_gae_lambda() -> None:
+    """collect passes the collector's gamma/gae_lambda to compute_advantages.
+
+    Recomputing GAE over the buffer's own stored fields with the SAME distinct
+    knobs reproduces the buffer's advantages/returns, while recomputing with the
+    ppo defaults does not - so the collector forwarded its overrides instead of
+    silently using the buffer defaults. terminate_prob=0 keeps every done 0, so
+    gamma/gae_lambda affect every step (no boundary zeroing masks the effect).
+
+    Revert-verify: drop the gamma/gae_lambda kwargs from collect's
+    compute_advantages call and the buffer reverts to the ppo defaults - the
+    distinct-knob match fails and the default-mismatch assertions fail too.
+    """
+    ac = _make_ac()
+    device = next(ac.parameters()).device
+    collector = RolloutCollector(
+        _make_env(terminate_prob=0.0, max_episode_steps=10_000),
+        ac,
+        seed=0,
+        gamma=DISTINCT_GAMMA,
+        gae_lambda=DISTINCT_GAE_LAMBDA,
+    )
+    buffer = RolloutBuffer()
+    collector.collect(buffer, N_STEPS)
+
+    # Rebuild compute_gae's inputs from the buffer's stored fields, bootstrapping
+    # from V of the post-collect cursor obs (deterministic: no update ran).
+    rewards = torch.tensor(buffer._rewards, dtype=torch.float32)
+    dones = torch.tensor(buffer._dones, dtype=torch.float32)
+    values = torch.stack(buffer._values).to(torch.float32)
+    with torch.no_grad():
+        last_value = ac.get_value(observation_to_batched_tensors(collector._obs, device)).squeeze(0)
+
+    expected_adv, expected_ret = compute_gae(
+        rewards, values, dones, last_value, gamma=DISTINCT_GAMMA, gae_lambda=DISTINCT_GAE_LAMBDA
+    )
+    default_adv, default_ret = compute_gae(rewards, values, dones, last_value)
+
+    (batch,) = buffer.iter_minibatches(N_STEPS, shuffle=False)
+    # The forwarded knobs reproduce the buffer's GAE exactly...
+    assert torch.allclose(batch.advantages, expected_adv)
+    assert torch.allclose(batch.returns, expected_ret)
+    # ...and the ppo defaults do NOT, so the override was not ignored.
+    assert not torch.allclose(batch.advantages, default_adv)
+    assert not torch.allclose(batch.returns, default_ret)
 
 
 def test_episode_diagnostics_present_when_episodes_complete() -> None:

@@ -40,6 +40,7 @@ import torch
 import sts_rl.agent.train as train_module
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.encoder import HIDDEN_DIM
+from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import (
     DEFAULT_LEARNING_RATE,
@@ -224,7 +225,40 @@ def test_config_defaults_are_symbolic() -> None:
     config = TrainConfig(num_iterations=1, n_steps=1)
     assert config.hidden_dim == HIDDEN_DIM
     assert config.learning_rate == DEFAULT_LEARNING_RATE
+    assert config.gamma == DEFAULT_GAMMA
+    assert config.gae_lambda == DEFAULT_GAE_LAMBDA
+    assert config.anneal_lr is False  # constant LR is the default first cut
     assert config.ppo == PPOConfig()
+
+
+def test_anneal_lr_decays_learning_rate() -> None:
+    """anneal_lr=True keeps iteration 0 at the full LR and decays it monotonically.
+
+    CleanRL linear schedule: frac = 1 - iteration/num_iterations, so iteration 0
+    runs at the full configured LR and every later iteration is strictly lower.
+    ``IterationRecord.learning_rate`` is the rate actually applied that iteration,
+    which is what makes the schedule observable/testable.
+
+    Revert-verify: without the anneal branch every iteration keeps the constant
+    LR, so records[-1] == records[0] and the strict-decay assertion fails.
+    """
+    config = _config(anneal_lr=True)
+    history = train(_task_env(), config)
+    lrs = [record.learning_rate for record in history.records]
+    # Iteration 0 -> full LR (frac = 1 - 0/N = 1).
+    assert lrs[0] == config.learning_rate
+    # The last iteration is strictly decayed below the first...
+    assert lrs[-1] < lrs[0]
+    # ...and the schedule is monotonically non-increasing across the run.
+    assert all(later <= earlier for earlier, later in zip(lrs, lrs[1:]))
+
+
+def test_constant_lr_when_annealing_disabled() -> None:
+    """anneal_lr defaults False: the recorded LR is constant across every iteration."""
+    config = _config()  # anneal_lr defaults False
+    history = train(_task_env(), config)
+    lrs = [record.learning_rate for record in history.records]
+    assert all(lr == config.learning_rate for lr in lrs)
 
 
 def test_logs_one_line_per_iteration(caplog: pytest.LogCaptureFixture) -> None:
@@ -235,6 +269,9 @@ def test_logs_one_line_per_iteration(caplog: pytest.LogCaptureFixture) -> None:
     iteration_lines = [r for r in caplog.records if r.name == train_module.__name__]
     assert len(iteration_lines) == iterations
     assert all("global_step=" in r.getMessage() for r in iteration_lines)
+    # The LR used and the explained variance are surfaced on every diagnostic line.
+    assert all("lr=" in r.getMessage() for r in iteration_lines)
+    assert all("explained_var=" in r.getMessage() for r in iteration_lines)
 
 
 def test_no_episode_completes_reports_none_and_logs_na(
