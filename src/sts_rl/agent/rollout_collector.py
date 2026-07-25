@@ -41,7 +41,9 @@ boundary, not merely storing the successor obs - a future buffer/GAE enhancement
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import gymnasium as gym
 import numpy as np
@@ -50,9 +52,12 @@ from torch import Tensor
 
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
-from sts_rl.agent.rollout_buffer import RolloutBuffer
+from sts_rl.agent.rollout_buffer import RolloutBuffer, VecRolloutBuffer
 from sts_rl.interface import (
+    ACTION_DIM,
     OBS_FIELDS,
+    Info,
+    InterfaceError,
     Obs,
     assert_valid_mask,
 )
@@ -71,6 +76,15 @@ EPISODE_INFO_KEY = "episode"
 EPISODE_RETURN_KEY = "r"
 EPISODE_LENGTH_KEY = "l"
 
+# On an auto-resetting vec-env step, the finished env's terminal info (carrying
+# EPISODE_INFO_KEY) is preserved under this key while the top-level info describes
+# the freshly reset episode - the VecEnvProtocol same-step idiom.
+FINAL_INFO_KEY = "final_info"
+
+# A batched (num_envs-leading) observation: same keys as a single Obs, each array
+# gaining a leading num_envs axis. Mirrors SubprocVecEnv's BatchObs.
+BatchObs = dict[str, np.ndarray]
+
 
 def observation_to_batched_tensors(obs: Obs, device: torch.device) -> dict[str, Tensor]:
     """Convert a single-env numpy observation into batched network input.
@@ -85,6 +99,23 @@ def observation_to_batched_tensors(obs: Obs, device: torch.device) -> dict[str, 
         dtype = torch.long if field.name in _ID_FIELDS else torch.float32
         tensor = torch.as_tensor(obs[field.name], dtype=dtype, device=device)
         batched[field.name] = tensor.unsqueeze(0)  # (*shape) -> (1, *shape)
+    return batched
+
+
+def vec_observation_to_tensors(obs: BatchObs, device: torch.device) -> dict[str, Tensor]:
+    """Convert a BATCHED (num_envs-leading) vec-env observation into network input.
+
+    The vectorized sibling of :func:`observation_to_batched_tensors`: the leading
+    ``num_envs`` axis is ALREADY present, so this only casts each field (id fields
+    to ``torch.long``, every other to ``float32``) and moves it to ``device`` - it
+    does NOT add a batch dim. Dtypes are set explicitly for the same reason as the
+    single-env converter: a float64 obs left to numpy inference would later
+    mismatch the trunk's Linear.
+    """
+    batched: dict[str, Tensor] = {}
+    for field in OBS_FIELDS:
+        dtype = torch.long if field.name in _ID_FIELDS else torch.float32
+        batched[field.name] = torch.as_tensor(obs[field.name], dtype=dtype, device=device)
     return batched
 
 
@@ -273,3 +304,209 @@ class RolloutCollector:
         """
         assert_valid_mask(mask)
         return torch.as_tensor(mask, device=self._device).unsqueeze(0)
+
+
+class VecEnvProtocol(Protocol):
+    """Structural type of the vectorized env the vec collector drives.
+
+    Declared structurally rather than by importing the engine-backed
+    :class:`~sts_rl.env.vec_env.SubprocVecEnv` (which pulls in the native engine),
+    so both the collector and its engine-free tests stay import-clean.
+    ``SubprocVecEnv`` satisfies this, as does an in-process test double.
+
+    Auto-reset contract (SubprocVecEnv's pre-1.0 "same-step" idiom): on a step
+    where env ``i`` ends, the returned ``obs``/``masks`` row ``i`` is ALREADY the
+    next episode's first observation, and env ``i``'s terminal info - including
+    the ``episode`` stats - is preserved under ``infos[i]["final_info"]``.
+    """
+
+    num_envs: int
+
+    def reset(self, seeds: Sequence[int] | None = None) -> tuple[BatchObs, np.ndarray]: ...
+
+    def step(
+        self, actions: np.ndarray
+    ) -> tuple[BatchObs, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[Info]]: ...
+
+
+class VecRolloutCollector:
+    """Steps ``num_envs`` envs in lockstep with a policy and fills a VecRolloutBuffer.
+
+    The vectorized sibling of :class:`RolloutCollector`: instead of one env it
+    drives a :class:`VecEnvProtocol` (for example
+    :class:`~sts_rl.env.vec_env.SubprocVecEnv`), batching the policy over the
+    ``num_envs`` axis and scattering each step into per-env sub-buffers so GAE is
+    computed independently per env. Like the single-env collector it holds a
+    persistent stream cursor reset once at construction, wraps every network call
+    in ``no_grad`` eval mode (saved/restored), and forwards ``gamma``/``gae_lambda``
+    to the buffer's GAE.
+
+    Auto-reset differs from the single-env path: the vec env resets a finished env
+    in-place (the same-step idiom), so this collector never calls ``reset``
+    mid-collect - it reads the terminal episode stats from
+    ``infos[i]["final_info"]``. The per-env done/GAE semantics (``done`` = terminal
+    only, a truncation bootstraps the post-reset obs) are exactly the single-env
+    collector's, applied per env; see that module docstring for the two benign
+    truncation consequences on the stationary toy task.
+    """
+
+    def __init__(
+        self,
+        vec_env: VecEnvProtocol,
+        actor_critic: ActorCritic,
+        device: torch.device | None = None,
+        seed: int | None = None,
+        gamma: float = DEFAULT_GAMMA,
+        gae_lambda: float = DEFAULT_GAE_LAMBDA,
+    ) -> None:
+        """Bind a vec env and network, resetting every env once to prime the streams.
+
+        ``seed`` derives one distinct per-env reset seed (``seed + i``, CleanRL's
+        idiom) so the parallel envs do not all replay the same episode; ``None``
+        leaves them unseeded. As with the single-env collector this seeds ONLY the
+        envs' reset streams, never the process-global torch/numpy RNGs (seed those
+        once at the training entry point). ``device`` is inferred from the network's
+        parameters when omitted. ``gamma``/``gae_lambda`` are forwarded to
+        ``compute_advantages`` on every collect.
+        """
+        self._vec_env = vec_env
+        self._actor_critic = actor_critic
+        self._num_envs = vec_env.num_envs
+        if device is None:
+            try:
+                device = next(actor_critic.parameters()).device
+            except StopIteration as exc:  # a param-less module gives no device to infer
+                raise ValueError(
+                    "cannot infer device from an actor_critic with no parameters; "
+                    "pass device explicitly"
+                ) from exc
+        self._device = device
+        self._gamma = gamma
+        self._gae_lambda = gae_lambda
+
+        # Distinct per-env reset seeds (base + i), so parallel envs do not run
+        # identical episodes. Only the envs' own reset streams are seeded here; the
+        # process-global RNGs are the training entry point's job (see the single-env
+        # collector). In-collect auto-resets are unseeded - one continuous stream
+        # per env.
+        seeds = None if seed is None else [seed + i for i in range(self._num_envs)]
+        obs, masks = vec_env.reset(seeds=seeds)
+        self._obs: BatchObs = obs
+        self._masks: np.ndarray = masks
+
+    def collect(self, buffer: VecRolloutBuffer, n_steps: int) -> CollectStats:
+        """Fill ``buffer`` with ``n_steps`` transitions PER env, then run per-env GAE.
+
+        Collects ``n_steps`` steps across all ``num_envs`` envs
+        (``n_steps * num_envs`` transitions total), mirroring
+        :meth:`RolloutCollector.collect`: clears the buffer, steps under
+        ``no_grad`` in eval mode, bootstraps each env's tail with ``get_value``,
+        and calls :meth:`VecRolloutBuffer.compute_advantages`. The returned
+        ``CollectStats.n_steps`` is the TOTAL transitions collected
+        (``n_steps * num_envs``, so it equals ``len(buffer)``) and
+        ``steps_per_second`` is over that total; episode stats are pooled across
+        every env that finished during the collect.
+        """
+        if n_steps <= 0:
+            raise ValueError(f"n_steps must be positive, got {n_steps}")
+
+        buffer.reset()
+        episode_returns: list[float] = []
+        episode_lengths: list[int] = []
+
+        was_training = self._actor_critic.training
+        self._actor_critic.eval()
+        try:
+            loop_start = time.perf_counter()
+            with torch.no_grad():
+                for _ in range(n_steps):
+                    obs_batched = vec_observation_to_tensors(self._obs, self._device)
+                    masks_batched = self._batched_masks(self._masks)
+
+                    action, log_prob, _entropy, value = self._actor_critic.act(
+                        obs_batched, masks_batched
+                    )
+                    # Vec env: act returns (num_envs,); the engine step wants one
+                    # python int per env, so a genuine (num_envs,) vector is required.
+                    assert action.shape == (
+                        self._num_envs,
+                    ), f"expected ({self._num_envs},) action, got {tuple(action.shape)}"
+                    next_obs, rewards, terminated, truncated, next_masks, infos = (
+                        self._vec_env.step(action.cpu().numpy())
+                    )
+
+                    # Store the batched transition. done is the TERMINAL flag only,
+                    # never truncation - each env's sub-buffer applies the same GAE
+                    # boundary rule as the single-env path (see the module docstring).
+                    buffer.add_batch(
+                        obs=obs_batched,
+                        actions=action,
+                        log_probs=log_prob,
+                        values=value,
+                        rewards=torch.as_tensor(rewards, dtype=torch.float32),
+                        dones=torch.as_tensor(terminated, dtype=torch.float32),
+                        masks=masks_batched,
+                    )
+
+                    # The vec env auto-resets any finished env in-place; the terminal
+                    # episode stats live under infos[i][FINAL_INFO_KEY], not the fresh
+                    # top-level info (which already describes the next episode).
+                    for i in range(self._num_envs):
+                        if terminated[i] or truncated[i]:
+                            episode = infos[i][FINAL_INFO_KEY][EPISODE_INFO_KEY]
+                            episode_returns.append(float(episode[EPISODE_RETURN_KEY]))
+                            episode_lengths.append(int(episode[EPISODE_LENGTH_KEY]))
+
+                    self._obs = next_obs
+                    self._masks = next_masks
+                loop_elapsed = time.perf_counter() - loop_start
+
+                # Per-env tail bootstrap: value of each env's current cursor state
+                # (the successor if that env did not end on the final step, else its
+                # post-reset obs). done=1 masks this bootstrap in GAE for an env that
+                # terminated on the final step.
+                last_values = self._actor_critic.get_value(
+                    vec_observation_to_tensors(self._obs, self._device)
+                )
+                buffer.compute_advantages(
+                    last_values, gamma=self._gamma, gae_lambda=self._gae_lambda
+                )
+        finally:
+            self._actor_critic.train(was_training)
+
+        # n_steps is PER env; report and rate over the total transitions collected.
+        total_steps = n_steps * self._num_envs
+        n_episodes = len(episode_returns)
+        mean_episode_return: float | None = None
+        mean_episode_length: float | None = None
+        if n_episodes > 0:
+            mean_episode_return = sum(episode_returns) / n_episodes
+            mean_episode_length = sum(episode_lengths) / n_episodes
+        # Guard a zero elapsed (perf_counter tie on a tiny loop) rather than divide.
+        steps_per_second = total_steps / loop_elapsed if loop_elapsed > 0 else float("inf")
+
+        return CollectStats(
+            n_steps=total_steps,
+            n_episodes=n_episodes,
+            mean_episode_return=mean_episode_return,
+            mean_episode_length=mean_episode_length,
+            steps_per_second=steps_per_second,
+        )
+
+    def _batched_masks(self, masks: np.ndarray) -> Tensor:
+        """Validate every env's action mask and batch to ``(num_envs, ACTION_DIM)`` bool.
+
+        Applies :func:`~sts_rl.interface.assert_valid_mask` to each env row at the
+        env->agent boundary (raising :class:`~sts_rl.interface.InterfaceError` on a
+        malformed or all-illegal mask), after a leading vec-shape check, then
+        converts the stacked numpy bool array to a ``torch.bool`` tensor without an
+        implicit cast that could mask a wrong-dtype bug.
+        """
+        if masks.shape != (self._num_envs, ACTION_DIM):
+            raise InterfaceError(
+                f"vec mask shape check failed: got {masks.shape}, expected "
+                f"{(self._num_envs, ACTION_DIM)}"
+            )
+        for i in range(self._num_envs):
+            assert_valid_mask(masks[i])
+        return torch.as_tensor(masks, device=self._device)
