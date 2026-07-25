@@ -239,6 +239,41 @@ def test_config_rejects_non_positive(field: str, value: object) -> None:
         dataclasses.replace(_BASE_CONFIG, **{field: value})
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("gamma", 1.5),
+        ("gamma", -0.1),
+        ("gae_lambda", 1.5),
+        ("gae_lambda", -0.1),
+    ],
+)
+def test_config_rejects_out_of_range_discount(field: str, value: float) -> None:
+    """gamma/gae_lambda are range-bound to [0, 1]; outside it silently corrupts GAE.
+
+    Revert-verify: drop the two __post_init__ range guards and this fails -
+    gamma=1.5 constructs without raising.
+    """
+    with pytest.raises(ValueError, match=field):
+        dataclasses.replace(_BASE_CONFIG, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("gamma", 0.0),
+        ("gamma", 1.0),
+        ("gae_lambda", 0.0),
+        ("gae_lambda", 1.0),
+    ],
+)
+def test_config_accepts_inclusive_discount_endpoints(field: str, value: float) -> None:
+    """The [0, 1] endpoints are valid: gamma=1.0 (undiscounted) and gae_lambda in
+    {0, 1} (TD(0) / Monte Carlo) are legitimate, so construction must not reject them."""
+    config = TrainConfig(num_iterations=1, n_steps=1, **{field: value})
+    assert getattr(config, field) == value
+
+
 def test_config_defaults_are_symbolic() -> None:
     """Defaults come from the shared constants, not re-declared literals."""
     config = TrainConfig(num_iterations=1, n_steps=1)

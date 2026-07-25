@@ -86,6 +86,14 @@ class TrainConfig:
             raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
         if self.hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
+        # A discount/trace-decay outside [0, 1] silently produces nonsense GAE
+        # returns, so fail at construction like the other loop knobs. Endpoints
+        # are inclusive: gamma=1.0 (undiscounted) and gae_lambda in {0, 1}
+        # (TD(0) / Monte Carlo) are legitimate here.
+        if not 0.0 <= self.gamma <= 1.0:
+            raise ValueError(f"gamma must be in [0, 1], got {self.gamma}")
+        if not 0.0 <= self.gae_lambda <= 1.0:
+            raise ValueError(f"gae_lambda must be in [0, 1], got {self.gae_lambda}")
 
 
 @dataclass(frozen=True)
