@@ -106,6 +106,18 @@ def test_player_powers_indexed_by_status_id() -> None:
     assert changed == {int(sts.PlayerStatus.STRENGTH), int(sts.PlayerStatus.RITUAL)}
 
 
+def test_bit_only_status_survives_and_encodes_as_presence() -> None:
+    # Regression: a "bit-only" player status (e.g. BARRICADE) sets its presence
+    # bit but has no statusMap entry, so the engine's getStatus (statusMap.at)
+    # throws IndexError on it. encode_observation must survive and encode the
+    # power as presence 1.0 rather than crashing the live-engine rollout.
+    gc, bc = _combat()
+    bc.player.buff(sts.PlayerStatus.BARRICADE, 1)
+    assert bc.player.hasStatus(sts.PlayerStatus.BARRICADE)  # bit set, no map entry
+    obs = encode_observation(gc, bc)  # must not raise IndexError
+    assert obs["player_powers"][int(sts.PlayerStatus.BARRICADE)] == 1.0
+
+
 def test_enemy_powers_indexed_by_status_id() -> None:
     gc, bc = _combat()
     monster = bc.monsters[0]
