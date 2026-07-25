@@ -1,4 +1,4 @@
 [submodule "engine/sts_lightspeed"]
 	path = engine/sts_lightspeed
 	url = https://github.com/maxy1991991/sts_lightspeed.git
-	branch = portable-build
+	branch = master
