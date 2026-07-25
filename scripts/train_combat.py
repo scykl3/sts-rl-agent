@@ -41,8 +41,9 @@ from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
-from sts_rl.env.encounters import act1_encounter_pool
+from sts_rl.env.encounters import act1_encounter_pool, resolve_encounter_names
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
+from sts_rl.interface import InterfaceError
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -65,28 +66,24 @@ DEFAULT_EVAL_BASE_SEED = 1_000_000
 def _parse_encounters(spec: str) -> tuple[Any, ...]:
     """argparse ``type`` for --encounters: parse "A,B,C" into MonsterEncounter values.
 
-    The engine is imported lazily (only when the CLI is actually parsed) so this
-    module still imports engine-free. Raises ``argparse.ArgumentTypeError`` naming
-    any unknown encounter, validated against ``sts.MonsterEncounter.__members__``
-    (the real enum members: unlike ``dir()`` this excludes Python attributes such
-    as ``name``/``value`` and the engine's ``INVALID`` sentinel).
+    Splits and strips the comma-separated spec and rejects an empty set, then
+    delegates the validity rule to
+    :func:`~sts_rl.env.encounters.resolve_encounter_names` - the single source of
+    truth the hardcoded Act 1 pool also uses - so a user-supplied list and the
+    canonical pool are accepted or rejected identically (reject the engine's
+    ``INVALID`` sentinel and any name absent from
+    ``sts.MonsterEncounter.__members__``). That resolver imports the engine
+    lazily, so this module still imports engine-free. Its ``InterfaceError``
+    (naming the unknown or sentinel entry) is re-raised as
+    ``argparse.ArgumentTypeError`` with the same message.
     """
-    from sts_rl.env._engine import slaythespire as sts
-
-    members = sts.MonsterEncounter.__members__
     names = [part.strip() for part in spec.split(",") if part.strip()]
     if not names:
         raise argparse.ArgumentTypeError("--encounters given but names an empty set")
-    chosen = []
-    for name in names:
-        if name == "INVALID":
-            raise argparse.ArgumentTypeError(
-                "INVALID is the engine's sentinel, not a real MonsterEncounter"
-            )
-        if name not in members:
-            raise argparse.ArgumentTypeError(f"unknown MonsterEncounter {name!r}")
-        chosen.append(members[name])
-    return tuple(chosen)
+    try:
+        return resolve_encounter_names(names)
+    except InterfaceError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
