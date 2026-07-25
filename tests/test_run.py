@@ -34,6 +34,12 @@ from sts_rl.env.run import (
 IRONCLAD_MAX_HP = 80
 START_ACT = 1
 START_FLOOR = 0
+# The engine positions a fresh run before the first map row with this y sentinel.
+PRE_MAP_NODE_Y = -1
+
+# Lockstep steps for the determinism replay; a normal path to the first battle is
+# well under this, so the loop compares every intervening overworld screen.
+DETERMINISM_REPLAY_STEPS = 20
 
 # A spread of seeds that should each start a valid run.
 REACHABLE_SEEDS = (1, 7, 42, 123, 2024)
@@ -67,11 +73,25 @@ def test_start_run_reads_raw_state() -> None:
     # The run opens on an agent decision, so at least one legal move is offered.
     assert snap.action_count >= 1
     assert snap.screen and snap.screen != BATTLE_SCREEN
+    # Positioned before the first map row; enum-name fields are populated.
+    assert snap.map_node_y == PRE_MAP_NODE_Y
+    assert isinstance(snap.map_node_x, int)
+    assert snap.cur_room and snap.cur_event
+    # Ironclad enters its run holding its class relic (Burning Blood).
+    assert snap.relic_count >= 1
 
 
 def test_start_run_is_deterministic() -> None:
-    """The same seed produces an identical initial run readout."""
-    assert read_run(start_run(seed=42)) == read_run(start_run(seed=42))
+    """The same seed replays identically under a fixed first-legal-action sequence."""
+    gc_a = start_run(seed=42)
+    gc_b = start_run(seed=42)
+    for _ in range(DETERMINISM_REPLAY_STEPS):
+        assert read_run(gc_a) == read_run(gc_b)
+        if gc_a.screen_state.name == BATTLE_SCREEN:
+            break
+        execute_overworld_action(gc_a, overworld_actions(gc_a)[0])
+        execute_overworld_action(gc_b, overworld_actions(gc_b)[0])
+    assert read_run(gc_a) == read_run(gc_b)
 
 
 def test_start_run_propagates_ascension() -> None:
