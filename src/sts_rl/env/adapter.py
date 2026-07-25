@@ -18,6 +18,7 @@ move is never handed to the engine.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import gymnasium as gym
@@ -63,6 +64,13 @@ class StsEnv(gym.Env):
         reward_config: shaping coefficients and anneal schedule; defaults to
             :class:`~sts_rl.env.reward.RewardConfig`.
         render_mode: one of ``None``, ``"ansi"``, ``"human"``.
+        encounters: optional non-empty pool of engine ``MonsterEncounter`` values.
+            When given, each :meth:`reset` samples one (deterministically from the
+            reset seed) and builds that combat directly instead of navigating to
+            the run's first monster room; ``None`` keeps the navigated behavior.
+            The chosen battle is built on a fresh run state (floor 0): starting
+            deck, full HP, no act-earned relics, i.e. a single-combat training
+            setup, not a mid-act state.
     """
 
     metadata = {"render_modes": ["ansi", "human"]}
@@ -75,6 +83,7 @@ class StsEnv(gym.Env):
         strict: bool = False,
         reward_config: RewardConfig | None = None,
         render_mode: str | None = None,
+        encounters: Sequence[Any] | None = None,  # sts.MonsterEncounter values | None
     ) -> None:
         if max_episode_steps < 1:
             raise InterfaceError(f"max_episode_steps must be >= 1, got {max_episode_steps}")
@@ -83,6 +92,8 @@ class StsEnv(gym.Env):
             raise InterfaceError(
                 f"render_mode {render_mode!r} invalid; expected one of {valid_render_modes}"
             )
+        if encounters is not None and len(encounters) == 0:
+            raise InterfaceError("encounters, when provided, must be non-empty")
 
         self.observation_space, self.action_space = build_spaces()
         self.interface_version = INTERFACE_VERSION
@@ -92,6 +103,9 @@ class StsEnv(gym.Env):
         self._max_episode_steps = max_episode_steps
         self._strict = strict
         self._reward_config = reward_config if reward_config is not None else RewardConfig()
+        # Fixed pool of chosen encounters sampled once per reset; None keeps the
+        # default navigate-to-first-combat behavior.
+        self._encounters = tuple(encounters) if encounters is not None else None
         # Cached once; the pinned commit does not change during a run.
         self._engine_commit = engine_commit()
 
@@ -120,7 +134,13 @@ class StsEnv(gym.Env):
         if seed is None:
             seed = int(self.np_random.integers(0, _MAX_SEED))
         self._episode_seed = seed
-        self._gc, self._bc = start_combat(seed, ascension=self._ascension)
+        if self._encounters is not None:
+            # Sample from self.np_random (seeded by super().reset above) so the
+            # chosen encounter is deterministic given the reset seed.
+            chosen = self._encounters[int(self.np_random.integers(len(self._encounters)))]
+            self._gc, self._bc = start_combat(seed, ascension=self._ascension, encounter=chosen)
+        else:
+            self._gc, self._bc = start_combat(seed, ascension=self._ascension)
         self._steps = 0
         self._ep_return = 0.0
         self._refresh_mask()

@@ -41,6 +41,7 @@ def start_combat(
     *,
     ascension: int = 0,
     max_nav_actions: int = DEFAULT_MAX_NAV_ACTIONS,
+    encounter: Any = None,  # sts.MonsterEncounter | None
 ) -> tuple[Any, Any]:
     """Start a seeded Ironclad run and advance it to the first combat.
 
@@ -48,10 +49,22 @@ def start_combat(
     action at each pre-combat screen; this is a fixed function of engine state,
     so for a given ``seed`` it reproducibly lands in the run's first battle.
 
+    When ``encounter`` (a :class:`MonsterEncounter`) is given, that battle is
+    built directly on the fresh run state (floor 0) and navigation is skipped, so
+    the returned combat is the chosen encounter rather than the run's first
+    monster room. That fresh state carries the starting deck, full HP, and no
+    act-earned relics, so the chosen encounter is a single-combat training setup,
+    not a mid-act state.
+
     Raises :class:`EngineError` if the run ends, offers no actions, or fails to
-    reach a battle within ``max_nav_actions`` steps.
+    reach a battle within ``max_nav_actions`` steps (default, navigated path only).
     """
     gc = sts.GameContext(sts.CharacterClass.IRONCLAD, int(seed), int(ascension))
+    if encounter is not None:
+        # Chosen-encounter path: build the battle directly on the fresh run state
+        # (floor 0); no pre-combat navigation is needed, so the nav guards below
+        # do not apply.
+        return gc, gc.create_battle_context(encounter)
     steps = 0
     while gc.screen_state != sts.ScreenState.BATTLE:
         if gc.outcome != sts.GameOutcome.UNDECIDED:
