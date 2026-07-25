@@ -22,15 +22,20 @@ shared interface (an observation dict plus ``info['action_mask']``), so the same
 ``train`` drives the engine-free stub today and the real engine env later - it
 never imports or references a concrete env.
 
-Opt-in add-ons: ``target_kl`` early-stop (via ``PPOConfig``) and learning-rate
-annealing (``anneal_lr``). ``explained_variance`` is now logged every iteration
-(always on, not opt-in). Still deferred: checkpointing and periodic evaluation.
+Opt-in add-ons: ``target_kl`` early-stop (via ``PPOConfig``), learning-rate
+annealing (``anneal_lr``), periodic holdout evaluation (``eval_every`` plus a
+separate ``eval_env``), and best/last checkpointing (``checkpoint_dir``).
+``explained_variance`` is now logged every iteration (always on, not opt-in).
+Every add-on defaults OFF, so leaving them unset reproduces the prior behavior.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -42,12 +47,33 @@ from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig, PPOStats, ppo_update
 from sts_rl.agent.rollout_buffer import RolloutBuffer
 from sts_rl.agent.rollout_collector import CollectStats, RolloutCollector
+from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
+from sts_rl.interface import INTERFACE_VERSION
 
 logger = logging.getLogger(__name__)
 
 # Adam step size for the update. This is a training-loop hyperparameter, not a
 # shared interface constant, so the loop owns it here rather than importing one.
 DEFAULT_LEARNING_RATE: float = 3e-4
+
+# Periodic-eval defaults, applied only when eval is enabled (eval_every set). The
+# seed base is deliberately distinct from the training seed so the holdout band
+# does not coincide with the training reset stream.
+DEFAULT_EVAL_EPISODES: int = 64
+DEFAULT_EVAL_SEED_BASE: int = 2_000_000
+
+# Checkpoint filenames and payload keys. best.pt is (over)written on each new-best
+# eval win rate; last.pt holds the final trained weights. Both are written
+# atomically via a sibling temp file (CHECKPOINT_TMP_SUFFIX) plus os.replace.
+BEST_CHECKPOINT_NAME: str = "best.pt"
+LAST_CHECKPOINT_NAME: str = "last.pt"
+CHECKPOINT_TMP_SUFFIX: str = ".tmp"
+CHECKPOINT_MODEL_KEY: str = "model_state_dict"
+CHECKPOINT_HIDDEN_DIM_KEY: str = "hidden_dim"
+CHECKPOINT_INTERFACE_VERSION_KEY: str = "interface_version"
+CHECKPOINT_ITERATION_KEY: str = "iteration"
+CHECKPOINT_STEP_KEY: str = "global_step"
+CHECKPOINT_WIN_RATE_KEY: str = "win_rate"
 
 
 @dataclass(frozen=True)
@@ -62,6 +88,10 @@ class TrainConfig:
     :data:`HIDDEN_DIM`; ``gamma``/``gae_lambda`` to the shared
     ``DEFAULT_GAMMA``/``DEFAULT_GAE_LAMBDA``; the PPO knobs to ``PPOConfig``'s.
     ``anneal_lr`` is off by default - a constant LR is a valid first cut.
+    Periodic holdout eval (``eval_every`` cadence over the
+    ``eval_seed_base``/``eval_episodes`` band) and best/last ``checkpoint_dir``
+    writing are all off by default (``eval_every``/``checkpoint_dir`` ``None``),
+    so an unset config reproduces the prior loop exactly.
     """
 
     num_iterations: int
@@ -73,6 +103,14 @@ class TrainConfig:
     seed: int = 0
     hidden_dim: int = HIDDEN_DIM
     ppo: PPOConfig = field(default_factory=PPOConfig)
+    # Periodic holdout eval + checkpointing, all default OFF: eval_every=None
+    # disables periodic eval, checkpoint_dir=None disables checkpointing, so an
+    # unset config reproduces the prior train() behavior exactly. When eval runs
+    # it uses the fixed band make_holdout_seeds(eval_seed_base, eval_episodes).
+    eval_every: int | None = None
+    eval_episodes: int = DEFAULT_EVAL_EPISODES
+    eval_seed_base: int = DEFAULT_EVAL_SEED_BASE
+    checkpoint_dir: str | None = None
 
     def __post_init__(self) -> None:
         # Fail at construction on a degenerate budget rather than silently
@@ -94,6 +132,10 @@ class TrainConfig:
             raise ValueError(f"gamma must be in [0, 1], got {self.gamma}")
         if not 0.0 <= self.gae_lambda <= 1.0:
             raise ValueError(f"gae_lambda must be in [0, 1], got {self.gae_lambda}")
+        # Periodic eval is opt-in (None disables); when enabled the cadence must be
+        # a positive iteration count, so fail at construction like the other knobs.
+        if self.eval_every is not None and self.eval_every <= 0:
+            raise ValueError(f"eval_every must be positive when set, got {self.eval_every}")
 
 
 @dataclass(frozen=True)
@@ -114,22 +156,52 @@ class IterationRecord:
 
 
 @dataclass(frozen=True)
+class EvalRecord:
+    """One periodic-evaluation snapshot: the step counters plus the full report.
+
+    Kept out of :class:`IterationRecord` because eval is sparse (every
+    ``eval_every`` iterations, not every iteration), so folding the report into
+    the per-iteration record would carry mostly-empty eval fields on the common
+    path.
+    """
+
+    iteration: int
+    global_step: int
+    report: EvalReport
+
+
+@dataclass(frozen=True)
 class TrainHistory:
     """Result of a :func:`train` run: per-iteration records and the trained net.
 
     ``actor_critic`` is returned so a caller (evaluation, checkpointing, a sample
     playthrough) can use the trained network directly without re-threading it.
+    ``eval_reports`` holds the periodic-eval snapshots (empty when ``eval_every``
+    is unset); :meth:`best_eval` is the highest-win-rate snapshot, mirroring which
+    run produced ``best.pt``.
     """
 
     records: list[IterationRecord]
     actor_critic: ActorCritic
+    eval_reports: list[EvalRecord] = field(default_factory=list)
 
     def mean_episode_returns(self) -> list[float | None]:
         """Per-iteration mean episode return (``None`` where no episode ended)."""
         return [record.collect.mean_episode_return for record in self.records]
 
+    def best_eval(self) -> EvalRecord | None:
+        """Highest-win-rate eval snapshot, or ``None`` if no periodic eval ran.
 
-def train(env: gym.Env, config: TrainConfig) -> TrainHistory:
+        Ties resolve to the EARLIEST such snapshot (``max`` returns the first
+        maximal element), matching the strictly-greater ``best.pt`` overwrite rule
+        so this and the saved best checkpoint always agree.
+        """
+        if not self.eval_reports:
+            return None
+        return max(self.eval_reports, key=lambda record: record.report.win_rate)
+
+
+def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None) -> TrainHistory:
     """Run ``config.num_iterations`` collect->update iterations; return the history.
 
     Seeds the process-global RNGs once up front (the reproducibility contract:
@@ -141,7 +213,28 @@ def train(env: gym.Env, config: TrainConfig) -> TrainHistory:
     Each iteration collects exactly ``config.n_steps`` transitions (the collector
     clears the buffer and runs GAE internally), runs one multi-epoch PPO update
     over that buffer, records the merged diagnostics, and emits one INFO log line.
+
+    Periodic evaluation and checkpointing are opt-in and default OFF. When
+    ``config.eval_every`` is set, every ``eval_every`` iterations (and always on
+    the final iteration, so best/last reflect the fully trained policy) the
+    current policy is greedily evaluated on the fixed holdout band via ``eval_env``
+    - a SEPARATE env instance, because :func:`evaluate` resets the env once per
+    seed and pointing it at the training env would corrupt the collector's
+    in-progress rollout stream. When ``config.checkpoint_dir`` is set, a new
+    best-win-rate eval writes ``best.pt`` and the final weights write ``last.pt``
+    (state_dicts, saved atomically); a ``checkpoint_dir`` without ``eval_every``
+    writes only ``last.pt`` (there are no eval win rates to rank a best).
     """
+    # Periodic eval needs its OWN env: evaluate() resets the env once per holdout
+    # seed, which would derail the training collector mid-rollout. Fail fast rather
+    # than silently sharing (and corrupting) the training env.
+    if config.eval_every is not None and eval_env is None:
+        raise ValueError(
+            "config.eval_every is set but eval_env is None; periodic evaluation "
+            "requires a separate env instance (evaluate() resets it per seed, "
+            "which would corrupt the training rollout stream)"
+        )
+
     # One-time global seeding BEFORE any RNG is consumed: weight init below must
     # be reproducible too, so this precedes ActorCritic construction. The
     # collector's own seed arg covers only the env reset stream.
@@ -159,7 +252,16 @@ def train(env: gym.Env, config: TrainConfig) -> TrainHistory:
     )
     buffer = RolloutBuffer()
 
+    # Create the checkpoint dir once up front (not per save), so a bad path fails
+    # before training rather than after the first eval.
+    checkpoint_dir_path: Path | None = None
+    if config.checkpoint_dir is not None:
+        checkpoint_dir_path = Path(config.checkpoint_dir)
+        checkpoint_dir_path.mkdir(parents=True, exist_ok=True)
+
     records: list[IterationRecord] = []
+    eval_reports: list[EvalRecord] = []
+    best_win_rate: float | None = None
     global_step = 0
     for iteration in range(config.num_iterations):
         # CleanRL linear LR decay: iteration 0 keeps the full learning_rate and
@@ -192,7 +294,66 @@ def train(env: gym.Env, config: TrainConfig) -> TrainHistory:
         )
         _log_iteration(iteration, global_step, lr_now, collect_stats, ppo_stats)
 
-    return TrainHistory(records=records, actor_critic=actor_critic)
+        # Periodic eval on the cadence, and always on the final iteration so
+        # best/last reflect the fully trained policy. Gated by eval_every (None
+        # keeps this whole block off, the default).
+        is_final_iteration = iteration + 1 == config.num_iterations
+        if config.eval_every is not None and (
+            (iteration + 1) % config.eval_every == 0 or is_final_iteration
+        ):
+            assert eval_env is not None  # guaranteed by the eval_every/eval_env guard
+            # Greedy holdout readout on the SEPARATE eval env. deterministic=True
+            # (the default, made explicit) takes the masked argmax and draws no
+            # samples, so periodic eval never consumes the training torch RNG -
+            # training stays bit-identical with or without eval running.
+            report = evaluate(
+                actor_critic,
+                eval_env,
+                make_holdout_seeds(config.eval_seed_base, config.eval_episodes),
+                deterministic=True,
+            )
+            eval_reports.append(
+                EvalRecord(iteration=iteration, global_step=global_step, report=report)
+            )
+            logger.info(
+                "eval iter=%d global_step=%d win_rate=%.3f",
+                iteration,
+                global_step,
+                report.win_rate,
+            )
+            # New best (STRICTLY greater) overwrites best.pt; a tie keeps the
+            # earlier best, matching TrainHistory.best_eval.
+            if checkpoint_dir_path is not None and (
+                best_win_rate is None or report.win_rate > best_win_rate
+            ):
+                best_win_rate = report.win_rate
+                _save_checkpoint(
+                    checkpoint_dir_path,
+                    BEST_CHECKPOINT_NAME,
+                    actor_critic,
+                    hidden_dim=config.hidden_dim,
+                    iteration=iteration,
+                    global_step=global_step,
+                    win_rate=report.win_rate,
+                )
+
+    # last.pt always captures the final trained weights. Its win_rate is the final
+    # iteration's eval win rate when eval ran (the final iteration is always an
+    # eval iteration above), else None - the checkpoint_dir-without-eval_every case
+    # documented on train().
+    if checkpoint_dir_path is not None:
+        last_win_rate = eval_reports[-1].report.win_rate if eval_reports else None
+        _save_checkpoint(
+            checkpoint_dir_path,
+            LAST_CHECKPOINT_NAME,
+            actor_critic,
+            hidden_dim=config.hidden_dim,
+            iteration=config.num_iterations - 1,
+            global_step=global_step,
+            win_rate=last_win_rate,
+        )
+
+    return TrainHistory(records=records, actor_critic=actor_critic, eval_reports=eval_reports)
 
 
 def _log_iteration(
@@ -230,3 +391,46 @@ def _log_iteration(
         ppo.grad_norm,
         collect.steps_per_second,
     )
+
+
+def _save_checkpoint(
+    checkpoint_dir: Path,
+    filename: str,
+    actor_critic: ActorCritic,
+    *,
+    hidden_dim: int,
+    iteration: int,
+    global_step: int,
+    win_rate: float | None,
+) -> None:
+    """Atomically write one checkpoint: a state_dict payload, not a pickled module.
+
+    Saves ``actor_critic.state_dict()`` (portable, and loadable under
+    ``weights_only=True``) rather than the module object. The state_dict is
+    DEEP-COPIED at capture time because it returns live tensor references that keep
+    mutating as training continues, so a shallow grab could serialize post-capture
+    weights. The write is atomic: torch saves to a sibling temp file in the SAME
+    directory, then ``os.replace`` renames it over ``filename`` (an atomic
+    same-filesystem rename), so a crash mid-write can never leave a truncated
+    checkpoint at the final path.
+
+    The payload is self-describing: alongside the weights it records ``hidden_dim``
+    (the trunk width the net was built with) and ``interface_version`` (provenance),
+    so a checkpoint reloads without externally knowing the architecture - rebuild
+    ``ActorCritic(hidden_dim=ckpt[CHECKPOINT_HIDDEN_DIM_KEY])`` then
+    ``load_state_dict``.
+    """
+    payload: dict[str, object] = {
+        CHECKPOINT_MODEL_KEY: copy.deepcopy(actor_critic.state_dict()),
+        CHECKPOINT_HIDDEN_DIM_KEY: hidden_dim,
+        CHECKPOINT_INTERFACE_VERSION_KEY: INTERFACE_VERSION,
+        CHECKPOINT_ITERATION_KEY: iteration,
+        CHECKPOINT_STEP_KEY: global_step,
+        CHECKPOINT_WIN_RATE_KEY: win_rate,
+    }
+    final_path = checkpoint_dir / filename
+    # Sibling temp in the SAME dir keeps os.replace a single-filesystem atomic
+    # rename (a cross-device os.replace would raise instead).
+    tmp_path = final_path.with_name(final_path.name + CHECKPOINT_TMP_SUFFIX)
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, final_path)
