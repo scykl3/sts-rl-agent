@@ -23,10 +23,11 @@ from typing import TYPE_CHECKING
 from sts_rl.interface import SHAPING_TERMS
 
 if TYPE_CHECKING:
-    # Only a type hint; keep the runtime import out so this module (and its
+    # Only type hints; keep the runtime imports out so this module (and its
     # tests) do not depend on the built engine. The functions access snapshots
     # by attribute and work on any object with the same fields.
     from sts_rl.env.engine import CombatSnapshot
+    from sts_rl.env.run import RunSnapshot
 
 # Default shaping coefficients. Positive coefficients reward progress; the
 # damage coefficient is negative so taking damage is penalized.
@@ -116,6 +117,27 @@ def combat_shaping_terms(
     player_hp_lost = _player_hp_fraction(prev) - _player_hp_fraction(curr)
     terms["enemy_hp_removed"] = cfg.enemy_hp_removed * enemy_removed
     terms["damage_taken"] = cfg.damage_taken * player_hp_lost
+    return terms
+
+
+def run_shaping_terms(prev: RunSnapshot, curr: RunSnapshot, cfg: RewardConfig) -> dict[str, float]:
+    """Coefficient-applied, pre-``beta`` shaping terms for one overworld step.
+
+    ``floor_progress`` rewards descending to new floors (the run's floor number
+    only increases), and ``boss_kill`` rewards each act advance, which happens
+    exactly when the act boss is defeated. Both deltas are floored at zero so a
+    non-progressing transition contributes nothing rather than a spurious
+    penalty. On the step that crosses into a new act both terms fire, since the
+    boss floor is also a new floor; the spec treats them as independent terms, so
+    this double credit is intended. ``enemy_hp_removed`` and ``damage_taken`` are
+    combat signals and stay ``0.0`` here; the run adapter applies combat shaping
+    on battle steps and this on overworld steps.
+    """
+    terms = zero_shaping_terms()
+    floors_gained = max(0, curr.floor - prev.floor)
+    bosses_killed = max(0, curr.act - prev.act)
+    terms["floor_progress"] = cfg.floor_progress * floors_gained
+    terms["boss_kill"] = cfg.boss_kill * bosses_killed
     return terms
 
 

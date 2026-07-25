@@ -11,12 +11,15 @@ from dataclasses import dataclass
 import pytest
 
 from sts_rl.env.reward import (
+    DEFAULT_BOSS_KILL_COEF,
     DEFAULT_DAMAGE_TAKEN_COEF,
     DEFAULT_ENEMY_HP_REMOVED_COEF,
+    DEFAULT_FLOOR_PROGRESS_COEF,
     DEFAULT_T_ANNEAL,
     RewardConfig,
     beta,
     combat_shaping_terms,
+    run_shaping_terms,
     shaping_reward,
     zero_shaping_terms,
 )
@@ -34,6 +37,16 @@ class _Snap:
     player_hp: int
     player_max_hp: int
     monsters: tuple[_Monster, ...]
+
+
+@dataclass
+class _RunSnap:
+    floor: int
+    act: int
+
+
+def _run(floor: int, act: int) -> _RunSnap:
+    return _RunSnap(floor=floor, act=act)
 
 
 def _snap(player_hp: int, monsters: tuple[tuple[int, int], ...], *, player_max: int = 80) -> _Snap:
@@ -141,6 +154,52 @@ def test_run_mode_terms_stay_zero_in_combat() -> None:
     prev = _snap(80, ((48, 48),))
     curr = _snap(60, ((0, 48),))
     terms = combat_shaping_terms(prev, curr, RewardConfig())
+    assert terms["floor_progress"] == 0.0
+    assert terms["boss_kill"] == 0.0
+
+
+# --- run-mode shaping terms ------------------------------------------------
+
+
+def test_no_run_progress_yields_zero_terms() -> None:
+    snap = _run(floor=5, act=1)
+    terms = run_shaping_terms(snap, snap, RewardConfig())
+    assert all(v == 0.0 for v in terms.values())
+
+
+def test_descending_a_floor_rewards_progress() -> None:
+    terms = run_shaping_terms(_run(5, 1), _run(6, 1), RewardConfig())
+    assert terms["floor_progress"] == pytest.approx(DEFAULT_FLOOR_PROGRESS_COEF)
+    assert terms["boss_kill"] == 0.0
+
+
+def test_multi_floor_jump_scales_with_count() -> None:
+    terms = run_shaping_terms(_run(5, 1), _run(8, 1), RewardConfig())
+    assert terms["floor_progress"] == pytest.approx(3 * DEFAULT_FLOOR_PROGRESS_COEF)
+
+
+def test_advancing_act_rewards_boss_kill() -> None:
+    # Crossing an act boundary is one boss defeated (and one new floor).
+    terms = run_shaping_terms(_run(16, 1), _run(17, 2), RewardConfig())
+    assert terms["boss_kill"] == pytest.approx(DEFAULT_BOSS_KILL_COEF)
+    assert terms["floor_progress"] == pytest.approx(DEFAULT_FLOOR_PROGRESS_COEF)
+
+
+def test_combat_terms_stay_zero_in_run_shaping() -> None:
+    terms = run_shaping_terms(_run(5, 1), _run(6, 1), RewardConfig())
+    assert terms["enemy_hp_removed"] == 0.0
+    assert terms["damage_taken"] == 0.0
+
+
+def test_run_shaping_covers_every_interface_term() -> None:
+    terms = run_shaping_terms(_run(5, 1), _run(6, 1), RewardConfig())
+    assert set(terms) == set(SHAPING_TERMS)
+
+
+def test_non_progress_delta_is_floored() -> None:
+    # Defensive: floor/act never decrease in a real run, but a zero or negative
+    # delta must contribute nothing rather than a negative reward.
+    terms = run_shaping_terms(_run(6, 2), _run(5, 1), RewardConfig())
     assert terms["floor_progress"] == 0.0
     assert terms["boss_kill"] == 0.0
 
