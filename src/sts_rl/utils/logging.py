@@ -37,6 +37,11 @@ _ENGINE_CONFIG = _REPO_ROOT / "configs" / "engine.toml"
 MANIFEST_FILENAME = "manifest.json"
 METRICS_FILENAME = "metrics.jsonl"
 
+# The per-record x-axis key in metrics.jsonl. Written by log_metrics and read
+# back by downstream tooling (e.g. the dashboard), so it lives as one constant
+# rather than a literal repeated on both sides.
+STEP_KEY = "step"
+
 # Sentinel recorded when a provenance field cannot be resolved (e.g. git is
 # absent, or the run is not inside a checkout). Kept explicit so a replay reader
 # can tell "unknown" apart from a real value.
@@ -188,7 +193,7 @@ class RunLogger:
         """
         if self._metrics_file is None or self._metrics_file.closed:
             raise ValueError("cannot log metrics after the logger is closed")
-        record = {**dict(metrics), "step": step}
+        record = {**dict(metrics), STEP_KEY: step}
         self._metrics_file.write(json.dumps(record, default=str) + "\n")
         self._metrics_file.flush()
 
