@@ -312,15 +312,22 @@ def _fill_map_context(obs: Obs, gc: Any) -> None:
     ctx[progress + 1] = int(gc.floor_num) / RUN_MAX_FLOOR
 
     # Columns reachable from the current node in the next row. Pre-map (cur_y < 0),
-    # any row-0 column holding a real room is a legal first step; otherwise the
-    # engine's edge list gives the reachable next-row columns.
+    # any row-0 column holding a real room is a legal first step; within the grid the
+    # engine's edge list gives the reachable next-row columns; at the boss node there
+    # are none (see below).
     next_row = cur_y + 1
     if cur_y < 0:
         reachable = {
             c for c in range(MAP_COLS) if 0 <= int(spire_map.get_room_type(c, 0)) < N_NODE_TYPES
         }
-    else:
+    elif 0 <= cur_x < MAP_COLS and cur_y < MAP_ROWS:
         reachable = {int(c) for c in spire_map.edges(cur_x, cur_y)}
+    else:
+        # The engine parks the run on the act boss node at cur_y == MAP_ROWS (above
+        # the grid) through the boss reward / relic screens. edges() indexes the grid
+        # and throws there; the run leaves via the act transition, not a map choice,
+        # so no next-row column is reachable.
+        reachable = set()
 
     # Edges out of the top grid row lead to the act boss, which is not stored in the
     # grid (next_row is past the grid, so get_room_type would return INVALID). On

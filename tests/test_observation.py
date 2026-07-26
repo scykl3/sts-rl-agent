@@ -370,3 +370,30 @@ def test_map_context_encodes_act_boss_above_top_row() -> None:
         assert mc[slot + 1] == 1.0  # is_combat: the boss is a fight
         assert mc[slot + 2] == 0.0  # is_elite: the boss is not an elite
         assert mc[slot + 3] == boss_norm  # room type is BOSS, not SHOP (id 0)
+
+
+def test_map_context_on_boss_node_does_not_index_off_grid() -> None:
+    # While the boss reward / relic screens are up, the engine parks the run ON the
+    # boss node at cur_y == MAP_ROWS (above the grid). map_context must encode that
+    # overworld state without indexing off the grid: edges() throws there, and the
+    # run leaves via the act transition, not a map choice, so no column is reachable.
+    spire_map = start_run(seed=REGRESSION_SEED).map
+    # Precondition the guard exists for: querying edges at the boss row raises.
+    with pytest.raises(IndexError):
+        spire_map.edges(0, MAP_ROWS)
+
+    fake_gc = SimpleNamespace(
+        map=spire_map,
+        cur_map_node_x=0,
+        cur_map_node_y=MAP_ROWS,  # the boss node, one past the top grid row
+        cur_room=int(sts.Room.BOSS),
+        act=1,
+        floor_num=MAP_ROWS,
+    )
+    obs = _empty_obs()
+    _fill_map_context(obs, fake_gc)  # must not raise IndexError
+    mc = obs["map_context"]
+
+    assert np.isfinite(mc).all()
+    assert _encoded_reachable_cols(mc) == set()  # no next-row node from the boss
+    assert mc[int(sts.Room.BOSS)] == 1.0  # current-room one-hot marks the boss
