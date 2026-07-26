@@ -5,8 +5,10 @@ Reads a live ``GameContext`` + ``BattleContext`` and emits the
 field widths and id bounds come from :mod:`sts_rl.interface`, so an engine enum
 bump propagates here instead of silently desyncing.
 
-Scope is combat: ``map_context`` (a run-mode feature) is left zero and filled
-when run-mode screens land. Every other field is populated from the live state.
+One encoder serves both modes. Pass a live ``BattleContext`` for combat, or
+``bc=None`` for an overworld (run-mode) state: combat-only fields (hand, piles,
+enemies, powers, potions) then stay zero and ``map_context`` is filled from the
+run's map. ``map_context`` is left zero during combat.
 
 Conventions:
 
@@ -29,10 +31,13 @@ import numpy as np
 
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.interface import (
+    ACTION_BLOCK_BY_NAME,
     HAND_MAX,
+    MAP_CONTEXT_DIM,
     MAX_ENEMIES,
     N_MONSTER_MOVE_IDS,
     N_MONSTER_POWER_IDS,
+    N_NODE_TYPES,
     N_PLAYER_POWER_IDS,
     N_RELIC_IDS,
     N_SCREENS,
@@ -73,6 +78,43 @@ _CARD_TYPE_POWER = int(sts.CardType.POWER)
 _POTION_EMPTY = sts.Potion.EMPTY_POTION_SLOT
 _POTION_INVALID = sts.Potion.INVALID
 
+# --- map_context layout (run mode) -----------------------------------------
+# The act map is a grid MAP_COLS wide and MAP_ROWS tall (verified against the
+# engine). MAP_SELECT chooses a target column, so the per-column features below
+# align 1:1 with that action block: per-column feature j describes the node
+# reachable at map column j.
+MAP_COLS = ACTION_BLOCK_BY_NAME["MAP_SELECT"].count  # engine map width (x = 0..MAP_COLS-1)
+# Grid rows are 0..MAP_ROWS-1 (verified against the engine: get_room_type past the
+# top row is INVALID). The act boss is not stored in the grid; it sits above the
+# top row and is reached by the edges out of it. MAP_ROWS scales cur_y.
+MAP_ROWS = 15
+MAX_ACTS = 3  # Acts 1-3 (no Act 4 at Ascension 0); scales act
+# floor_num is a cumulative counter across acts (not the per-act row), so it needs its
+# own scale: an upper bound on the floors in a 3-act run, giving floor_norm ~[0, 1].
+RUN_MAX_FLOOR = 56
+
+# map_context is split into a "current" block (where the run stands) and a
+# per-column "next" block (each reachable next-row node). The named widths below
+# must sum to MAP_CONTEXT_DIM; the check makes a layout drift a hard error.
+_MAP_CUR_ROOM_ONEHOT = N_NODE_TYPES  # current node room type (real types 0..N-1)
+_MAP_CUR_POS = 2  # cur_x, cur_y normalized (both negative before the first row)
+_MAP_PROGRESS = 2  # act, floor normalized
+_MAP_PER_COL_FEATS = 4  # per column: reachable, is_combat, is_elite, room_type_norm
+_MAP_CUR_BLOCK = _MAP_CUR_ROOM_ONEHOT + _MAP_CUR_POS + _MAP_PROGRESS
+_MAP_NEXT_BLOCK = MAP_COLS * _MAP_PER_COL_FEATS
+if _MAP_CUR_BLOCK + _MAP_NEXT_BLOCK != MAP_CONTEXT_DIM:
+    raise AssertionError(
+        f"map_context layout ({_MAP_CUR_BLOCK} + {_MAP_NEXT_BLOCK}) must sum to "
+        f"MAP_CONTEXT_DIM ({MAP_CONTEXT_DIM})"
+    )
+
+# Room ids that gate the per-column combat/elite flags (a live enum, not magic ints).
+_ROOM_MONSTER = int(sts.Room.MONSTER)
+_ROOM_ELITE = int(sts.Room.ELITE)
+_ROOM_BOSS = int(sts.Room.BOSS)
+# A combat node from the map's perspective: normal fight, elite, or act boss.
+_COMBAT_ROOMS = (_ROOM_MONSTER, _ROOM_ELITE, _ROOM_BOSS)
+
 
 def _empty_obs() -> Obs:
     """Zero-filled observation with every field's interface dtype and shape."""
@@ -92,22 +134,32 @@ def _read_status(player: Any, status: Any) -> float:
 
 
 def encode_observation(gc: Any, bc: Any) -> Obs:
-    """Encode a live ``GameContext``/``BattleContext`` into the observation dict.
+    """Encode a live ``GameContext`` (+ optional ``BattleContext``) into the obs dict.
 
-    ``gc`` supplies run-level scalars (gold, floor, act, ascension, screen);
-    ``bc`` supplies the combat state (player vitals, powers, piles, enemies).
-    Reads only; no engine mutation.
+    ``gc`` supplies run-level scalars (gold, floor, act, ascension, screen) and,
+    in run mode, the map. ``bc`` supplies the combat state (player vitals, powers,
+    piles, enemies); pass ``bc=None`` for an overworld screen, where combat-only
+    fields stay zero and ``map_context`` is filled instead. Reads only; no engine
+    mutation.
     """
     obs = _empty_obs()
+    # relics and the screen one-hot are read from gc in both modes.
+    _fill_relics_multihot(obs, gc)
+    _fill_screen_onehot(obs, gc)
+
+    if bc is None:
+        _fill_run_scalars(obs, gc)
+        _fill_map_context(obs, gc)
+        return obs
+
     player = bc.player
     monsters = bc.monsters
 
     # Card, monster, and potion ids below are written straight from engine enums
     # with no per-write clamp: validate_engine_enums asserts each enum's max id
     # fits its table (max_id < N) at startup, so a held id is always in bounds.
-    # The relic multi-hot, enemy move id, and screen one-hot guard explicitly
-    # because their raw value can be an out-of-range sentinel (e.g. an empty
-    # RelicId.INVALID or a not-yet-rolled move).
+    # The enemy move id guards explicitly because its raw value can be an
+    # out-of-range sentinel (a not-yet-rolled move).
 
     # -- player_scalars: hp_cur, hp_max, block, energy, gold, floor, ascension, turn
     obs["player_scalars"][:] = (
@@ -120,13 +172,6 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
         gc.ascension,
         bc.turn,
     )
-
-    # -- relics_multihot: one bit per owned relic id
-    relics = obs["relics_multihot"]
-    for relic in gc.relics:
-        rid = int(relic.id)
-        if 0 <= rid < N_RELIC_IDS:
-            relics[rid] = 1.0
 
     # -- player_powers: dense amount per player status id
     powers = obs["player_powers"]
@@ -200,14 +245,98 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
         for idx, status in _MONSTER_STATUSES:
             enemy_powers[i, idx] = monster.getStatus(status)
 
-    # -- screen_onehot: current overworld/battle screen
+    # map_context stays zero in combat: it is a run-mode feature, filled only when
+    # bc is None (overworld encoding).
+    return obs
+
+
+def _fill_relics_multihot(obs: Obs, gc: Any) -> None:
+    """Set one bit per owned relic id (guards the INVALID sentinel out of range)."""
+    relics = obs["relics_multihot"]
+    for relic in gc.relics:
+        rid = int(relic.id)
+        if 0 <= rid < N_RELIC_IDS:
+            relics[rid] = 1.0
+
+
+def _fill_screen_onehot(obs: Obs, gc: Any) -> None:
+    """Set the one-hot bit for the current screen (guards out-of-range screen ids)."""
     screen_idx = int(gc.screen_state)
     if 0 <= screen_idx < N_SCREENS:
         obs["screen_onehot"][screen_idx] = 1.0
 
-    # map_context stays zero: it is a run-mode feature, filled with non-combat
-    # screens later.
-    return obs
+
+def _fill_run_scalars(obs: Obs, gc: Any) -> None:
+    """Player scalars for an overworld state (no combat: block/energy/turn are 0)."""
+    obs["player_scalars"][:] = (
+        gc.cur_hp,
+        gc.max_hp,
+        0.0,  # block: no combat block out of battle
+        0.0,  # energy: refilled at combat start
+        gc.gold,
+        gc.floor_num,
+        gc.ascension,
+        0.0,  # turn: combat-only counter
+    )
+
+
+def _fill_map_context(obs: Obs, gc: Any) -> None:
+    """Fill ``map_context`` from the run's map: current node + reachable next nodes.
+
+    Layout (sums to ``MAP_CONTEXT_DIM``): a current block -- room-type one-hot,
+    normalized ``(x, y)`` position, normalized ``(act, floor)`` -- followed by one
+    per-column block for each of the ``MAP_COLS`` map columns, aligned to the
+    ``MAP_SELECT`` action index. Each per-column block is
+    ``(reachable, is_combat, is_elite, room_type_norm)`` for the node reachable at
+    that column in the next row; unreachable columns stay zero.
+
+    Before the first row the engine reports ``cur == (-1, -1)``; the normalized
+    position is then negative (a distinct pre-map signal) and the reachable set is
+    every column holding a real room in row 0.
+    """
+    ctx = obs["map_context"]
+    spire_map = gc.map
+    cur_x = int(gc.cur_map_node_x)
+    cur_y = int(gc.cur_map_node_y)
+
+    # current node room type (NONE/INVALID, e.g. pre-map, leave the one-hot zero)
+    cur_room_id = int(gc.cur_room)
+    if 0 <= cur_room_id < N_NODE_TYPES:
+        ctx[cur_room_id] = 1.0
+
+    pos = _MAP_CUR_ROOM_ONEHOT
+    ctx[pos] = cur_x / (MAP_COLS - 1)
+    ctx[pos + 1] = cur_y / (MAP_ROWS - 1)
+    progress = pos + _MAP_CUR_POS
+    ctx[progress] = (int(gc.act) - 1) / (MAX_ACTS - 1)
+    ctx[progress + 1] = int(gc.floor_num) / RUN_MAX_FLOOR
+
+    # Columns reachable from the current node in the next row. Pre-map (cur_y < 0),
+    # any row-0 column holding a real room is a legal first step; otherwise the
+    # engine's edge list gives the reachable next-row columns.
+    next_row = cur_y + 1
+    if cur_y < 0:
+        reachable = {
+            c for c in range(MAP_COLS) if 0 <= int(spire_map.get_room_type(c, 0)) < N_NODE_TYPES
+        }
+    else:
+        reachable = {int(c) for c in spire_map.edges(cur_x, cur_y)}
+
+    # Edges out of the top grid row lead to the act boss, which is not stored in the
+    # grid (next_row is past the grid, so get_room_type would return INVALID). On
+    # that boundary the reachable columns are the boss; encode it as BOSS so it keeps
+    # its combat signal instead of reading as SHOP (room id 0). Within the grid, read
+    # the real next-row room type (the norm guard keeps any stray sentinel at zero).
+    on_boss_boundary = next_row >= MAP_ROWS
+    base = progress + _MAP_PROGRESS
+    for col in reachable:
+        room_id = _ROOM_BOSS if on_boss_boundary else int(spire_map.get_room_type(col, next_row))
+        slot = base + col * _MAP_PER_COL_FEATS
+        ctx[slot] = 1.0  # reachable
+        ctx[slot + 1] = 1.0 if room_id in _COMBAT_ROOMS else 0.0
+        ctx[slot + 2] = 1.0 if room_id == _ROOM_ELITE else 0.0
+        if 0 <= room_id < N_NODE_TYPES:
+            ctx[slot + 3] = room_id / (N_NODE_TYPES - 1)
 
 
 def _fill_pile_ids(out: np.ndarray, pile: Any) -> None:
