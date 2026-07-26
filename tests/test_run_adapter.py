@@ -18,22 +18,56 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
 
 from sts_rl.env.reward import RewardConfig, beta
 from sts_rl.env.run import overworld_actions
-from sts_rl.env.run_adapter import StsRunEnv
+from sts_rl.env.run_adapter import _MAX_SEED, StsRunEnv
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     ACTION_DIM,
     INFO_KEYS_ALWAYS,
     INFO_KEYS_TERMINAL,
     INTERFACE_VERSION,
+    TERMINAL_LOSS_REWARD,
     InterfaceError,
 )
 
 REGRESSION_SEED = 42
+# A seed whose greedy drive clears the first act's boss and crosses into the next
+# act, so boss_kill / act-transition shaping is exercised non-vacuously.
+ACT_CROSSING_SEED = 10
 # Generous drive cap; a passive-combat run dies far sooner. Well under the env's
 # own truncation cap so a driven episode ends by terminating, not truncating.
 MAX_DRIVE_STEPS = 2000
 _END_TURN = ACTION_BLOCK_BY_NAME["END_TURN"].start
 _COMBAT = "combat"
+
+
+def _drive(env: StsRunEnv, first_info: dict, policy) -> list[dict]:
+    """Drive ``env`` with ``policy`` until the episode ends; return per-step records.
+
+    Each record captures the state the action was taken in and the step's outcome:
+    ``acted_in_combat``, ``reward``, ``terminated``, ``truncated``, ``shaping`` (the
+    step's ``shaping_terms``), ``info``, and ``t_before`` (the anneal clock read
+    before the step, for reconstructing ``beta(t)``).
+    """
+    info = first_info
+    trace: list[dict] = []
+    for _ in range(MAX_DRIVE_STEPS):
+        acted_in_combat = info["screen"] == _COMBAT
+        t_before = env._global_step
+        _, reward, terminated, truncated, info = env.step(policy(info))
+        trace.append(
+            {
+                "acted_in_combat": acted_in_combat,
+                "reward": reward,
+                "terminated": terminated,
+                "truncated": truncated,
+                "shaping": info["shaping_terms"],
+                "info": info,
+                "t_before": t_before,
+            }
+        )
+        if terminated or truncated:
+            return trace
+    raise AssertionError("run did not end within the drive cap")
 
 
 def _greedy_action(info: dict) -> int:
@@ -283,3 +317,79 @@ def test_invalid_max_episode_steps_rejected(bad_steps: int) -> None:
 def test_invalid_render_mode_rejected() -> None:
     with pytest.raises(InterfaceError):
         StsRunEnv(render_mode="rgb_array")
+
+
+def test_run_shaping_credited_exactly_once_across_combats() -> None:
+    """Floor / boss shaping is credited once per floor / act gained, never on combat.
+
+    The run-shaping baseline persists across an intervening combat and updates only
+    on overworld steps, so the summed floor_progress / boss_kill contributions
+    telescope to the observed floor / act delta - no double count at the boundary,
+    none missed. Combat steps contribute zero to either term.
+    """
+    cfg = RewardConfig()
+    env = StsRunEnv(reward_config=cfg)
+    _, info0 = env.reset(seed=ACT_CROSSING_SEED)
+    init_floor, init_act = info0["floor"], info0["act"]
+    trace = _drive(env, info0, _greedy_action)
+    final = trace[-1]["info"]
+
+    floor_credit = sum(rec["shaping"]["floor_progress"] for rec in trace)
+    boss_credit = sum(rec["shaping"]["boss_kill"] for rec in trace)
+    assert floor_credit == pytest.approx(cfg.floor_progress * (final["floor"] - init_floor))
+    assert boss_credit == pytest.approx(cfg.boss_kill * (final["act"] - init_act))
+    # Non-vacuous: this drive actually cleared an act boss, so boss_kill fired.
+    assert final["act"] > init_act
+    # No run-shaping is ever credited on a combat step (that is combat shaping's job).
+    for rec in trace:
+        if rec["acted_in_combat"]:
+            assert rec["shaping"]["floor_progress"] == 0.0
+            assert rec["shaping"]["boss_kill"] == 0.0
+    env.close()
+
+
+def test_terminal_reward_added_once_on_terminal_step() -> None:
+    """The terminal -1 is applied exactly once, only on the terminal step.
+
+    Every non-terminal step's reward is pure shaping (no terminal component); the
+    terminal step's reward minus its shaping equals exactly one TERMINAL_LOSS_REWARD.
+    """
+    cfg = RewardConfig()
+    env = StsRunEnv(reward_config=cfg)
+    _, info0 = env.reset(seed=REGRESSION_SEED)
+    trace = _drive(env, info0, _passive_action)
+
+    assert trace[-1]["terminated"] and not trace[-1]["truncated"]
+    for rec in trace:
+        shaping = beta(rec["t_before"], cfg) * sum(rec["shaping"].values())
+        terminal_component = rec["reward"] - shaping
+        if rec is trace[-1]:
+            assert terminal_component == pytest.approx(TERMINAL_LOSS_REWARD)
+        else:
+            assert terminal_component == pytest.approx(0.0)
+    env.close()
+
+
+def test_forced_continues_and_autoresolves_do_not_count_as_steps() -> None:
+    """Only agent step() calls advance the step counter, not env-driven advances.
+
+    reset settles past forced continues before the first decision without counting a
+    step, and mid-episode forced continues / combat auto-resolves never inflate the
+    count: the terminal episode length equals the number of step() calls made.
+    """
+    env = StsRunEnv()
+    _, info0 = env.reset(seed=REGRESSION_SEED)
+    assert env._steps == 0  # settle advanced forced continues but counted no step
+    trace = _drive(env, info0, _passive_action)
+    assert trace[-1]["info"]["episode"]["l"] == len(trace)
+    env.close()
+
+
+def test_reset_without_seed_is_valid_and_bounded() -> None:
+    """reset(seed=None) draws an in-range episode seed and yields a valid observation."""
+    env = StsRunEnv()
+    obs, info = env.reset()
+    assert env.observation_space.contains(obs)
+    assert info["action_mask"].any()
+    assert 0 <= env._episode_seed < _MAX_SEED
+    env.close()
