@@ -48,6 +48,7 @@ CHOICE_MAX = 10
 MAX_REWARD_GOLD = 1
 MAX_REWARD_POTIONS = 3  # at most one potion per reward in practice; headroom
 MAX_REWARD_RELICS = 3  # matches the engine's 3-relic rewards container
+MAX_REWARD_KEY = 1  # at most one key (Sapphire or Emerald) offered at once
 MAX_REWARD_CARD_GROUPS = 2  # card-choice groups (a second appears with Prayer Wheel)
 MAX_REWARD_CARDS_PER_GROUP = 4  # cards per group == CardReward fixed_list<Card,4>
 MAX_REWARD_CARD_SLOTS = MAX_REWARD_CARD_GROUPS * MAX_REWARD_CARDS_PER_GROUP  # 8
@@ -114,10 +115,10 @@ REWARD_GOLD_OFFSET = 0
 REWARD_POTION_OFFSET = REWARD_GOLD_OFFSET + MAX_REWARD_GOLD
 REWARD_RELIC_OFFSET = REWARD_POTION_OFFSET + MAX_REWARD_POTIONS
 REWARD_KEY_OFFSET = REWARD_RELIC_OFFSET + MAX_REWARD_RELICS
-REWARD_CARD_OFFSET = REWARD_KEY_OFFSET + 1
+REWARD_CARD_OFFSET = REWARD_KEY_OFFSET + MAX_REWARD_KEY
 REWARD_SINGING_BOWL_OFFSET = REWARD_CARD_OFFSET + MAX_REWARD_CARD_SLOTS
-REWARD_SKIP_OFFSET = REWARD_SINGING_BOWL_OFFSET + 1
-REWARD_SELECT_COUNT = REWARD_SKIP_OFFSET + 1
+REWARD_SKIP_OFFSET = REWARD_SINGING_BOWL_OFFSET + 1  # Singing Bowl: one slot
+REWARD_SELECT_COUNT = REWARD_SKIP_OFFSET + 1  # skip / leave: one slot
 
 
 # Ordered (name, count) specs. Counts are expressed in terms of the caps above
@@ -130,6 +131,10 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("USE_POTION_UNTARGETED", POTION_SLOTS),  # 5
     ("DISCARD_POTION", POTION_SLOTS),  # 5
     ("CARD_SELECT", CHOICE_MAX),  # 10
+    # Confirm the running selection of a sequential in-combat multi-select
+    # (EXHAUST_MANY / GAMBLE). Kept with the combat blocks so every combat index
+    # stays a fixed prefix as the overworld region grows.
+    ("CONFIRM_SELECT", 1),
     # REWARDS screen: one flat block, sub-divided by the REWARD_*_OFFSET slots
     # above, covering gold / potions / relics / key / card choices / Singing
     # Bowl / skip. Taking an item removes it and the screen re-presents the rest.
@@ -141,9 +146,6 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("EVENT_SELECT", 10),
     ("BOSS_RELIC_SELECT", 4),
     ("PROCEED", 1),
-    # Confirm the running selection of a sequential in-combat multi-select
-    # (EXHAUST_MANY / GAMBLE); appended at the tail so all prior indices are stable.
-    ("CONFIRM_SELECT", 1),
 )
 
 

@@ -47,6 +47,7 @@ def _expected_block_spec():
         ("USE_POTION_UNTARGETED", interface.POTION_SLOTS),
         ("DISCARD_POTION", interface.POTION_SLOTS),
         ("CARD_SELECT", interface.CHOICE_MAX),
+        ("CONFIRM_SELECT", 1),
         ("REWARD_SELECT", interface.REWARD_SELECT_COUNT),
         ("MAP_SELECT", 7),
         ("SHOP_SELECT", 15),
@@ -55,7 +56,6 @@ def _expected_block_spec():
         ("EVENT_SELECT", 10),
         ("BOSS_RELIC_SELECT", 4),
         ("PROCEED", 1),
-        ("CONFIRM_SELECT", 1),
     ]
 
 
@@ -74,9 +74,10 @@ def test_action_block_offsets_match_spec():
         start += count
 
     assert interface.ACTION_BLOCK_BY_NAME["END_TURN"].start == 0
-    assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == 170
-    # CONFIRM_SELECT is the tail block, so its stop equals the full action dim.
-    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == interface.ACTION_DIM
+    # PROCEED is the tail block, so its stop equals the full action dim.
+    assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == interface.ACTION_DIM
+    # CONFIRM_SELECT closes the combat prefix, ahead of the overworld blocks.
+    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == 107
 
 
 def test_action_block_contains():
@@ -99,6 +100,7 @@ def test_reward_select_sublayout_tiles_the_block():
     assert i.REWARD_SINGING_BOWL_OFFSET == i.REWARD_CARD_OFFSET + i.MAX_REWARD_CARD_SLOTS
     assert i.REWARD_SKIP_OFFSET == i.REWARD_SINGING_BOWL_OFFSET + 1
     assert i.REWARD_SELECT_COUNT == i.REWARD_SKIP_OFFSET + 1
+    assert i.REWARD_SELECT_COUNT == 18
     assert i.ACTION_BLOCK_BY_NAME["REWARD_SELECT"].count == i.REWARD_SELECT_COUNT
     assert i.MAX_REWARD_CARD_SLOTS == i.MAX_REWARD_CARD_GROUPS * i.MAX_REWARD_CARDS_PER_GROUP
 

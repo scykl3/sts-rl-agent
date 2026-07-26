@@ -31,7 +31,7 @@ SMALL_HIDDEN = 32
 N_STEPS = 8
 MINIBATCH = 4
 # A single multi-action block: a legal mask every step, non-degenerate learnable
-# task (count 5 > 1, so no degenerate-task warning).
+# task (count 18 > 1, so no degenerate-task warning).
 ACTIVE_BLOCK = "REWARD_SELECT"
 # GAE knobs distinct from the ppo defaults (0.99 / 0.95) so a forwarded override
 # visibly changes the advantages/returns from the buffer-default result.

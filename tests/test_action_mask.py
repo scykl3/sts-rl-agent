@@ -227,6 +227,13 @@ def test_decode_rejects_out_of_range_index() -> None:
 def test_noncombat_indices_do_not_map_in_combat() -> None:
     """Out-of-combat blocks (map, shop, proceed, ...) decode to None during combat."""
     _, bc = start_combat(seed=REGRESSION_SEED)
-    for name in ("MAP_SELECT", "SHOP_SELECT", "REST_SELECT", "PROCEED", "REWARD_SELECT"):
+    for name in (
+        "MAP_SELECT",
+        "SHOP_SELECT",
+        "REST_SELECT",
+        "TREASURE_SELECT",
+        "PROCEED",
+        "REWARD_SELECT",
+    ):
         block = ACTION_BLOCK_BY_NAME[name]
         assert decode_action(block.start, bc) is None

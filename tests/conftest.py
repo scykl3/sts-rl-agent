@@ -20,7 +20,7 @@ from sts_rl.env.stub_env import StubEnv
 # Field names whose dtype is an id (embedding index) -> long tensors.
 ID_FIELDS = {f.name for f in interface.OBS_FIELDS if f.bounds == "id"}
 
-# A multi-action block (count 5 > 1) so the learnable task is non-degenerate (a
+# A multi-action block (count 18 > 1) so the learnable task is non-degenerate (a
 # legal mask every step, something to learn), matching the rollout-collector suite.
 STUB_ACTIVE_BLOCK = "REWARD_SELECT"
 
