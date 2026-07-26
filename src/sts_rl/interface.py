@@ -42,11 +42,14 @@ CHOICE_MAX = 10
 # item; each id-bearing category has a matching observation field so the agent
 # sees which card / relic / potion occupies a slot (the slot index alone carries
 # no meaning).
-MAX_REWARD_GOLD = 1  # a combat reward screen has a single gold pile
-MAX_REWARD_POTIONS = 3  # potion rewards presentable at once
-MAX_REWARD_RELICS = 3  # relic rewards presentable at once (elite / boss / chest)
+# One gold slot suffices even for two piles (base + stolen gold): the engine
+# enumerates every gold reward at index 0, so the single slot, taken once per
+# step, collects them all as the screen re-presents.
+MAX_REWARD_GOLD = 1
+MAX_REWARD_POTIONS = 3  # at most one potion per reward in practice; headroom
+MAX_REWARD_RELICS = 3  # matches the engine's 3-relic rewards container
 MAX_REWARD_CARD_GROUPS = 2  # card-choice groups (a second appears with Prayer Wheel)
-MAX_REWARD_CARDS_PER_GROUP = 4  # cards per group (4 with Question Card)
+MAX_REWARD_CARDS_PER_GROUP = 4  # cards per group == CardReward fixed_list<Card,4>
 MAX_REWARD_CARD_SLOTS = MAX_REWARD_CARD_GROUPS * MAX_REWARD_CARDS_PER_GROUP  # 8
 
 # --- Enum cardinalities (confirm against engine enums at startup) ----------
