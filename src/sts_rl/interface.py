@@ -36,7 +36,9 @@ PILE_MAX = 64
 # A card-select screen can span a full pile or the whole deck (deck-wide event
 # removes / transforms, large pile searches like Headbutt / Exhume), so its width
 # is the pile/deck cap. The paired card_select_ids observation carries the card
-# id at each slot, so the choice is by card identity, never by raw index.
+# id at each slot, so the choice is by card identity, never by raw index. Reusing
+# PILE_MAX couples the two: changing PILE_MAX resizes the action space. A deck
+# larger than this cap is truncated (the tail is auto-resolved), not represented.
 CHOICE_MAX = PILE_MAX
 
 # --- Reward-screen selection caps (combat / elite / chest REWARDS screen) ---
