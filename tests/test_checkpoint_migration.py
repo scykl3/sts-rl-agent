@@ -156,10 +156,19 @@ def test_spot_check_named_block_remap(name: str) -> None:
     ), f"{name}: row from old offset {old_start} did not land at new offset {new_start}"
 
 
-def test_confirm_select_moves_from_154_to_106() -> None:
-    """Explicit index check of the headline remap: old 154 -> new 106."""
-    assert OLD_LAYOUT["CONFIRM_SELECT"] == (154, 1)
-    assert ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].start == 106
+def test_confirm_select_remaps_to_current_offset() -> None:
+    """Headline remap: old CONFIRM_SELECT@154 lands at its current interface offset,
+    derived live (never a hardcoded literal) so it survives later layout shifts."""
+    old_start, _ = OLD_LAYOUT["CONFIRM_SELECT"]
+    assert old_start == 154  # fixed 0.3.0 history
+    new_start = ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].start
+    assert new_start != old_start  # CONFIRM shifted when the overworld blocks were inserted
+    state = _build_old_state_dict()
+    migrated = migrate_policy_head(state, OLD_VERSION)
+    assert torch.equal(
+        migrated[POLICY_LOGITS_WEIGHT_KEY][new_start],
+        state[POLICY_LOGITS_WEIGHT_KEY][old_start],
+    )
 
 
 def test_new_only_blocks_are_zero_initialized() -> None:
