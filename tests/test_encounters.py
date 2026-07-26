@@ -87,6 +87,15 @@ def test_act1_pool_includes_the_three_elites() -> None:
         assert elite in ACT1_ENCOUNTER_NAMES
 
 
+def test_resolve_rejects_empty_names() -> None:
+    """resolve_encounter_names([]) raises rather than returning (): the empty-pool
+    rejection is the resolver's own rule, matching --encounters and StsEnv, so its
+    docstring's "same validity rule" claim holds. Unmarked (not engine-gated)
+    because the empty guard runs before the lazy engine import, so it is pure-Python."""
+    with pytest.raises(InterfaceError):
+        resolve_encounter_names([])
+
+
 # Engine-dependent checks: mapping names to live enum values needs the native binding.
 
 

@@ -50,17 +50,24 @@ ACT1_ENCOUNTER_NAMES: tuple[str, ...] = (
 def resolve_encounter_names(names: Sequence[str]) -> tuple[Any, ...]:
     """Resolve ``MonsterEncounter`` member names to live engine enum values.
 
-    Validates each name against ``sts.MonsterEncounter.__members__`` (the real
-    enum members: unlike ``dir()`` this excludes Python attributes such as
-    ``name``/``value``) and rejects the engine's ``INVALID`` sentinel. This is
-    the same validity rule the ``--encounters`` CLI parser applies, so a
-    hardcoded pool and a user-supplied list are accepted or rejected the same
+    Rejects an empty ``names`` sequence, then validates each name against
+    ``sts.MonsterEncounter.__members__`` (the real enum members: unlike
+    ``dir()`` this excludes Python attributes such as ``name``/``value``) and
+    rejects the engine's ``INVALID`` sentinel. This is the same validity rule
+    the ``--encounters`` CLI parser applies (an empty list is rejected too), so
+    a hardcoded pool and a user-supplied list are accepted or rejected the same
     way. The engine is imported lazily so this module stays importable without a
     native build.
 
-    Raises :class:`~sts_rl.interface.InterfaceError` naming any unknown or
-    sentinel entry.
+    Raises :class:`~sts_rl.interface.InterfaceError` on an empty sequence, or
+    naming any unknown or sentinel entry.
     """
+    # Degenerate input: reject an empty pool before the lazy engine import. Matches
+    # the empty-pool rejection --encounters and StsEnv already apply, and makes the
+    # docstring's "same validity rule" claim above true.
+    if not names:
+        raise InterfaceError("names is empty; an encounter pool needs at least one entry")
+
     from sts_rl.env._engine import slaythespire as sts
 
     members = sts.MonsterEncounter.__members__
