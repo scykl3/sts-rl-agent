@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -38,6 +39,23 @@ class MiniBatch:
     old_values: Tensor
     advantages: Tensor
     returns: Tensor
+
+
+class SupportsMinibatches(Protocol):
+    """The rollout-buffer surface :func:`~sts_rl.agent.ppo_update.ppo_update` consumes.
+
+    A structural type covering exactly what the update pass touches - the length
+    and the shuffled-minibatch iterator - and nothing else. Both the single-env
+    :class:`RolloutBuffer` and the multi-env :class:`VecRolloutBuffer` satisfy it,
+    so ``ppo_update`` is agnostic to the buffer layout (one env vs a flattened
+    ``num_envs`` batch).
+    """
+
+    def __len__(self) -> int: ...
+
+    def iter_minibatches(
+        self, minibatch_size: int, shuffle: bool = True
+    ) -> Iterator[MiniBatch]: ...
 
 
 class RolloutBuffer:
@@ -186,3 +204,160 @@ class RolloutBuffer:
         self._masks.clear()
         self.advantages = None
         self.returns = None
+
+
+def _assert_leading_dim(tensor: Tensor, expected: int, name: str) -> None:
+    """Raise unless ``tensor``'s leading axis is ``expected`` (the num_envs boundary)."""
+    if tensor.shape[0] != expected:
+        raise ValueError(
+            f"{name} must have leading dim {expected}, got shape {tuple(tensor.shape)}"
+        )
+
+
+class VecRolloutBuffer:
+    """Multi-env rollout buffer: ``num_envs`` independent trajectories, per-env GAE.
+
+    Holds one single-env :class:`RolloutBuffer` per environment and delegates to
+    them, so GAE is computed INDEPENDENTLY per env through the same trusted
+    :func:`~sts_rl.agent.ppo.compute_gae` path - a done or truncation in one env
+    never leaks advantage into another. For the PPO update the per-env
+    trajectories are flattened into one ``(T * num_envs, ...)`` batch (env-major:
+    env 0's ``T`` steps, then env 1's, ...). The flattening order is irrelevant to
+    the update because :meth:`iter_minibatches` shuffles, and the update
+    normalizes advantages per minibatch over that flattened set (standard
+    vectorized-PPO semantics).
+
+    Satisfies :class:`SupportsMinibatches`, so it is a drop-in for
+    :func:`~sts_rl.agent.ppo_update.ppo_update` in place of a single
+    :class:`RolloutBuffer`.
+    """
+
+    def __init__(self, num_envs: int) -> None:
+        if num_envs < 1:
+            raise ValueError(f"num_envs must be >= 1, got {num_envs}")
+        self.num_envs = num_envs
+        # One trusted single-env buffer per env; all storage/GAE delegates here.
+        self._buffers: list[RolloutBuffer] = [RolloutBuffer() for _ in range(num_envs)]
+
+    def add_batch(
+        self,
+        obs: dict[str, Tensor],
+        actions: Tensor,
+        log_probs: Tensor,
+        values: Tensor,
+        rewards: Tensor,
+        dones: Tensor,
+        masks: Tensor,
+    ) -> None:
+        """Append one batched transition, scattering row ``i`` to env ``i``'s buffer.
+
+        Every tensor carries a leading ``num_envs`` axis: ``obs`` maps each field
+        to ``(num_envs, *field_shape)``, ``masks`` is ``(num_envs, ACTION_DIM)``,
+        and ``actions``/``log_probs``/``values``/``rewards``/``dones`` are
+        ``(num_envs,)``. ``dones[i]`` is env ``i``'s TERMINAL flag only (never a
+        truncation), matching :meth:`RolloutBuffer.add`; the per-step
+        ``.detach().clone()`` ownership is inherited from the sub-buffers' ``add``.
+        """
+        # Assert the num_envs leading axis on EVERY batched field (not just
+        # actions): a mismatch must fail loudly here rather than silently drop or
+        # misalign rows through the per-env indexing below.
+        for name, tensor in obs.items():
+            _assert_leading_dim(tensor, self.num_envs, f"obs[{name}]")
+        _assert_leading_dim(actions, self.num_envs, "actions")
+        _assert_leading_dim(log_probs, self.num_envs, "log_probs")
+        _assert_leading_dim(values, self.num_envs, "values")
+        _assert_leading_dim(rewards, self.num_envs, "rewards")
+        _assert_leading_dim(dones, self.num_envs, "dones")
+        _assert_leading_dim(masks, self.num_envs, "masks")
+        for i, buffer in enumerate(self._buffers):
+            buffer.add(
+                obs={name: tensor[i] for name, tensor in obs.items()},
+                action=actions[i],
+                log_prob=log_probs[i],
+                value=values[i],
+                reward=float(rewards[i]),
+                done=float(dones[i]),
+                mask=masks[i],
+            )
+
+    def compute_advantages(
+        self,
+        last_values: Tensor,
+        gamma: float = DEFAULT_GAMMA,
+        gae_lambda: float = DEFAULT_GAE_LAMBDA,
+    ) -> None:
+        """Run GAE PER env, bootstrapping env ``i`` from ``last_values[i]``.
+
+        ``last_values`` is ``(num_envs,)`` (the critic's value of each env's
+        post-rollout cursor state). Each env's advantages/returns come from the
+        single-env :func:`~sts_rl.agent.ppo.compute_gae` over that env's own
+        stored trajectory, so the recursion is severed at that env's episode
+        boundaries alone. Advantages stay RAW (per-minibatch normalization is the
+        update's job), matching :meth:`RolloutBuffer.compute_advantages`.
+        """
+        _assert_leading_dim(last_values, self.num_envs, "last_values")
+        for i, buffer in enumerate(self._buffers):
+            buffer.compute_advantages(last_values[i], gamma=gamma, gae_lambda=gae_lambda)
+
+    def __len__(self) -> int:
+        """Total stored transitions across all envs (``T * num_envs`` after a collect)."""
+        return sum(len(buffer) for buffer in self._buffers)
+
+    def reset(self) -> None:
+        """Clear every env's sub-buffer for the next rollout."""
+        for buffer in self._buffers:
+            buffer.reset()
+
+    def iter_minibatches(self, minibatch_size: int, shuffle: bool = True) -> Iterator[MiniBatch]:
+        """Yield the flattened ``(T * num_envs, ...)`` rollout as ``(mb, ...)`` minibatches.
+
+        Requires :meth:`compute_advantages` to have run (per env). Each env's full
+        in-order ``(T, ...)`` slice - already carrying that env's GAE - is taken
+        from its sub-buffer and concatenated env-major, then a single index
+        permutation is sliced into ``minibatch_size`` chunks, mirroring
+        :meth:`RolloutBuffer.iter_minibatches`. Every transition lands in exactly
+        one minibatch; the final chunk keeps the remainder.
+        """
+        if minibatch_size <= 0:
+            raise ValueError(f"minibatch_size must be positive, got {minibatch_size}")
+        length = len(self)
+        if length == 0:  # nothing collected; yield nothing rather than cat([]) crashing
+            return
+        # The collector steps every env in lockstep, so all sub-buffers share T. An
+        # uneven fill is a caller bug (e.g. add_batch skipped an env); fail loudly.
+        sub_lengths = {len(buffer) for buffer in self._buffers}
+        if len(sub_lengths) != 1:
+            raise RuntimeError(
+                f"vec sub-buffers have unequal lengths {sub_lengths}; every env must be "
+                "stepped the same number of times before iter_minibatches"
+            )
+        # One full-width, in-order MiniBatch per env (each already GAE-computed),
+        # concatenated along the batch axis into the flattened rollout.
+        per_env = [
+            next(buffer.iter_minibatches(len(buffer), shuffle=False)) for buffer in self._buffers
+        ]
+        obs = {key: torch.cat([mb.obs[key] for mb in per_env]) for key in per_env[0].obs}
+        masks = torch.cat([mb.masks for mb in per_env])
+        actions = torch.cat([mb.actions for mb in per_env])
+        old_log_probs = torch.cat([mb.old_log_probs for mb in per_env])
+        old_values = torch.cat([mb.old_values for mb in per_env])
+        advantages = torch.cat([mb.advantages for mb in per_env])
+        returns = torch.cat([mb.returns for mb in per_env])
+
+        # Co-locate the shuffle index with the data so the gather stays on-device.
+        order = (
+            torch.randperm(length, device=advantages.device)
+            if shuffle
+            else torch.arange(length, device=advantages.device)
+        )
+        for start in range(0, length, minibatch_size):
+            idx = order[start : start + minibatch_size]
+            yield MiniBatch(
+                obs={key: tensor[idx] for key, tensor in obs.items()},
+                masks=masks[idx],
+                actions=actions[idx],
+                old_log_probs=old_log_probs[idx],
+                old_values=old_values[idx],
+                advantages=advantages[idx],
+                returns=returns[idx],
+            )

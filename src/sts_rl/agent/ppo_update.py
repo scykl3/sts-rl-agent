@@ -18,7 +18,7 @@ import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.ppo import DEFAULT_CLIP_COEF, clipped_policy_loss, clipped_value_loss
-from sts_rl.agent.rollout_buffer import RolloutBuffer
+from sts_rl.agent.rollout_buffer import SupportsMinibatches
 
 # Standard PPO objective weights and update schedule. Named so a tuning change
 # propagates instead of being buried as literals in PPOConfig's signature.
@@ -101,7 +101,7 @@ def _explained_variance(y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
 
 def ppo_update(
     actor_critic: ActorCritic,
-    buffer: RolloutBuffer,
+    buffer: SupportsMinibatches,
     optimizer: torch.optim.Optimizer,
     config: PPOConfig = PPOConfig(),
 ) -> PPOStats:

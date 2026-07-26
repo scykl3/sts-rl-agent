@@ -9,7 +9,8 @@ fixed-length rollout and then runs one PPO update over it. This is SB3's
 math lives here, only the composition.
 
 ``global_step`` counts environment steps taken - the x-axis for a learning curve.
-With a single environment it advances by exactly ``n_steps`` per iteration.
+It advances by ``num_envs * n_steps`` per iteration (exactly ``n_steps`` in the
+default single-env case).
 
 GAE ``gamma``/``gae_lambda`` ARE configurable through this loop: ``TrainConfig``
 carries both (defaulting to ``DEFAULT_GAMMA``/``DEFAULT_GAE_LAMBDA``) and forwards
@@ -20,7 +21,11 @@ prior fixed-default behavior exactly.
 The loop is environment-agnostic: it accepts any gymnasium env satisfying the
 shared interface (an observation dict plus ``info['action_mask']``), so the same
 ``train`` drives the engine-free stub today and the real engine env later - it
-never imports or references a concrete env.
+never imports or references a concrete env. When ``config.num_envs > 1`` it
+instead drives a vectorized env (a ``VecEnvProtocol`` such as ``SubprocVecEnv``)
+over ``num_envs`` parallel envs, collecting ``n_steps`` per env with per-env GAE;
+the caller constructs and passes that vec env. ``num_envs == 1`` (the default)
+runs the original single-env path unchanged.
 
 Opt-in add-ons: ``target_kl`` early-stop (via ``PPOConfig``), learning-rate
 annealing (``anneal_lr``), periodic holdout evaluation (``eval_every`` plus a
@@ -45,8 +50,13 @@ from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig, PPOStats, ppo_update
-from sts_rl.agent.rollout_buffer import RolloutBuffer
-from sts_rl.agent.rollout_collector import CollectStats, RolloutCollector
+from sts_rl.agent.rollout_buffer import RolloutBuffer, SupportsMinibatches, VecRolloutBuffer
+from sts_rl.agent.rollout_collector import (
+    CollectStats,
+    RolloutCollector,
+    VecEnvProtocol,
+    VecRolloutCollector,
+)
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 from sts_rl.interface import INTERFACE_VERSION
 
@@ -80,13 +90,16 @@ CHECKPOINT_WIN_RATE_KEY: str = "win_rate"
 class TrainConfig:
     """Hyperparameters for one :func:`train` run.
 
-    Holds the loop-level knobs (iteration count, rollout length, optimizer step,
-    LR-anneal toggle, GAE ``gamma``/``gae_lambda``, seed, trunk width) plus a
-    nested :class:`PPOConfig` forwarded verbatim to :func:`ppo_update`. Nesting
-    the existing config avoids restating - and later drifting from - its fields
-    and their defaults. ``hidden_dim`` defaults to the encoder's
-    :data:`HIDDEN_DIM`; ``gamma``/``gae_lambda`` to the shared
+    Holds the loop-level knobs (iteration count, rollout length, parallel-env
+    count, optimizer step, LR-anneal toggle, GAE ``gamma``/``gae_lambda``, seed,
+    trunk width) plus a nested :class:`PPOConfig` forwarded verbatim to
+    :func:`ppo_update`. Nesting the existing config avoids restating - and later
+    drifting from - its fields and their defaults. ``hidden_dim`` defaults to the
+    encoder's :data:`HIDDEN_DIM`; ``gamma``/``gae_lambda`` to the shared
     ``DEFAULT_GAMMA``/``DEFAULT_GAE_LAMBDA``; the PPO knobs to ``PPOConfig``'s.
+    ``num_envs`` defaults to 1 (the single-env path, behavior-identical to the
+    pre-vectorization loop); ``num_envs > 1`` opts into the vectorized path and
+    requires ``env`` to be a matching vectorized env.
     ``anneal_lr`` is off by default - a constant LR is a valid first cut.
     Periodic holdout eval (``eval_every`` cadence over the
     ``eval_seed_base``/``eval_episodes`` band) and best/last ``checkpoint_dir``
@@ -96,6 +109,7 @@ class TrainConfig:
 
     num_iterations: int
     n_steps: int
+    num_envs: int = 1
     learning_rate: float = DEFAULT_LEARNING_RATE
     anneal_lr: bool = False
     gamma: float = DEFAULT_GAMMA
@@ -120,6 +134,8 @@ class TrainConfig:
             raise ValueError(f"num_iterations must be positive, got {self.num_iterations}")
         if self.n_steps <= 0:
             raise ValueError(f"n_steps must be positive, got {self.n_steps}")
+        if self.num_envs <= 0:
+            raise ValueError(f"num_envs must be positive, got {self.num_envs}")
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
         if self.hidden_dim <= 0:
@@ -201,7 +217,9 @@ class TrainHistory:
         return max(self.eval_reports, key=lambda record: record.report.win_rate)
 
 
-def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None) -> TrainHistory:
+def train(
+    env: gym.Env | VecEnvProtocol, config: TrainConfig, *, eval_env: gym.Env | None = None
+) -> TrainHistory:
     """Run ``config.num_iterations`` collect->update iterations; return the history.
 
     Seeds the process-global RNGs once up front (the reproducibility contract:
@@ -210,9 +228,11 @@ def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None)
     network, optimizer, collector, and buffer and loops. The collector separately
     seeds only the env's own reset stream via its ``seed`` argument.
 
-    Each iteration collects exactly ``config.n_steps`` transitions (the collector
-    clears the buffer and runs GAE internally), runs one multi-epoch PPO update
-    over that buffer, records the merged diagnostics, and emits one INFO log line.
+    Each iteration collects ``config.n_steps`` transitions per env (the collector
+    clears the buffer and runs per-env GAE internally), runs one multi-epoch PPO
+    update over that buffer, records the merged diagnostics, and emits one INFO
+    log line. With ``num_envs > 1``, ``env`` must be a vectorized env whose
+    ``num_envs`` matches ``config.num_envs`` (else a ``ValueError``).
 
     Periodic evaluation and checkpointing are opt-in and default OFF. When
     ``config.eval_every`` is set, every ``eval_every`` iterations (and always on
@@ -243,14 +263,61 @@ def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None)
 
     actor_critic = ActorCritic(hidden_dim=config.hidden_dim)
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=config.learning_rate)
-    collector = RolloutCollector(
-        env,
-        actor_critic,
-        seed=config.seed,
-        gamma=config.gamma,
-        gae_lambda=config.gae_lambda,
-    )
-    buffer = RolloutBuffer()
+    # Rollout collection runs either the single-env path (num_envs == 1: the
+    # existing RolloutCollector + RolloutBuffer, behavior-identical to the
+    # pre-vectorization loop) or the vectorized path (num_envs > 1), where `env`
+    # must be a vectorized env (a VecEnvProtocol such as SubprocVecEnv) whose
+    # own num_envs matches the config. Both are held here and only one is built.
+    single_collector: RolloutCollector | None = None
+    vec_collector: VecRolloutCollector | None = None
+    single_buffer: RolloutBuffer | None = None
+    vec_buffer: VecRolloutBuffer | None = None
+    if config.num_envs == 1:
+        # Single-env path: env must be a plain gym.Env. The raise rejects a caller
+        # env-type/num_envs mismatch with a clear ValueError (consistent with the
+        # num_envs value check below and every boundary check in train()/TrainConfig)
+        # and narrows the union for mypy - a raise on the not-a-gym.Env case leaves
+        # env a gym.Env in the code that follows, so no cast is needed.
+        if not isinstance(env, gym.Env):
+            raise ValueError(
+                f"config.num_envs=1 (single-env path) requires a gym.Env, but the "
+                f"passed env is not a gym.Env (got {type(env).__name__}); pass a "
+                f"gym.Env or set num_envs to the vectorized env's num_envs"
+            )
+        single_collector = RolloutCollector(
+            env,
+            actor_critic,
+            seed=config.seed,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+        )
+        single_buffer = RolloutBuffer()
+    else:
+        # Vectorized path: env must be a VecEnvProtocol (e.g. SubprocVecEnv), not a
+        # gym.Env. The raise rejects a caller env-type/num_envs mismatch with a clear
+        # ValueError (mirroring the single-env branch and consistent with the
+        # num_envs value check below) and narrows the union to VecEnvProtocol for
+        # mypy - a raise on the gym.Env case leaves env a VecEnvProtocol in the code
+        # that follows (so env.num_envs is valid), without a cast.
+        if isinstance(env, gym.Env):
+            raise ValueError(
+                f"config.num_envs={config.num_envs} (vectorized path) requires a "
+                f"vectorized env (a VecEnvProtocol such as SubprocVecEnv), but the "
+                f"passed env is a gym.Env; pass a vectorized env or set num_envs=1"
+            )
+        if env.num_envs != config.num_envs:
+            raise ValueError(
+                f"config.num_envs={config.num_envs} but the passed vectorized env "
+                f"reports num_envs={env.num_envs}; they must match"
+            )
+        vec_collector = VecRolloutCollector(
+            env,
+            actor_critic,
+            seed=config.seed,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+        )
+        vec_buffer = VecRolloutBuffer(config.num_envs)
 
     # Create the checkpoint dir once up front (not per save), so a bad path fails
     # before training rather than after the first eval.
@@ -277,11 +344,22 @@ def train(env: gym.Env, config: TrainConfig, *, eval_env: gym.Env | None = None)
 
         # collect() resets the buffer and runs compute_advantages itself, so the
         # SAME buffer is handed straight to ppo_update with GAE already computed.
-        collect_stats = collector.collect(buffer, config.n_steps)
-        # Single env: one collected transition == one env step, so the step
-        # counter advances by exactly n_steps each iteration.
-        global_step += config.n_steps
-        ppo_stats = ppo_update(actor_critic, buffer, optimizer, config.ppo)
+        # Both collectors expose the same collect(buffer, n_steps) -> CollectStats
+        # surface and fill a SupportsMinibatches buffer, so only construction
+        # differs between the single-env and vectorized paths.
+        if single_collector is not None:
+            assert single_buffer is not None  # paired with single_collector above
+            collect_stats = single_collector.collect(single_buffer, config.n_steps)
+            buffer_for_update: SupportsMinibatches = single_buffer
+        else:
+            assert vec_collector is not None and vec_buffer is not None  # paired above
+            collect_stats = vec_collector.collect(vec_buffer, config.n_steps)
+            buffer_for_update = vec_buffer
+        # n_steps transitions are collected PER env across num_envs envs, so the
+        # step counter advances by num_envs * n_steps (exactly n_steps when
+        # num_envs == 1, preserving the single-env accounting).
+        global_step += config.num_envs * config.n_steps
+        ppo_stats = ppo_update(actor_critic, buffer_for_update, optimizer, config.ppo)
 
         records.append(
             IterationRecord(

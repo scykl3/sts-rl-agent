@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from conftest import make_stub_vec_env
 
 import sts_rl.agent.train as train_module
 from sts_rl.agent.actor_critic import ActorCritic
@@ -300,6 +301,7 @@ def test_config_defaults_are_symbolic() -> None:
     assert config.gamma == DEFAULT_GAMMA
     assert config.gae_lambda == DEFAULT_GAE_LAMBDA
     assert config.anneal_lr is False  # constant LR is the default first cut
+    assert config.num_envs == 1  # single-env path by default (opt-in vectorization)
     assert config.ppo == PPOConfig()
     # Eval + checkpointing default OFF, so an unset config is behaviour-identical
     # to the pre-feature loop; the band defaults come from the module constants.
@@ -646,3 +648,122 @@ def test_eval_and_checkpoint_default_off(tmp_path: Path) -> None:
     assert history.best_eval() is None
     # checkpoint_dir was None, so nothing is written anywhere (tmp_path stays empty).
     assert list(tmp_path.iterdir()) == []
+
+
+# -- Vectorized (num_envs > 1) path ------------------------------------------
+
+# terminate_prob=1.0 with a high step cap makes every StubEnv episode a single
+# terminal step, keeping the vectorized runs fast and every iteration full of
+# completed episodes.
+VEC_NUM_ENVS = 3
+
+
+def _vec_task_env(num_envs: int = VEC_NUM_ENVS):
+    """A StubVecEnv of single-step bandit envs for the vectorized-path tests."""
+    return make_stub_vec_env(num_envs, terminate_prob=1.0, max_episode_steps=10_000)
+
+
+def test_num_envs_defaults_to_one() -> None:
+    """num_envs defaults to 1 (the single-env path)."""
+    assert TrainConfig(num_iterations=1, n_steps=1).num_envs == 1
+
+
+@pytest.mark.parametrize("value", [0, -1, -4])
+def test_config_rejects_non_positive_num_envs(value: int) -> None:
+    """num_envs must be positive; a degenerate count fails at construction."""
+    with pytest.raises(ValueError, match="num_envs"):
+        dataclasses.replace(_BASE_CONFIG, num_envs=value)
+
+
+def test_vectorized_global_step_accounting() -> None:
+    """num_envs>1 advances global_step by num_envs*n_steps per iteration.
+
+    Locks the vectorized step accounting end to end: each iteration collects
+    n_steps per env across num_envs envs, so global_step is the running
+    num_envs*n_steps total and CollectStats.n_steps reports that per-iteration
+    total (== len of the flattened buffer).
+    """
+    n_steps = 16
+    num_iterations = 3
+    config = _config(num_iterations=num_iterations, n_steps=n_steps, num_envs=VEC_NUM_ENVS)
+
+    history = train(_vec_task_env(), config)
+
+    assert len(history.records) == num_iterations
+    for i, record in enumerate(history.records):
+        assert record.global_step == (i + 1) * VEC_NUM_ENVS * n_steps
+        assert record.collect.n_steps == VEC_NUM_ENVS * n_steps  # total transitions collected
+    assert history.records[-1].global_step == num_iterations * VEC_NUM_ENVS * n_steps
+
+
+def test_vectorized_num_envs_mismatch_raises() -> None:
+    """config.num_envs must match the passed vec env's num_envs, else a ValueError.
+
+    Revert-verify: drop the num_envs equality guard in train() and this no longer
+    raises (the collector would then batch the wrong number of envs).
+    """
+    vec_env = make_stub_vec_env(2, terminate_prob=1.0, max_episode_steps=10_000)
+    config = _config(num_iterations=1, n_steps=4, num_envs=3)  # 3 != 2
+    with pytest.raises(ValueError, match="num_envs"):
+        train(vec_env, config)
+
+
+def test_num_envs_one_rejects_vectorized_env() -> None:
+    """num_envs==1 with a vectorized env passed raises a clear ValueError.
+
+    The single-env branch requires a plain gym.Env; a VecEnvProtocol (StubVecEnv
+    here) is rejected with a ValueError - matching the adjacent num_envs-mismatch
+    check - not a bare AssertionError that python -O would strip. Revert-verify:
+    restore the bare assert isinstance(env, gym.Env) and this raises AssertionError,
+    not ValueError, so the ValueError match fails.
+    """
+    vec_env = make_stub_vec_env(1, terminate_prob=1.0, max_episode_steps=10_000)
+    config = _config(num_iterations=1, n_steps=4, num_envs=1)
+    with pytest.raises(ValueError, match="single-env path"):
+        train(vec_env, config)
+
+
+def test_num_envs_gt_one_rejects_plain_env() -> None:
+    """num_envs>1 with a plain gym.Env passed raises a clear ValueError.
+
+    The vectorized branch requires a VecEnvProtocol; a plain gym.Env (StubEnv here)
+    is rejected with a ValueError - mirroring the single-env branch and the
+    num_envs-mismatch check - not a bare AssertionError that python -O would strip.
+    Revert-verify: restore the bare assert not isinstance(env, gym.Env) and this
+    raises AssertionError, not ValueError, so the ValueError match fails.
+    """
+    config = _config(num_iterations=1, n_steps=4, num_envs=VEC_NUM_ENVS)
+    with pytest.raises(ValueError, match="vectorized path"):
+        train(_bandit_env(), config)
+
+
+def test_vectorized_training_moves_weights() -> None:
+    """The vectorized path trains end to end: weights differ from the seeded init.
+
+    Exercises collect -> per-env GAE -> flattened minibatches -> ppo_update over the
+    vectorized buffer, and confirms the optimizer actually steps. ``train`` seeds the
+    global RNG then builds the network, so reseeding with the same seed reproduces
+    the exact init; any difference afterward is the update's doing.
+    """
+    config = _config(num_iterations=3, n_steps=32, num_envs=VEC_NUM_ENVS)
+
+    history = train(_vec_task_env(), config)
+
+    torch.manual_seed(SEED)
+    initial = ActorCritic(hidden_dim=HIDDEN)
+    assert _param_checksum(initial) != _param_checksum(history.actor_critic)
+
+
+def test_vectorized_diagnostics_finite_and_sane() -> None:
+    """Every per-iteration diagnostic on the vectorized path is finite and in range."""
+    history = train(_vec_task_env(), _config(num_iterations=3, n_steps=32, num_envs=VEC_NUM_ENVS))
+    for record in history.records:
+        ppo = record.ppo
+        for value in (ppo.policy_loss, ppo.value_loss, ppo.entropy, ppo.approx_kl, ppo.grad_norm):
+            assert math.isfinite(value)
+        assert 0.0 <= ppo.clip_fraction <= 1.0
+        sps = record.collect.steps_per_second
+        assert math.isfinite(sps) and sps > 0.0
+        # Single-step bandit envs terminate on every transition, so the pooled
+        # episode count equals the total transitions collected this iteration.
+        assert record.collect.n_episodes == record.collect.n_steps
