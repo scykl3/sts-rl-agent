@@ -218,7 +218,11 @@ class TrainHistory:
 
 
 def train(
-    env: gym.Env | VecEnvProtocol, config: TrainConfig, *, eval_env: gym.Env | None = None
+    env: gym.Env | VecEnvProtocol,
+    config: TrainConfig,
+    *,
+    eval_env: gym.Env | None = None,
+    init_actor_critic: ActorCritic | None = None,
 ) -> TrainHistory:
     """Run ``config.num_iterations`` collect->update iterations; return the history.
 
@@ -244,6 +248,15 @@ def train(
     best-win-rate eval writes ``best.pt`` and the final weights write ``last.pt``
     (state_dicts, saved atomically); a ``checkpoint_dir`` without ``eval_every``
     writes only ``last.pt`` (there are no eval win rates to rank a best).
+
+    ``init_actor_critic`` warm-starts training from a pre-built network (e.g. a
+    checkpoint loaded and migrated by
+    :func:`~sts_rl.agent.checkpoint_migration.load_checkpoint`) instead of a fresh
+    random init: when given, it is used as the network (after the one-time global
+    seeding, so sampling/shuffling stay reproducible) and its encoder trunk width
+    must equal ``config.hidden_dim`` (a mismatch raises, because that width is
+    recorded in saved checkpoints). ``None`` (the default) rebuilds a fresh net, so
+    the default path is behaviour-identical to before.
     """
     # Periodic eval needs its OWN env: evaluate() resets the env once per holdout
     # seed, which would derail the training collector mid-rollout. Fail fast rather
@@ -261,7 +274,29 @@ def train(
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
-    actor_critic = ActorCritic(hidden_dim=config.hidden_dim)
+    # Warm-start hook: with init_actor_critic given, train the injected (pre-built,
+    # possibly checkpoint-migrated) net instead of a fresh init. The seeding above
+    # still runs first, so action sampling and minibatch shuffling stay reproducible
+    # for a fixed seed regardless of the net's origin. init_actor_critic=None (the
+    # default) rebuilds a fresh net exactly as before, so that path is unchanged.
+    if init_actor_critic is None:
+        actor_critic = ActorCritic(hidden_dim=config.hidden_dim)
+    else:
+        # config.hidden_dim is recorded verbatim in every saved checkpoint
+        # (_save_checkpoint) and must therefore describe the actual trunk width; a
+        # mismatch would write a checkpoint that load_checkpoint cannot rebuild.
+        # Require the caller to pass a config whose hidden_dim matches the injected
+        # net (the run driver derives it from the loaded checkpoint) and fail fast
+        # with a clear error otherwise.
+        net_hidden_dim = init_actor_critic.encoder.output_dim
+        if net_hidden_dim != config.hidden_dim:
+            raise ValueError(
+                f"init_actor_critic trunk width ({net_hidden_dim}) does not match "
+                f"config.hidden_dim ({config.hidden_dim}); pass a TrainConfig whose "
+                f"hidden_dim equals the injected network's encoder width (saved "
+                f"checkpoints record config.hidden_dim, so a mismatch would be unloadable)"
+            )
+        actor_critic = init_actor_critic
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=config.learning_rate)
     # Rollout collection runs either the single-env path (num_envs == 1: the
     # existing RolloutCollector + RolloutBuffer, behavior-identical to the

@@ -227,6 +227,57 @@ def test_different_gamma_changes_run() -> None:
     assert _param_checksum(base.actor_critic) != _param_checksum(other.actor_critic)
 
 
+def test_warm_start_trains_injected_network() -> None:
+    """init_actor_critic trains the injected net in place, not a fresh init.
+
+    The returned ``history.actor_critic`` IS the injected object (identity), and
+    its params moved from the pre-training snapshot, so training started from the
+    injected weights. The injected net is built under a DIFFERENT seed than
+    train's own, so it is distinct from the fresh init train would otherwise
+    build - guarding that this isn't vacuously matching a coincidental init.
+
+    Revert-verify: drop the ``init_actor_critic`` branch (always build fresh) and
+    the identity assertion fails (``history.actor_critic`` is a new object).
+    """
+    torch.manual_seed(SEED + 123)
+    warm_net = ActorCritic(hidden_dim=HIDDEN)
+    before = _param_checksum(warm_net)
+
+    # A fresh init under train's own seed differs from the injected net, so the
+    # injection is observable (not the weights train would have built anyway).
+    torch.manual_seed(SEED)
+    fresh = ActorCritic(hidden_dim=HIDDEN)
+    assert _param_checksum(fresh) != before
+
+    history = train(_bandit_env(), _config(num_iterations=2), init_actor_critic=warm_net)
+    assert history.actor_critic is warm_net  # the injected object was trained
+    assert _param_checksum(history.actor_critic) != before  # and its weights moved
+
+
+def test_warm_start_hidden_dim_mismatch_raises() -> None:
+    """A net whose trunk width != config.hidden_dim is rejected with a clear error.
+
+    ``config.hidden_dim`` is recorded verbatim in saved checkpoints, so an injected
+    net of a different width would write an unloadable checkpoint; train() fails
+    fast rather than silently disagreeing.
+    """
+    warm_net = ActorCritic(hidden_dim=HIDDEN * 2)  # 64 != _config()'s hidden_dim of 32
+    with pytest.raises(ValueError, match="hidden_dim"):
+        train(_bandit_env(), _config(num_iterations=1), init_actor_critic=warm_net)
+
+
+def test_warm_start_none_matches_default_path() -> None:
+    """init_actor_critic=None reproduces the no-warm-start path exactly (revert-safe).
+
+    Passing None explicitly and omitting it yield bit-identical trained params, so
+    the new keyword defaults to the prior behaviour.
+    """
+    config = _config(num_iterations=3)
+    omitted = train(_bandit_env(), config)
+    explicit_none = train(_bandit_env(), config, init_actor_critic=None)
+    assert _param_checksum(omitted.actor_critic) == _param_checksum(explicit_none.actor_critic)
+
+
 @pytest.mark.parametrize(
     "field, value",
     [

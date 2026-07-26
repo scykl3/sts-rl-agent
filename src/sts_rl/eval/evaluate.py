@@ -4,7 +4,8 @@ The learning loop needs a fixed, reproducible readout of policy quality that is
 independent of the noisy training return. :func:`evaluate` runs the current
 policy greedily (argmax over the masked logits, no sampling) over a fixed set of
 holdout seeds - one episode per seed - and reports win rate, floor reached, HP
-retained, episode length, and return.
+retained, episode length, return, and the Act-1 clear rate (the fraction of
+episodes whose terminal ``act`` reached Act 2, i.e. the Act 1 boss was beaten).
 
 Greedy action selection is deterministic given the network weights, so a fixed
 (policy, seed set) yields the same metrics on every call without touching the
@@ -12,8 +13,8 @@ global torch/numpy RNG - the property that makes eval a stable comparison point
 across training checkpoints.
 
 The harness is env-agnostic: it drives any gymnasium-style env that honours the
-shared interface (the terminal ``info`` keys ``won``/``floor``/``hp`` and the
-``episode`` summary). It is therefore engine-free testable against
+shared interface (the terminal ``info`` keys ``won``/``floor``/``act``/``hp`` and
+the ``episode`` summary). It is therefore engine-free testable against
 :class:`~sts_rl.env.stub_env.StubEnv` and swaps in the real
 :class:`~sts_rl.env.adapter.StsEnv` at integration by passing a different env.
 """
@@ -32,15 +33,23 @@ from sts_rl.interface import InterfaceError, assert_valid_mask
 
 # Info-dict keys read at the terminal step. All are documented in
 # sts_rl.interface: "action_mask" is INFO_KEYS_ALWAYS; "won" and "episode" are
-# INFO_KEYS_TERMINAL (present only when terminated or truncated); "floor"/"hp"
+# INFO_KEYS_TERMINAL (present only when terminated or truncated); "floor"/"act"/"hp"
 # are INFO_KEYS_ALWAYS and carry the terminal values on the last step.
 MASK_INFO_KEY = "action_mask"
 WON_INFO_KEY = "won"
 FLOOR_INFO_KEY = "floor"
+ACT_INFO_KEY = "act"
 HP_INFO_KEY = "hp"
 EPISODE_INFO_KEY = "episode"
 EPISODE_RETURN_KEY = "r"
 EPISODE_LENGTH_KEY = "l"
+
+# gc.act is 1-based (Act 1 == 1; the run starts in Act 1, locked by START_ACT in
+# tests/test_run.py). Beating the Act 1 boss advances the run to Act 2 (floor 17),
+# so a terminal act >= ACT2_INDEX means Act 1 was cleared, whether the run then
+# continued, died later, or won the whole run outright. "won" (full-run victory)
+# is a strict subset, so a run-mode clear rate must key on act, not won.
+ACT2_INDEX = 2
 
 # Absolute per-episode step ceiling. A well-formed env truncates itself at its
 # own max_episode_steps, so this is only a backstop against a misconfigured env
@@ -56,6 +65,7 @@ class EpisodeResult:
     seed: int
     won: bool
     floor: int
+    act: int
     hp: int
     length: int
     ret: float
@@ -67,6 +77,13 @@ class EvalReport:
 
     ``avg_hp`` is the mean terminal player HP across all episodes; it includes
     losses (HP near 0), so it trends with, but is not conditioned on, wins.
+
+    ``win_rate`` is the fraction of full-run victories (terminal ``won``); on a
+    combat env it is the combat win rate, on a full-run env the whole-run win
+    rate. ``act1_clear_rate`` is the fraction of episodes that cleared Act 1
+    (terminal ``act >= ACT2_INDEX``), a run-mode progress metric: it is a
+    superset of ``win_rate`` on a full run and defaults to ``0.0`` on combat/stub
+    eval (those episodes never leave Act 1), so it is harmless there.
     """
 
     n_episodes: int
@@ -75,6 +92,9 @@ class EvalReport:
     avg_hp: float
     avg_ep_len: float
     avg_return: float
+    # Trailing, defaulted so existing combat callers/tests that build an
+    # EvalReport without it are unchanged; evaluate() always fills it.
+    act1_clear_rate: float = 0.0
 
     def as_dict(self) -> dict[str, float]:
         """Flat ``{metric: value}`` view for experiment logging."""
@@ -151,6 +171,10 @@ def run_episode(
         seed=seed,
         won=bool(info[WON_INFO_KEY]),
         floor=int(info[FLOOR_INFO_KEY]),
+        # act is INFO_KEYS_ALWAYS: every conformant env emits it, so read it
+        # strictly (like won/floor/hp) - a missing key is a regression to catch,
+        # not a default-to-Act-1 case.
+        act=int(info[ACT_INFO_KEY]),
         hp=int(info[HP_INFO_KEY]),
         length=int(episode[EPISODE_LENGTH_KEY]),
         ret=float(episode[EPISODE_RETURN_KEY]),
@@ -195,4 +219,6 @@ def evaluate(
         avg_hp=sum(r.hp for r in results) / n,
         avg_ep_len=sum(r.length for r in results) / n,
         avg_return=sum(r.ret for r in results) / n,
+        # Act-1 clear rate: fraction whose terminal act reached Act 2 (boss beaten).
+        act1_clear_rate=sum(r.act >= ACT2_INDEX for r in results) / n,
     )
