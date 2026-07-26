@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 from sts_rl.eval import dashboard as dash
-from sts_rl.utils.logging import METRICS_FILENAME, RunLogger
+from sts_rl.utils.logging import MANIFEST_FILENAME, METRICS_FILENAME, STEP_KEY, RunLogger
 
 _ENGINE_SHA = "engsha1234567"  # 13 chars: longer than _SHA_DISPLAY_LEN, so it truncates
 
@@ -73,8 +73,8 @@ def test_load_skips_records_without_usable_step(tmp_path: Path) -> None:
     run_dir.mkdir()
     lines = [
         {"win_rate": 0.1},  # no step key
-        {"win_rate": 0.2, "step": "oops"},  # non-numeric step
-        {"win_rate": 0.3, "step": 5},  # the only usable record
+        {"win_rate": 0.2, STEP_KEY: "oops"},  # non-numeric step
+        {"win_rate": 0.3, STEP_KEY: 5},  # the only usable record
     ]
     (run_dir / METRICS_FILENAME).write_text(
         "\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8"
@@ -87,15 +87,39 @@ def test_load_drops_non_finite_step(tmp_path: Path) -> None:
     run_dir = tmp_path / "raw"
     run_dir.mkdir()
     lines = [
-        {"win_rate": 0.1, "step": float("nan")},  # NaN step: parses, would crash int()
-        {"win_rate": 0.2, "step": float("inf")},  # inf step: same
-        {"win_rate": 0.3, "step": 5},  # the only usable record
+        {"win_rate": 0.1, STEP_KEY: float("nan")},  # NaN step: parses, would crash int()
+        {"win_rate": 0.2, STEP_KEY: float("inf")},  # inf step: same
+        {"win_rate": 0.3, STEP_KEY: 5},  # the only usable record
     ]
     (run_dir / METRICS_FILENAME).write_text(
         "\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8"
     )
     series = dash.load_run_series(run_dir)
     assert series.series["win_rate"] == [(5, 0.3)]
+
+
+def test_load_skips_malformed_metrics_lines(tmp_path: Path) -> None:
+    run_dir = tmp_path / "raw"
+    run_dir.mkdir()
+    good = [json.dumps({"win_rate": 0.4, STEP_KEY: 0}), json.dumps({"win_rate": 0.6, STEP_KEY: 1})]
+    # A garbage middle line (what a crashed writer can leave) is skipped, not fatal.
+    (run_dir / METRICS_FILENAME).write_text(
+        good[0] + "\n{ not valid json\n" + good[1] + "\n", encoding="utf-8"
+    )
+    series = dash.load_run_series(run_dir)
+    assert series.series["win_rate"] == [(0, 0.4), (1, 0.6)]
+
+
+def test_load_tolerates_corrupt_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    (run_dir / MANIFEST_FILENAME).write_text("{ not json", encoding="utf-8")
+    (run_dir / METRICS_FILENAME).write_text(
+        json.dumps({"win_rate": 0.5, STEP_KEY: 0}) + "\n", encoding="utf-8"
+    )
+    series = dash.load_run_series(run_dir)
+    assert series.manifest == {}  # corrupt provenance degrades to empty, not a crash
+    assert series.series["win_rate"] == [(0, 0.5)]
 
 
 def test_load_tolerates_missing_files(tmp_path: Path) -> None:
@@ -156,6 +180,14 @@ def test_render_escapes_labels(tmp_path: Path) -> None:
     html_out = dash.render_dashboard([series])
     assert "<script>x&y" not in html_out
     assert "&lt;script&gt;x&amp;y" in html_out
+
+
+def test_render_escapes_title(tmp_path: Path) -> None:
+    # The title reaches both <title> and <h1>; both must be escaped.
+    run = _write_run(tmp_path / "r", [(0, {"win_rate": 0.5})])
+    html_out = dash.render_dashboard([dash.load_run_series(run)], title="<x>&t")
+    assert "<x>&t" not in html_out
+    assert "&lt;x&gt;&amp;t" in html_out
 
 
 def test_render_escapes_metric_names(tmp_path: Path) -> None:
@@ -220,10 +252,14 @@ def test_render_ragged_metric_across_runs(tmp_path: Path) -> None:
     assert ">loss<" in html_out  # panel exists even though only run a has it
 
 
-def test_render_is_deterministic(tmp_path: Path) -> None:
+def test_render_is_deterministic_across_reload(tmp_path: Path) -> None:
     run = _write_run(tmp_path / "r", [(0, {"win_rate": 0.4}), (1, {"win_rate": 0.6})])
-    runs = dash.load_runs([run])
-    assert dash.render_dashboard(runs) == dash.render_dashboard(runs)
+    # Reload from disk each time, not re-render the same in-memory object.
+    first = dash.render_dashboard(dash.load_runs([run]))
+    second = dash.render_dashboard(dash.load_runs([run]))
+    assert first == second
+    # The run's absolute path must not leak into the output.
+    assert str(tmp_path) not in first
 
 
 def test_render_shows_provenance(tmp_path: Path) -> None:

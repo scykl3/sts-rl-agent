@@ -76,6 +76,11 @@ _PLOT_HEIGHT = _CHART_HEIGHT - _PAD_TOP - _PAD_BOTTOM
 
 # A single point can't draw a polyline, so mark it with a dot of this radius.
 _MARKER_RADIUS = 3.0
+_LINE_STROKE_WIDTH = 2  # width of a run's series line
+_YTICK_LABEL_GAP = 6  # px left of the axis for right-aligned y tick labels
+_TICK_LABEL_BASELINE_DY = 3  # nudge y tick text down so it centers on its line
+_XTICK_LABEL_DY = 18  # px below the plot for x tick labels
+_FLAT_RANGE_PAD_FRACTION = 0.05  # pad a constant series by +/- this * |value|
 # Characters of a commit SHA shown in the provenance table.
 _SHA_DISPLAY_LEN = 10
 
@@ -101,17 +106,36 @@ class RunSeries:
         return sorted(self.series)
 
 
+def _load_manifest_or_empty(run_path: Path) -> dict[str, Any]:
+    """Read ``manifest.json``, or return ``{}`` if it is missing or unparseable.
+
+    Provenance is a header detail; a corrupt or half-written manifest should
+    degrade to a blank one, not sink the whole dashboard. (``JSONDecodeError`` is
+    a ``ValueError``.)
+    """
+    if not (run_path / MANIFEST_FILENAME).exists():
+        return {}
+    try:
+        return read_manifest(run_path)
+    except (ValueError, OSError):
+        return {}
+
+
 def load_run_series(run_dir: str | Path, *, label: str | None = None) -> RunSeries:
     """Load one run directory into a :class:`RunSeries`.
 
-    Reads ``manifest.json`` and ``metrics.jsonl`` when present; a missing file is
-    treated as absent data (empty manifest / no records) rather than an error, so
-    a run that never wrote one of the two files still loads. ``label`` defaults
-    to the directory's base name.
+    Loading is best-effort: a missing file, an unparseable manifest, or a
+    malformed metrics line (what a crashed run can leave behind) is skipped
+    rather than raised, so a partial run still renders. ``label`` defaults to the
+    directory's base name.
     """
     run_path = Path(run_dir)
-    manifest = read_manifest(run_path) if (run_path / MANIFEST_FILENAME).exists() else {}
-    records = read_metrics(run_path) if (run_path / METRICS_FILENAME).exists() else []
+    manifest = _load_manifest_or_empty(run_path)
+    records = (
+        read_metrics(run_path, skip_malformed=True)
+        if (run_path / METRICS_FILENAME).exists()
+        else []
+    )
 
     series: dict[str, list[tuple[int, float]]] = {}
     for record in records:
@@ -291,7 +315,7 @@ def _render_chart(metric: str, runs: Sequence[RunSeries], colors: dict[int, str]
     # Pad a flat range so a constant series draws a centered horizontal line with
     # honest, distinct tick labels rather than three identical ones.
     if y_hi == y_lo:
-        pad = abs(y_hi) * 0.05 if y_hi != 0 else 1.0
+        pad = abs(y_hi) * _FLAT_RANGE_PAD_FRACTION if y_hi != 0 else 1.0
         y_lo, y_hi = y_lo - pad, y_hi + pad
 
     body: list[str] = []
@@ -303,16 +327,18 @@ def _render_chart(metric: str, runs: Sequence[RunSeries], colors: dict[int, str]
             f'<line class="grid" x1="{_PAD_LEFT}" y1="{py:.2f}" '
             f'x2="{_PAD_LEFT + _PLOT_WIDTH}" y2="{py:.2f}"></line>'
         )
+        label = html.escape(_fmt(tick))
         body.append(
-            f'<text class="ytick" x="{_PAD_LEFT - 6}" y="{py + 3:.2f}">{html.escape(_fmt(tick))}</text>'
+            f'<text class="ytick" x="{_PAD_LEFT - _YTICK_LABEL_GAP}" '
+            f'y="{py + _TICK_LABEL_BASELINE_DY:.2f}">{label}</text>'
         )
 
     # x tick labels at first / last step.
     for tick in dict.fromkeys((x_lo, x_hi)):
         px = _scale(tick, x_lo, x_hi, _PAD_LEFT, _PAD_LEFT + _PLOT_WIDTH)
         body.append(
-            f'<text class="xtick" x="{px:.2f}" y="{_PAD_TOP + _PLOT_HEIGHT + 18:.2f}">'
-            f"{html.escape(_fmt(tick))}</text>"
+            f'<text class="xtick" x="{px:.2f}" '
+            f'y="{_PAD_TOP + _PLOT_HEIGHT + _XTICK_LABEL_DY:.2f}">{html.escape(_fmt(tick))}</text>'
         )
 
     # One polyline per run (plus a dot when a run has a single point).
@@ -324,7 +350,8 @@ def _render_chart(metric: str, runs: Sequence[RunSeries], colors: dict[int, str]
             for step, value in points
         )
         body.append(
-            f'<polyline fill="none" stroke="{color}" stroke-width="2" points="{coords}"></polyline>'
+            f'<polyline fill="none" stroke="{color}" '
+            f'stroke-width="{_LINE_STROKE_WIDTH}" points="{coords}"></polyline>'
         )
         if len(points) == 1:
             cx, cy = coords.split(",")

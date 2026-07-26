@@ -215,11 +215,23 @@ def read_manifest(run_dir: str | Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def read_metrics(run_dir: str | Path) -> list[dict[str, Any]]:
-    """Load ``metrics.jsonl`` as a list of records, skipping blank lines."""
+def read_metrics(run_dir: str | Path, *, skip_malformed: bool = False) -> list[dict[str, Any]]:
+    """Load ``metrics.jsonl`` as a list of records, skipping blank lines.
+
+    With ``skip_malformed=True`` a line that is not valid JSON is skipped rather
+    than raised. The jsonl format is meant to survive a crash mid-write, which
+    usually leaves a truncated final line; a reader that only wants to plot what
+    was logged should pass this. Off by default so a caller relying on strict
+    provenance still sees the error.
+    """
     path = Path(run_dir) / METRICS_FILENAME
     records: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
+        if not line.strip():
+            continue
+        try:
             records.append(json.loads(line))
+        except json.JSONDecodeError:
+            if not skip_malformed:
+                raise
     return records
