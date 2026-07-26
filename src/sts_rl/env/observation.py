@@ -8,7 +8,8 @@ bump propagates here instead of silently desyncing.
 One encoder serves both modes. Pass a live ``BattleContext`` for combat, or
 ``bc=None`` for an overworld (run-mode) state: combat-only fields (hand, piles,
 enemies, powers, potions) then stay zero and ``map_context`` is filled from the
-run's map. ``map_context`` is left zero during combat.
+run's map, plus the ``reward_*`` fields on a REWARDS screen. ``map_context`` and
+the ``reward_*`` fields are left zero during combat.
 
 Conventions:
 
@@ -35,6 +36,10 @@ from sts_rl.interface import (
     HAND_MAX,
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
+    MAX_REWARD_CARD_GROUPS,
+    MAX_REWARD_CARDS_PER_GROUP,
+    MAX_REWARD_POTIONS,
+    MAX_REWARD_RELICS,
     N_MONSTER_MOVE_IDS,
     N_MONSTER_POWER_IDS,
     N_NODE_TYPES,
@@ -77,6 +82,11 @@ _CARD_TYPE_POWER = int(sts.CardType.POWER)
 # Potion slot sentinels the engine uses for "no potion here".
 _POTION_EMPTY = sts.Potion.EMPTY_POTION_SLOT
 _POTION_INVALID = sts.Potion.INVALID
+
+# The combat/elite/chest REWARDS screen: the only screen whose rewardsContainer
+# holds the live offered rewards (openCombatRewardScreen sets both together). The
+# separate BOSS_RELIC_REWARDS screen is covered by its own action block, not here.
+_SCREEN_REWARDS = int(sts.ScreenState.REWARDS)
 
 # --- map_context layout (run mode) -----------------------------------------
 # The act map is a grid MAP_COLS wide and MAP_ROWS tall (verified against the
@@ -150,6 +160,7 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
     if bc is None:
         _fill_run_scalars(obs, gc)
         _fill_map_context(obs, gc)
+        _fill_reward_ids(obs, gc)
         return obs
 
     player = bc.player
@@ -344,6 +355,55 @@ def _fill_map_context(obs: Obs, gc: Any) -> None:
         ctx[slot + 2] = 1.0 if room_id == _ROOM_ELITE else 0.0
         if 0 <= room_id < N_NODE_TYPES:
             ctx[slot + 3] = room_id / (N_NODE_TYPES - 1)
+
+
+def _fill_reward_ids(obs: Obs, gc: Any) -> None:
+    """Fill ``reward_card_ids`` / ``reward_relic_ids`` / ``reward_potion_ids`` from
+    the live REWARDS screen, slot-aligned with the ``REWARD_SELECT`` action block.
+
+    Only the combat/elite/chest REWARDS screen carries a live ``rewardsContainer``;
+    on every other screen these fields stay PAD (0), so the guard makes them
+    meaningful exactly when the ``REWARD_SELECT`` block is legal.
+
+    Cards keep their choice-group structure: the engine offers one group per card
+    reward (a second appears with Prayer Wheel), and each group lets the player
+    take one card. Slot ``group * MAX_REWARD_CARDS_PER_GROUP + j`` holds the j-th
+    card of group ``g``, matching the group layout of the ``REWARD_SELECT`` card
+    sub-block. Relics and potions are flat: one slot per offered item.
+    """
+    if int(gc.screen_state) != _SCREEN_REWARDS:
+        return
+    rewards = gc.screen_state_info.rewards_container
+
+    # Cards: pre-filtered of INVALID by the binding, so ids are written directly
+    # (like hand_ids) -- startup enum validation guarantees each fits its table.
+    card_ids = obs["reward_card_ids"]
+    groups = rewards.cards
+    for g in range(min(len(groups), MAX_REWARD_CARD_GROUPS)):
+        group = groups[g]
+        base = g * MAX_REWARD_CARDS_PER_GROUP
+        for j in range(min(len(group), MAX_REWARD_CARDS_PER_GROUP)):
+            card_ids[base + j] = int(group[j].id)
+
+    # Relics: guard the INVALID sentinel (RelicId.INVALID == N_RELIC_IDS, one past
+    # the relic table) out of range so an empty slot never overflows the id field;
+    # write per-index so a guarded slot stays PAD without shifting the rest.
+    relic_ids = obs["reward_relic_ids"]
+    relics = rewards.relics
+    for i in range(min(len(relics), MAX_REWARD_RELICS)):
+        rid = int(relics[i])
+        if 0 <= rid < N_RELIC_IDS:
+            relic_ids[i] = rid
+
+    # Potions: skip the engine's "no potion" sentinels (same as the belt encoder);
+    # written per-index, so a skipped slot stays PAD.
+    potion_ids = obs["reward_potion_ids"]
+    potions = rewards.potions
+    for i in range(min(len(potions), MAX_REWARD_POTIONS)):
+        potion = potions[i]
+        if potion == _POTION_EMPTY or potion == _POTION_INVALID:
+            continue
+        potion_ids[i] = int(potion)
 
 
 def _fill_pile_ids(out: np.ndarray, pile: Any) -> None:

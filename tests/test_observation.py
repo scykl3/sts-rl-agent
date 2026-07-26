@@ -27,15 +27,24 @@ from sts_rl.env.observation import (
     _MAP_PER_COL_FEATS,
     _empty_obs,
     _fill_map_context,
+    _fill_reward_ids,
     encode_observation,
 )
 from sts_rl.env.run import execute_overworld_action, overworld_actions, start_run
 from sts_rl.env.spaces import build_observation_space
 from sts_rl.interface import (
+    MAX_REWARD_CARD_GROUPS,
+    MAX_REWARD_CARDS_PER_GROUP,
+    MAX_REWARD_POTIONS,
+    MAX_REWARD_RELICS,
     N_NODE_TYPES,
+    N_RELIC_IDS,
     OBS_FIELDS,
     OBS_FIELD_BY_NAME,
 )
+
+# reward_* fields: populated only on the REWARDS screen, PAD everywhere else.
+_REWARD_ID_FIELDS = ("reward_card_ids", "reward_relic_ids", "reward_potion_ids")
 
 REGRESSION_SEED = 42
 
@@ -397,3 +406,143 @@ def test_map_context_on_boss_node_does_not_index_off_grid() -> None:
     assert np.isfinite(mc).all()
     assert _encoded_reachable_cols(mc) == set()  # no next-row node from the boss
     assert mc[int(sts.Room.BOSS)] == 1.0  # current-room one-hot marks the boss
+
+
+# --- reward_* fields (REWARDS screen) --------------------------------------
+
+
+def _reward_gc(screen, cards=(), relics=(), potions=()):
+    """A minimal gc whose screen + rewardsContainer drive ``_fill_reward_ids`` alone.
+
+    ``cards`` is a sequence of groups; each group is a sequence of card ids. Card
+    objects only need an ``id`` attribute (that is all the encoder reads).
+    """
+    container = SimpleNamespace(
+        cards=[[SimpleNamespace(id=cid) for cid in group] for group in cards],
+        relics=list(relics),
+        potions=list(potions),
+    )
+    return SimpleNamespace(
+        screen_state=screen, screen_state_info=SimpleNamespace(rewards_container=container)
+    )
+
+
+def test_reward_fields_pad_off_reward_screen() -> None:
+    # reward_* are reward-screen-only: PAD in combat (bc set) and on the map screen.
+    gc, bc = _combat()
+    combat_obs = encode_observation(gc, bc)
+    map_obs = encode_observation(_drive_to_first_map_screen(), None)
+    for name in _REWARD_ID_FIELDS:
+        assert not np.any(combat_obs[name]), name
+        assert not np.any(map_obs[name]), name
+
+
+def test_reward_ids_populated_from_live_container() -> None:
+    # Round-trip through a real engine Rewards container (proves the binding shape
+    # and Card.id path), gated by a synthetic REWARDS screen. Two card groups, a
+    # relic, and a potion land in their aligned slots; unused slots stay PAD.
+    info = start_run(seed=REGRESSION_SEED).screen_state_info
+    rc = info.rewards_container
+    rc.clear()
+    group0 = [sts.CardId.ACCURACY, sts.CardId.ADRENALINE, sts.CardId.ANGER]
+    group1 = [sts.CardId.BASH, sts.CardId.CLEAVE]
+    rc.add_card_reward([sts.Card(cid, 0) for cid in group0])
+    rc.add_card_reward([sts.Card(cid, 0) for cid in group1])
+    rc.add_relic(sts.RelicId.ART_OF_WAR)
+    rc.add_potion(sts.Potion.AMBROSIA)
+
+    gc = SimpleNamespace(screen_state=sts.ScreenState.REWARDS, screen_state_info=info)
+    obs = _empty_obs()
+    _fill_reward_ids(obs, gc)
+
+    card_ids = obs["reward_card_ids"]
+    # Group 0 occupies slots 0..len-1; group 1 starts at MAX_REWARD_CARDS_PER_GROUP.
+    for j, cid in enumerate(group0):
+        assert card_ids[j] == int(cid)
+    for j, cid in enumerate(group1):
+        assert card_ids[MAX_REWARD_CARDS_PER_GROUP + j] == int(cid)
+    # The gap slot after group 0 and the tail after group 1 stay PAD.
+    assert card_ids[len(group0)] == 0
+    assert np.all(card_ids[MAX_REWARD_CARDS_PER_GROUP + len(group1) :] == 0)
+
+    assert obs["reward_relic_ids"][0] == int(sts.RelicId.ART_OF_WAR)
+    assert np.all(obs["reward_relic_ids"][1:] == 0)
+    assert obs["reward_potion_ids"][0] == int(sts.Potion.AMBROSIA)
+    assert np.all(obs["reward_potion_ids"][1:] == 0)
+
+    # The populated obs stays a valid member of the observation space.
+    assert build_observation_space().contains(obs)
+
+
+def test_reward_ids_enforce_caps_and_skip_sentinels() -> None:
+    # Groups past MAX_REWARD_CARD_GROUPS and cards past MAX_REWARD_CARDS_PER_GROUP
+    # are dropped; the INVALID relic sentinel (id past the table) and the potion
+    # sentinels are guarded to PAD without shifting the surviving slots.
+    over_group = list(range(1, MAX_REWARD_CARDS_PER_GROUP + 3))  # more cards than fit
+    extra_group = [7, 8]  # a 3rd group, beyond MAX_REWARD_CARD_GROUPS
+    relics = [
+        int(sts.RelicId.ART_OF_WAR),
+        int(sts.RelicId.INVALID),
+        int(sts.RelicId.BIRD_FACED_URN),
+    ]
+    potions = [sts.Potion.INVALID, sts.Potion.AMBROSIA, sts.Potion.EMPTY_POTION_SLOT]
+    gc = _reward_gc(
+        sts.ScreenState.REWARDS,
+        cards=[over_group, [9], extra_group][: MAX_REWARD_CARD_GROUPS + 1],
+        relics=relics,
+        potions=potions,
+    )
+    obs = _empty_obs()
+    _fill_reward_ids(obs, gc)
+
+    card_ids = obs["reward_card_ids"]
+    # Group 0 is truncated to the per-group cap; group 1's single card follows at
+    # the next group block; every other slot stays PAD.
+    kept0 = over_group[:MAX_REWARD_CARDS_PER_GROUP]
+    expected = [0] * len(card_ids)
+    expected[: len(kept0)] = kept0
+    expected[MAX_REWARD_CARDS_PER_GROUP] = 9
+    assert card_ids.tolist() == expected
+    # Cards past group 0's per-group cap and the whole 3rd group (past the group
+    # cap) are dropped: none of their ids appear anywhere in the field.
+    dropped = over_group[MAX_REWARD_CARDS_PER_GROUP:] + extra_group
+    assert not np.isin(dropped, card_ids).any()
+
+    # Relic slot 1 (INVALID=180, past N_RELIC_IDS) is guarded to PAD; 0 and 2 kept.
+    assert obs["reward_relic_ids"][0] == int(sts.RelicId.ART_OF_WAR)
+    assert obs["reward_relic_ids"][1] == 0
+    assert obs["reward_relic_ids"][2] == int(sts.RelicId.BIRD_FACED_URN)
+    assert int(sts.RelicId.INVALID) >= N_RELIC_IDS  # the guard's precondition
+
+    # Potion sentinels at slots 0 and 2 are skipped; the real potion at slot 1 kept.
+    assert obs["reward_potion_ids"][0] == 0
+    assert obs["reward_potion_ids"][1] == int(sts.Potion.AMBROSIA)
+    assert obs["reward_potion_ids"][2] == 0
+    assert build_observation_space().contains(obs)
+
+
+def test_reward_ids_truncate_relics_and_potions_to_caps() -> None:
+    # More relics / potions than fit are truncated to their caps (no overflow).
+    relics = [int(sts.RelicId.ART_OF_WAR)] * (MAX_REWARD_RELICS + 2)
+    potions = [sts.Potion.AMBROSIA] * (MAX_REWARD_POTIONS + 2)
+    gc = _reward_gc(sts.ScreenState.REWARDS, relics=relics, potions=potions)
+    obs = _empty_obs()
+    _fill_reward_ids(obs, gc)
+    assert obs["reward_relic_ids"].shape == (MAX_REWARD_RELICS,)
+    assert obs["reward_potion_ids"].shape == (MAX_REWARD_POTIONS,)
+    assert np.all(obs["reward_relic_ids"] == int(sts.RelicId.ART_OF_WAR))
+    assert np.all(obs["reward_potion_ids"] == int(sts.Potion.AMBROSIA))
+
+
+def test_fill_reward_ids_noop_off_reward_screen() -> None:
+    # A populated container on a non-REWARDS screen leaves every reward field PAD.
+    gc = _reward_gc(
+        sts.ScreenState.MAP_SCREEN,
+        cards=[[sts.CardId.ACCURACY]],
+        relics=[int(sts.RelicId.ART_OF_WAR)],
+        potions=[sts.Potion.AMBROSIA],
+    )
+    obs = _empty_obs()
+    _fill_reward_ids(obs, gc)
+    for name in _REWARD_ID_FIELDS:
+        assert not np.any(obs[name]), name
