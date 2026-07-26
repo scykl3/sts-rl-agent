@@ -708,6 +708,35 @@ def test_vectorized_num_envs_mismatch_raises() -> None:
         train(vec_env, config)
 
 
+def test_num_envs_one_rejects_vectorized_env() -> None:
+    """num_envs==1 with a vectorized env passed raises a clear ValueError.
+
+    The single-env branch requires a plain gym.Env; a VecEnvProtocol (StubVecEnv
+    here) is rejected with a ValueError - matching the adjacent num_envs-mismatch
+    check - not a bare AssertionError that python -O would strip. Revert-verify:
+    restore the bare assert isinstance(env, gym.Env) and this raises AssertionError,
+    not ValueError, so the ValueError match fails.
+    """
+    vec_env = make_stub_vec_env(1, terminate_prob=1.0, max_episode_steps=10_000)
+    config = _config(num_iterations=1, n_steps=4, num_envs=1)
+    with pytest.raises(ValueError, match="single-env path"):
+        train(vec_env, config)
+
+
+def test_num_envs_gt_one_rejects_plain_env() -> None:
+    """num_envs>1 with a plain gym.Env passed raises a clear ValueError.
+
+    The vectorized branch requires a VecEnvProtocol; a plain gym.Env (StubEnv here)
+    is rejected with a ValueError - mirroring the single-env branch and the
+    num_envs-mismatch check - not a bare AssertionError that python -O would strip.
+    Revert-verify: restore the bare assert not isinstance(env, gym.Env) and this
+    raises AssertionError, not ValueError, so the ValueError match fails.
+    """
+    config = _config(num_iterations=1, n_steps=4, num_envs=VEC_NUM_ENVS)
+    with pytest.raises(ValueError, match="vectorized path"):
+        train(_bandit_env(), config)
+
+
 def test_vectorized_training_moves_weights() -> None:
     """The vectorized path trains end to end: weights differ from the seeded init.
 

@@ -273,9 +273,17 @@ def train(
     single_buffer: RolloutBuffer | None = None
     vec_buffer: VecRolloutBuffer | None = None
     if config.num_envs == 1:
-        # Single-env path: env is a plain gym.Env. isinstance narrows the union for
-        # mypy (a vectorized env is not a gym.Env), so no cast is needed.
-        assert isinstance(env, gym.Env)
+        # Single-env path: env must be a plain gym.Env. The raise rejects a caller
+        # env-type/num_envs mismatch with a clear ValueError (consistent with the
+        # num_envs value check below and every boundary check in train()/TrainConfig)
+        # and narrows the union for mypy - a raise on the not-a-gym.Env case leaves
+        # env a gym.Env in the code that follows, so no cast is needed.
+        if not isinstance(env, gym.Env):
+            raise ValueError(
+                f"config.num_envs=1 (single-env path) requires a gym.Env, but the "
+                f"passed env is not a gym.Env (got {type(env).__name__}); pass a "
+                f"gym.Env or set num_envs to the vectorized env's num_envs"
+            )
         single_collector = RolloutCollector(
             env,
             actor_critic,
@@ -285,10 +293,18 @@ def train(
         )
         single_buffer = RolloutBuffer()
     else:
-        # Vectorized path: env is a VecEnvProtocol (e.g. SubprocVecEnv), which is
-        # not a gym.Env, so this narrows the union to VecEnvProtocol for mypy
-        # (mirroring the single-env branch) without a cast.
-        assert not isinstance(env, gym.Env)
+        # Vectorized path: env must be a VecEnvProtocol (e.g. SubprocVecEnv), not a
+        # gym.Env. The raise rejects a caller env-type/num_envs mismatch with a clear
+        # ValueError (mirroring the single-env branch and consistent with the
+        # num_envs value check below) and narrows the union to VecEnvProtocol for
+        # mypy - a raise on the gym.Env case leaves env a VecEnvProtocol in the code
+        # that follows (so env.num_envs is valid), without a cast.
+        if isinstance(env, gym.Env):
+            raise ValueError(
+                f"config.num_envs={config.num_envs} (vectorized path) requires a "
+                f"vectorized env (a VecEnvProtocol such as SubprocVecEnv), but the "
+                f"passed env is a gym.Env; pass a vectorized env or set num_envs=1"
+            )
         if env.num_envs != config.num_envs:
             raise ValueError(
                 f"config.num_envs={config.num_envs} but the passed vectorized env "

@@ -129,6 +129,11 @@ class CollectStats:
     divides by zero and never reads a fabricated 0 as a real mean. Both means are
     taken over ``info["episode"]`` (gymnasium RecordEpisodeStatistics' ``r``/``l``).
     ``steps_per_second`` times the env-stepping loop only.
+
+    ``n_steps`` and ``steps_per_second`` are producer-dependent:
+    :class:`RolloutCollector` (single env) reports the per-collect ``n_steps`` and
+    the rate over it; :class:`VecRolloutCollector` reports the TOTAL across envs
+    (``n_steps * num_envs``, equal to ``len(buffer)``) and the rate over that total.
     """
 
     n_steps: int
