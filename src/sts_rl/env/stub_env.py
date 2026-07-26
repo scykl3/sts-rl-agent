@@ -110,7 +110,7 @@ class StubEnv(gym.Env):
         active_blocks: optional names of the action blocks that may be the legal
             block on a step. Defaults to all blocks, exercising every screen's
             masking. Restrict to a small block (for example
-            ``("CARD_REWARD_SELECT",)``) for a faster-converging toy task.
+            ``("REWARD_SELECT",)``) for a faster-converging toy task.
         strict: if ``True``, an illegal action passed to :meth:`step` raises
             :class:`~sts_rl.interface.InterfaceError` instead of only setting the
             ``invalid_action`` info flag.
@@ -163,7 +163,7 @@ class StubEnv(gym.Env):
             warnings.warn(
                 "StubEnv learnable mode with only count-1 active blocks yields a "
                 "degenerate task (nothing to learn); use a multi-action block such "
-                "as 'CARD_REWARD_SELECT' to exercise learning.",
+                "as 'REWARD_SELECT' to exercise learning.",
                 stacklevel=2,
             )
 

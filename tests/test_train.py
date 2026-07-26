@@ -63,7 +63,7 @@ HIDDEN = 32
 NUM_ITERATIONS = 5
 N_STEPS = 128
 LEARNING_RATE = 1e-2
-CARD_REWARD_BLOCK = "CARD_REWARD_SELECT"
+REWARD_BLOCK = "REWARD_SELECT"
 # Tiny holdout for the eval/checkpoint tests: the bandit eval env terminates every
 # episode in one step, so a handful of episodes keeps these tests fast.
 EVAL_EPISODES = 4
@@ -87,8 +87,8 @@ _BASE_CONFIG = TrainConfig(
 
 
 def _task_env() -> StubEnv:
-    """The exact task env: learnable reward gated on one CARD_REWARD_SELECT block."""
-    return StubEnv(reward_mode="learnable", active_blocks=(CARD_REWARD_BLOCK,))
+    """The exact task env: learnable reward gated on one REWARD_SELECT block."""
+    return StubEnv(reward_mode="learnable", active_blocks=(REWARD_BLOCK,))
 
 
 def _bandit_env() -> StubEnv:
@@ -102,7 +102,7 @@ def _bandit_env() -> StubEnv:
     """
     return StubEnv(
         reward_mode="learnable",
-        active_blocks=(CARD_REWARD_BLOCK,),
+        active_blocks=(REWARD_BLOCK,),
         terminate_prob=1.0,
         max_episode_steps=10_000,
     )
@@ -369,7 +369,7 @@ def test_no_episode_completes_reports_none_and_logs_na(
     # a 4-step collect from truncating, so no episode boundary occurs.
     non_terminating_env = StubEnv(
         reward_mode="learnable",
-        active_blocks=(CARD_REWARD_BLOCK,),
+        active_blocks=(REWARD_BLOCK,),
         terminate_prob=0.0,
         max_episode_steps=10_000,
     )

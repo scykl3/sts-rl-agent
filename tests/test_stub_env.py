@@ -372,9 +372,9 @@ def test_random_mode_terminal_reward_is_plus_or_minus_one():
 
 
 def test_active_blocks_restriction_limits_legal_block():
-    env = StubEnv(active_blocks=["CARD_REWARD_SELECT"], terminate_prob=0.0)
+    env = StubEnv(active_blocks=["REWARD_SELECT"], terminate_prob=0.0)
     env.reset(seed=16)
-    expected = interface.ACTION_BLOCK_BY_NAME["CARD_REWARD_SELECT"]
+    expected = interface.ACTION_BLOCK_BY_NAME["REWARD_SELECT"]
     for _ in range(50):
         assert _active_block_of(env.legal_actions()) is expected
         env.step(env.optimal_action())
