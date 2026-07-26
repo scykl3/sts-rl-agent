@@ -469,11 +469,17 @@ def test_reward_ids_enforce_caps_and_skip_sentinels() -> None:
     _fill_reward_ids(obs, gc)
 
     card_ids = obs["reward_card_ids"]
-    # Group 0 truncated to MAX_REWARD_CARDS_PER_GROUP; group 1 keeps its one card.
-    assert list(card_ids[:MAX_REWARD_CARDS_PER_GROUP]) == over_group[:MAX_REWARD_CARDS_PER_GROUP]
-    assert card_ids[MAX_REWARD_CARDS_PER_GROUP] == 9
-    # No 3rd group: everything at/after group index MAX_REWARD_CARD_GROUPS is PAD.
-    assert np.all(card_ids[MAX_REWARD_CARD_GROUPS * MAX_REWARD_CARDS_PER_GROUP :] == 0)
+    # Group 0 is truncated to the per-group cap; group 1's single card follows at
+    # the next group block; every other slot stays PAD.
+    kept0 = over_group[:MAX_REWARD_CARDS_PER_GROUP]
+    expected = [0] * len(card_ids)
+    expected[: len(kept0)] = kept0
+    expected[MAX_REWARD_CARDS_PER_GROUP] = 9
+    assert card_ids.tolist() == expected
+    # Cards past group 0's per-group cap and the whole 3rd group (past the group
+    # cap) are dropped: none of their ids appear anywhere in the field.
+    dropped = over_group[MAX_REWARD_CARDS_PER_GROUP:] + extra_group
+    assert not np.isin(dropped, card_ids).any()
 
     # Relic slot 1 (INVALID=180, past N_RELIC_IDS) is guarded to PAD; 0 and 2 kept.
     assert obs["reward_relic_ids"][0] == int(sts.RelicId.ART_OF_WAR)
