@@ -22,6 +22,13 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.run import describe_action, is_run_over, overworld_actions, start_run
 from sts_rl.env.run_actions import (
+    _RT_CARD,
+    _RT_CARD_REMOVE,
+    _RT_GOLD,
+    _RT_KEY,
+    _RT_POTION,
+    _RT_RELIC,
+    _RT_SKIP,
     auto_resolve_overworld,
     build_overworld_mask,
     decode_overworld_action,
@@ -117,6 +124,23 @@ def test_no_overworld_mask_in_battle() -> None:
     assert not build_overworld_mask(gc).any()
 
 
+def test_reward_type_constants_match_engine() -> None:
+    """The hand-copied RewardsActionType values match the engine enum.
+
+    Reward/shop/boss decode reads the type from GameAction.bits against these
+    constants; pinning them against the live enum makes a future engine reorder
+    fail here rather than mis-decode silently on a path the fuzz may not reach.
+    """
+    rt = sts.RewardsActionType
+    assert _RT_CARD == int(rt.CARD)
+    assert _RT_GOLD == int(rt.GOLD)
+    assert _RT_KEY == int(rt.KEY)
+    assert _RT_POTION == int(rt.POTION)
+    assert _RT_RELIC == int(rt.RELIC)
+    assert _RT_CARD_REMOVE == int(rt.CARD_REMOVE)
+    assert _RT_SKIP == int(rt.SKIP)
+
+
 def test_decode_out_of_range_raises() -> None:
     gc = start_run(seed=REGRESSION_SEED)
     with pytest.raises(InterfaceError):
@@ -164,6 +188,7 @@ def test_run_navigation_no_false_positives() -> None:
 
     assert states_checked > 50
     # Neow (an event) and the map are traversed on every run; competent battle
-    # play also reaches the post-combat reward screen.
-    assert {"EVENT_SCREEN", "MAP_SCREEN"} <= seen_screens
-    assert len(seen_screens) >= 3
+    # play (search seeded from seed+floor) deterministically reaches the
+    # post-combat reward screen, so requiring REWARDS also guarantees the
+    # reward-placement parity check above actually ran.
+    assert {"EVENT_SCREEN", "MAP_SCREEN", "REWARDS"} <= seen_screens
