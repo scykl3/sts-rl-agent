@@ -107,18 +107,20 @@ class RunSeries:
 
 
 def _load_manifest_or_empty(run_path: Path) -> dict[str, Any]:
-    """Read ``manifest.json``, or return ``{}`` if it is missing or unparseable.
+    """Read ``manifest.json``, or return ``{}`` if it is unusable.
 
-    Provenance is a header detail; a corrupt or half-written manifest should
-    degrade to a blank one, not sink the whole dashboard. (``JSONDecodeError`` is
-    a ``ValueError``.)
+    Provenance is a header detail; a missing, half-written, or otherwise unusable
+    manifest should degrade to a blank one, not sink the whole dashboard. That
+    includes valid JSON that is not an object (e.g. a list), which has no ``.get``
+    for the render path. (``JSONDecodeError`` is a ``ValueError``.)
     """
     if not (run_path / MANIFEST_FILENAME).exists():
         return {}
     try:
-        return read_manifest(run_path)
+        manifest = read_manifest(run_path)
     except (ValueError, OSError):
         return {}
+    return manifest if isinstance(manifest, dict) else {}
 
 
 def load_run_series(run_dir: str | Path, *, label: str | None = None) -> RunSeries:

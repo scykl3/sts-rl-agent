@@ -122,6 +122,20 @@ def test_load_tolerates_corrupt_manifest(tmp_path: Path) -> None:
     assert series.series["win_rate"] == [(0, 0.5)]
 
 
+def test_load_tolerates_non_dict_manifest(tmp_path: Path) -> None:
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    # Valid JSON, but a list - parses fine, yet has no .get for the render path.
+    (run_dir / MANIFEST_FILENAME).write_text("[1, 2, 3]", encoding="utf-8")
+    (run_dir / METRICS_FILENAME).write_text(
+        json.dumps({"win_rate": 0.5, STEP_KEY: 0}) + "\n", encoding="utf-8"
+    )
+    series = dash.load_run_series(run_dir)
+    assert series.manifest == {}
+    # Rendering the provenance table must not raise on the non-dict manifest.
+    assert "<!DOCTYPE html>" in dash.render_dashboard([series])
+
+
 def test_load_tolerates_missing_files(tmp_path: Path) -> None:
     empty = tmp_path / "nothing"
     empty.mkdir()
