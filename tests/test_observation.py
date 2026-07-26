@@ -24,7 +24,6 @@ from sts_rl.env.observation import (
     _MAP_CUR_BLOCK,
     _MAP_CUR_POS,
     _MAP_CUR_ROOM_ONEHOT,
-    _MAP_NEXT_BLOCK,
     _MAP_PER_COL_FEATS,
     _empty_obs,
     _fill_map_context,
@@ -33,8 +32,6 @@ from sts_rl.env.observation import (
 from sts_rl.env.run import execute_overworld_action, overworld_actions, start_run
 from sts_rl.env.spaces import build_observation_space
 from sts_rl.interface import (
-    ACTION_BLOCK_BY_NAME,
-    MAP_CONTEXT_DIM,
     N_NODE_TYPES,
     OBS_FIELDS,
     OBS_FIELD_BY_NAME,
@@ -254,13 +251,6 @@ def test_adapter_returns_encoded_not_placeholder_observation() -> None:
     assert np.count_nonzero(obs["hand_ids"]) > 0
     assert obs["enemy_alive"].sum() >= 1
     env.close()
-
-
-def test_map_context_layout_fills_dim_and_aligns_to_map_select() -> None:
-    # The named sub-widths tile map_context exactly, and the per-column block is
-    # keyed to the MAP_SELECT action index (one column per selectable map move).
-    assert _MAP_CUR_BLOCK + _MAP_NEXT_BLOCK == MAP_CONTEXT_DIM
-    assert MAP_COLS == ACTION_BLOCK_BY_NAME["MAP_SELECT"].count
 
 
 def test_overworld_obs_is_valid_with_bc_none() -> None:

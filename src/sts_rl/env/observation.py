@@ -313,9 +313,7 @@ def _fill_map_context(obs: Obs, gc: Any) -> None:
 
     # Columns reachable from the current node in the next row. Pre-map (cur_y < 0),
     # any row-0 column holding a real room is a legal first step; otherwise the
-    # engine's edge list gives the reachable next-row columns. On the top grid row
-    # the edges lead to the act boss, which is not stored in the grid, so the
-    # next-row lookup returns INVALID; that case is remapped to BOSS below.
+    # engine's edge list gives the reachable next-row columns.
     next_row = cur_y + 1
     if cur_y < 0:
         reachable = {
@@ -324,19 +322,21 @@ def _fill_map_context(obs: Obs, gc: Any) -> None:
     else:
         reachable = {int(c) for c in spire_map.edges(cur_x, cur_y)}
 
+    # Edges out of the top grid row lead to the act boss, which is not stored in the
+    # grid (next_row is past the grid, so get_room_type would return INVALID). On
+    # that boundary the reachable columns are the boss; encode it as BOSS so it keeps
+    # its combat signal instead of reading as SHOP (room id 0). Within the grid, read
+    # the real next-row room type (the norm guard keeps any stray sentinel at zero).
+    on_boss_boundary = next_row >= MAP_ROWS
     base = progress + _MAP_PROGRESS
     for col in reachable:
-        room_id = int(spire_map.get_room_type(col, next_row))
-        # A reachable column with no stored room is the act boss (top-row edge):
-        # encode it as BOSS so the boss keeps its combat signal instead of reading
-        # as SHOP (room id 0).
-        if not 0 <= room_id < N_NODE_TYPES:
-            room_id = _ROOM_BOSS
+        room_id = _ROOM_BOSS if on_boss_boundary else int(spire_map.get_room_type(col, next_row))
         slot = base + col * _MAP_PER_COL_FEATS
         ctx[slot] = 1.0  # reachable
         ctx[slot + 1] = 1.0 if room_id in _COMBAT_ROOMS else 0.0
         ctx[slot + 2] = 1.0 if room_id == _ROOM_ELITE else 0.0
-        ctx[slot + 3] = room_id / (N_NODE_TYPES - 1)
+        if 0 <= room_id < N_NODE_TYPES:
+            ctx[slot + 3] = room_id / (N_NODE_TYPES - 1)
 
 
 def _fill_pile_ids(out: np.ndarray, pile: Any) -> None:
