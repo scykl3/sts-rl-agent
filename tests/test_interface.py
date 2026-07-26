@@ -13,11 +13,11 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.4.0"
+    assert interface.INTERFACE_VERSION == "0.5.0"
 
 
-def test_action_dim_is_171():
-    assert interface.ACTION_DIM == 171
+def test_action_dim_is_257():
+    assert interface.ACTION_DIM == 257
 
 
 def test_action_dim_equals_sum_of_block_counts():
@@ -77,7 +77,7 @@ def test_action_block_offsets_match_spec():
     # PROCEED is the tail block, so its stop equals the full action dim.
     assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == interface.ACTION_DIM
     # CONFIRM_SELECT closes the combat prefix, ahead of the overworld blocks.
-    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == 107
+    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == 193
 
 
 def test_action_block_contains():
@@ -114,6 +114,14 @@ def test_reward_obs_fields_slot_aligned_with_block():
     assert by["reward_potion_ids"].shape == (interface.MAX_REWARD_POTIONS,)
 
 
+def test_card_select_obs_field_aligned_with_block():
+    # card_select_ids must be exactly as wide as the CARD_SELECT action block, so
+    # obs slot i and action index i refer to the same candidate card.
+    field = interface.OBS_FIELD_BY_NAME["card_select_ids"]
+    assert field.shape == (interface.CHOICE_MAX,)
+    assert field.shape[0] == interface.ACTION_BLOCK_BY_NAME["CARD_SELECT"].count
+
+
 # ---------------------------------------------------------------------------
 # Observation fields
 # ---------------------------------------------------------------------------
@@ -121,7 +129,7 @@ def test_reward_obs_fields_slot_aligned_with_block():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 21
+    assert len(fields) == 22
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:
@@ -172,6 +180,7 @@ def test_id_fields_have_id_high():
         "reward_card_ids": interface.N_CARD_IDS - 1,
         "reward_relic_ids": interface.N_RELIC_IDS - 1,
         "reward_potion_ids": interface.N_POTION_IDS - 1,
+        "card_select_ids": interface.N_CARD_IDS - 1,
     }
     # Pin the exact set of id fields, so silently switching one to another
     # bounds value (which __post_init__ would happily accept) is caught.
@@ -204,10 +213,10 @@ def test_observation_space_matches_registry():
             assert sub.dtype == np.float32
 
 
-def test_action_space_is_discrete_171():
+def test_action_space_is_discrete_257():
     space = spaces.build_action_space()
     assert space == gym.spaces.Discrete(interface.ACTION_DIM)
-    assert space.n == 171
+    assert space.n == 257
 
 
 def test_build_spaces_returns_pair():
