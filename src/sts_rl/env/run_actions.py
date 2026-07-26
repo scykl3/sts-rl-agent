@@ -14,9 +14,10 @@ enumerated as legal, and decoding it returns that same move -- which the caller
 still gates on ``isValidAction`` before executing, since ``execute`` on an
 invalid ``GameAction`` is undefined under the engine's asserts.
 
-Reward-screen action types are read out of ``GameAction.bits`` (the engine's
-``RewardsActionType`` enum is not bound to Python), matching the bit layout in
-the engine's ``GameAction`` (``type << 27 | idx2 << 8 | idx1``).
+Reward-screen action types are read out of ``GameAction.bits`` -- the same field
+the potion flag and the bound ``idx1``/``idx2`` come from -- so the whole mapping
+reads one source, matching the engine's ``GameAction`` bit layout
+(``type << 27 | idx2 << 8 | idx1``).
 
 Scope / deferrals:
 - Overworld potion use is not represented: the engine's ``getAllActionsInState``
@@ -37,7 +38,7 @@ from typing import Any
 import numpy as np
 
 from sts_rl.env._engine import slaythespire as sts
-from sts_rl.env.run import is_run_over, overworld_actions
+from sts_rl.env.run import execute_overworld_action, is_run_over, overworld_actions
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     ACTION_DIM,
@@ -58,7 +59,7 @@ from sts_rl.interface import (
 )
 
 # RewardsActionType values (engine GameAction.h). Read from GameAction.bits via
-# ``(bits >> 27) & 0x7`` so this module does not depend on the enum being bound.
+# ``(bits >> 27) & 0x7`` -- the same field the potion flag and idx1/idx2 use.
 _RT_CARD = 0
 _RT_GOLD = 1
 _RT_KEY = 2
@@ -248,7 +249,9 @@ def auto_resolve_overworld(gc: Any) -> int:
             raise InterfaceError(
                 f"no representable or resolvable overworld action at screen {gc.screen_state}"
             )
-        actions[0].execute(gc)
+        # Route through the legality-gated executor rather than execute() directly,
+        # for defense-in-depth against the undefined-execute abort this module avoids.
+        execute_overworld_action(gc, actions[0])
         steps += 1
     raise InterfaceError(
         f"auto_resolve_overworld exceeded {_RESOLVE_CAP} steps; possible state loop"

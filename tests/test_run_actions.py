@@ -20,13 +20,24 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
     pytest.skip(f"engine not built ({exc})", allow_module_level=True)
 
 from sts_rl.env._engine import slaythespire as sts
-from sts_rl.env.run import is_run_over, overworld_actions, start_run
+from sts_rl.env.run import describe_action, is_run_over, overworld_actions, start_run
 from sts_rl.env.run_actions import (
     auto_resolve_overworld,
     build_overworld_mask,
     decode_overworld_action,
 )
-from sts_rl.interface import ACTION_BLOCK_BY_NAME, ACTION_DIM, InterfaceError
+from sts_rl.interface import (
+    ACTION_BLOCK_BY_NAME,
+    ACTION_DIM,
+    REWARD_CARD_OFFSET,
+    REWARD_GOLD_OFFSET,
+    REWARD_KEY_OFFSET,
+    REWARD_POTION_OFFSET,
+    REWARD_RELIC_OFFSET,
+    REWARD_SINGING_BOWL_OFFSET,
+    REWARD_SKIP_OFFSET,
+    InterfaceError,
+)
 
 REGRESSION_SEED = 42
 # A spread of seeds driven to (roughly) full runs; competent battle play reaches
@@ -45,6 +56,33 @@ def _battle_agent() -> object:
     agent = sts.Agent()
     agent.simulation_count_base = BATTLE_SIM_COUNT
     return agent
+
+
+def _assert_reward_placement(gc: object) -> None:
+    """Each reward action lands in its designated REWARD_SELECT sub-slot.
+
+    The shared mask/decode map cannot catch a transposed sub-offset on its own -- a
+    wrong-but-in-bounds index still decodes to a valid move -- so cross-check the
+    engine's own action description (independent of the module's bit logic) against
+    the slot each index falls in.
+    """
+    start = ACTION_BLOCK_BY_NAME["REWARD_SELECT"].start
+    for index in np.flatnonzero(build_overworld_mask(gc)):
+        rel = int(index) - start
+        desc = describe_action(gc, decode_overworld_action(int(index), gc))
+        if desc.startswith("gold"):
+            assert rel == REWARD_GOLD_OFFSET
+        elif desc.startswith("potion"):
+            assert REWARD_POTION_OFFSET <= rel < REWARD_RELIC_OFFSET
+        elif desc.startswith("relic"):
+            assert REWARD_RELIC_OFFSET <= rel < REWARD_KEY_OFFSET
+        elif desc.startswith("key"):
+            assert rel == REWARD_KEY_OFFSET
+        elif desc.startswith("card"):
+            # Card choices (incl. the Singing Bowl option at idx2 5) share the card range.
+            assert REWARD_CARD_OFFSET <= rel <= REWARD_SINGING_BOWL_OFFSET
+        elif desc.startswith("skip"):
+            assert rel == REWARD_SKIP_OFFSET
 
 
 def test_neow_start_offers_event_options() -> None:
@@ -115,6 +153,8 @@ def test_run_navigation_no_false_positives() -> None:
             legal = np.flatnonzero(mask)
             assert legal.size > 0, f"empty overworld mask on {gc.screen_state} (seed {seed})"
             seen_screens.add(gc.screen_state.name)
+            if gc.screen_state == sts.ScreenState.REWARDS:
+                _assert_reward_placement(gc)
             for index in legal:
                 action = decode_overworld_action(int(index), gc)
                 assert action is not None, f"masked index {index} decodes to None"
