@@ -16,8 +16,8 @@ def test_interface_version():
     assert interface.INTERFACE_VERSION == "0.5.0"
 
 
-def test_action_dim_is_225():
-    assert interface.ACTION_DIM == 225
+def test_action_dim_is_257():
+    assert interface.ACTION_DIM == 257
 
 
 def test_action_dim_equals_sum_of_block_counts():
@@ -77,7 +77,7 @@ def test_action_block_offsets_match_spec():
     # PROCEED is the tail block, so its stop equals the full action dim.
     assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == interface.ACTION_DIM
     # CONFIRM_SELECT closes the combat prefix, ahead of the overworld blocks.
-    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == 161
+    assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == 193
 
 
 def test_action_block_contains():
@@ -112,6 +112,14 @@ def test_reward_obs_fields_slot_aligned_with_block():
     assert by["reward_card_ids"].shape == (interface.MAX_REWARD_CARD_SLOTS,)
     assert by["reward_relic_ids"].shape == (interface.MAX_REWARD_RELICS,)
     assert by["reward_potion_ids"].shape == (interface.MAX_REWARD_POTIONS,)
+
+
+def test_card_select_obs_field_aligned_with_block():
+    # card_select_ids must be exactly as wide as the CARD_SELECT action block, so
+    # obs slot i and action index i refer to the same candidate card.
+    field = interface.OBS_FIELD_BY_NAME["card_select_ids"]
+    assert field.shape == (interface.CHOICE_MAX,)
+    assert field.shape[0] == interface.ACTION_BLOCK_BY_NAME["CARD_SELECT"].count
 
 
 # ---------------------------------------------------------------------------
@@ -205,10 +213,10 @@ def test_observation_space_matches_registry():
             assert sub.dtype == np.float32
 
 
-def test_action_space_is_discrete_225():
+def test_action_space_is_discrete_257():
     space = spaces.build_action_space()
     assert space == gym.spaces.Discrete(interface.ACTION_DIM)
-    assert space.n == 225
+    assert space.n == 257
 
 
 def test_build_spaces_returns_pair():

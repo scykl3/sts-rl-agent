@@ -32,14 +32,18 @@ PAD_ID: int = 0
 HAND_MAX = 10
 MAX_ENEMIES = 5
 POTION_SLOTS = 5
+# Engine CardManager::MAX_GROUP_SIZE: the combat draw / discard / exhaust pile cap.
 PILE_MAX = 64
-# A card-select screen can span a full pile or the whole deck (deck-wide event
-# removes / transforms, large pile searches like Headbutt / Exhume), so its width
-# is the pile/deck cap. The paired card_select_ids observation carries the card
-# id at each slot, so the choice is by card identity, never by raw index. Reusing
-# PILE_MAX couples the two: changing PILE_MAX resizes the action space. A deck
-# larger than this cap is truncated (the tail is auto-resolved), not represented.
-CHOICE_MAX = PILE_MAX
+# Engine Deck::MAX_SIZE: the maximum deck size, and the backing length of a
+# deck-wide card-select's candidate list (GameContext.toSelectCards).
+DECK_MAX = 96
+# A card-select screen can span a full pile (combat searches like Headbutt /
+# Exhume) or the whole deck (deck-wide event removes / transforms), so its width
+# is the larger of the two, the deck cap. Sized to DECK_MAX rather than PILE_MAX so
+# a deck-wide select on a >64-card deck is fully addressable, not truncated. The
+# paired card_select_ids observation carries the card id at each slot, so the
+# choice is by card identity, never by raw index.
+CHOICE_MAX = DECK_MAX
 
 # --- Reward-screen selection caps (combat / elite / chest REWARDS screen) ---
 # The REWARDS screen offers a heterogeneous, variable set of items the agent
@@ -136,7 +140,7 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("USE_POTION_TARGETED", POTION_SLOTS * MAX_ENEMIES),  # 25
     ("USE_POTION_UNTARGETED", POTION_SLOTS),  # 5
     ("DISCARD_POTION", POTION_SLOTS),  # 5
-    ("CARD_SELECT", CHOICE_MAX),  # 64
+    ("CARD_SELECT", CHOICE_MAX),  # 96
     # Confirm the running selection of a sequential in-combat multi-select
     # (EXHAUST_MANY / GAMBLE). Kept with the combat blocks so every combat index
     # stays a fixed prefix as the overworld region grows.
@@ -169,7 +173,7 @@ ACTION_BLOCKS: tuple[ActionBlock, ...] = _build_action_blocks()
 
 ACTION_DIM: int = sum(block.count for block in ACTION_BLOCKS)
 
-_EXPECTED_ACTION_DIM = 225
+_EXPECTED_ACTION_DIM = 257
 if ACTION_DIM != _EXPECTED_ACTION_DIM:
     raise InterfaceError(
         f"ACTION_DIM miscount: computed {ACTION_DIM}, expected "
