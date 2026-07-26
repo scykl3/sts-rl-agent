@@ -1,12 +1,15 @@
 """Tests for the full-run environment adapter (StsRunEnv).
 
 Requires the built engine; skips cleanly otherwise. A passive-combat scripted
-policy (end turn only) reliably dies in Act 1, so these drive real runs to a
-terminal loss without needing a trained agent; a full-win drive is left to the
-end-to-end validation.
+policy (end turn only) reliably dies in Act 1, driving real runs to a terminal
+loss without a trained agent; a search-based reference driver
+(test_reference_driver_wins_full_run_end_to_end) drives a complete run to a
+terminal victory across all three acts.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 import pytest
@@ -16,8 +19,11 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without a build
     pytest.skip(f"engine not built ({exc})", allow_module_level=True)
 
+from sts_rl.env._engine import slaythespire as sts
+from sts_rl.env.actions import decode_action
 from sts_rl.env.reward import RewardConfig, beta
 from sts_rl.env.run import overworld_actions
+from sts_rl.env.run_actions import decode_overworld_action
 from sts_rl.env.run_adapter import _MAX_SEED, StsRunEnv
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
@@ -26,6 +32,7 @@ from sts_rl.interface import (
     INFO_KEYS_TERMINAL,
     INTERFACE_VERSION,
     TERMINAL_LOSS_REWARD,
+    TERMINAL_WIN_REWARD,
     InterfaceError,
 )
 
@@ -38,6 +45,19 @@ ACT_CROSSING_SEED = 10
 MAX_DRIVE_STEPS = 2000
 _END_TURN = ACTION_BLOCK_BY_NAME["END_TURN"].start
 _COMBAT = "combat"
+
+# A seed the search-based reference driver below drives to a full-run victory
+# (through the Act 3 boss). The win depends on the pinned engine commit and the
+# driver's search budgets; if an engine bump changes play, re-scan low seeds for a
+# new winner and update this.
+FULL_WIN_SEED = 3
+# Per-move combat search budget and per-decision overworld search budget for the
+# reference driver. Large enough to win FULL_WIN_SEED deterministically, small
+# enough to keep the end-to-end drive near a second.
+_COMBAT_SEARCH_SIMS = 400
+_OVERWORLD_SEARCH_SIMS = 200
+# Ironclad runs cover Acts 1-3 (no Act 4), so a victory ends in the third act.
+_FINAL_ACT = 3
 
 
 def _drive(env: StsRunEnv, first_info: dict, policy) -> list[dict]:
@@ -93,6 +113,60 @@ def _passive_action(info: dict) -> int:
     if info["screen"] == _COMBAT:
         return _END_TURN if _END_TURN in legal else int(legal[0])
     return int(legal[0])
+
+
+def _combat_action_key(action: Any) -> tuple[int, int, int, int]:
+    """Identity of a combat ``search::Action``, used to match a searcher's chosen
+    move to the interface index that decodes to it: (type, source, target, select)."""
+    return (
+        int(action.get_action_type()),
+        action.get_source_idx(),
+        action.get_target_idx(),
+        action.get_select_idx(),
+    )
+
+
+class _ReferenceDriver:
+    """Search-based reference policy over the interface action space.
+
+    Picks engine-strength moves and maps each to the interface index that decodes
+    to it, so it drives ``StsRunEnv.step()`` through the same decode / mask path an
+    agent uses, not a private engine channel. Combat runs a ``BattleSearcher`` on
+    the env's live ``BattleContext``; the overworld uses the engine's out-of-combat
+    search (``pick_gameaction``). :meth:`action` returns ``None`` if a chosen move
+    has no interface index (the layout does not cover that decision).
+
+    The overworld agent is stateful - its search RNG advances across calls - so one
+    is held per driver (per run); combat uses a fresh searcher per move. Both are
+    deterministic for a fixed seed, so a run's outcome is reproducible.
+    """
+
+    def __init__(self) -> None:
+        self._overworld_agent = sts.Agent()
+        self._overworld_agent.simulation_count_base = _OVERWORLD_SEARCH_SIMS
+
+    def action(self, env: StsRunEnv, info: dict) -> int | None:
+        if info["screen"] == _COMBAT:
+            return self._combat_index(env._bc, info["action_mask"])
+        return self._overworld_index(env._gc, info["action_mask"])
+
+    def _combat_index(self, bc: Any, mask: np.ndarray) -> int | None:
+        searcher = sts.BattleSearcher(bc)
+        searcher.search(_COMBAT_SEARCH_SIMS)
+        want = _combat_action_key(searcher.get_best_action())
+        for i in np.flatnonzero(mask):
+            candidate = decode_action(int(i), bc)
+            if candidate is not None and _combat_action_key(candidate) == want:
+                return int(i)
+        return None
+
+    def _overworld_index(self, gc: Any, mask: np.ndarray) -> int | None:
+        want = self._overworld_agent.pick_gameaction(gc)
+        for i in np.flatnonzero(mask):
+            candidate = decode_overworld_action(int(i), gc)
+            if candidate is not None and candidate == want:
+                return int(i)
+        return None
 
 
 def test_reset_returns_interface_obs_and_info() -> None:
@@ -367,6 +441,62 @@ def test_terminal_reward_added_once_on_terminal_step() -> None:
             assert terminal_component == pytest.approx(TERMINAL_LOSS_REWARD)
         else:
             assert terminal_component == pytest.approx(0.0)
+    env.close()
+
+
+def test_reference_driver_wins_full_run_end_to_end() -> None:
+    """End-to-end: a reference driver carries a full run to a terminal victory.
+
+    The win-side counterpart to test_scripted_run_reaches_terminal_loss. It drives
+    StsRunEnv through every screen type and combat of a complete Ironclad run,
+    across all three acts, to a terminal PLAYER_VICTORY - exercising the adapter's
+    win branch, the act transitions, and full decode / mask coverage together over
+    a real winning run rather than a loss. The engine-strength moves are applied
+    through StsRunEnv.step() via the shared decode / mask path (see
+    _ReferenceDriver), so a win here validates the interface pipeline, not a
+    private engine channel.
+    """
+    cfg = RewardConfig()
+    env = StsRunEnv(reward_config=cfg)
+    driver = _ReferenceDriver()
+    obs, info = env.reset(seed=FULL_WIN_SEED)
+
+    trace: list[tuple[int, float, dict[str, float]]] = []
+    terminated = truncated = False
+    for _ in range(MAX_DRIVE_STEPS):
+        # Every step is a genuine decision with a valid observation, and the
+        # driver's engine pick maps to an interface index - so a full winning run
+        # never hits an unrepresentable decision.
+        assert env.observation_space.contains(obs)
+        assert info["action_mask"].any()
+        t_before = env._global_step
+        idx = driver.action(env, info)
+        assert idx is not None, "engine pick has no interface index on this decision"
+        obs, reward, terminated, truncated, info = env.step(idx)
+        trace.append((t_before, reward, info["shaping_terms"]))
+        if terminated or truncated:
+            break
+    else:
+        raise AssertionError("run did not reach a terminal within the drive cap")
+
+    assert terminated and not truncated
+    assert info["won"] is True
+    assert info["run"].outcome == "PLAYER_VICTORY"
+    # Non-vacuous: the drive crossed both act boundaries to win in the final act.
+    assert info["act"] == _FINAL_ACT
+    for key in INFO_KEYS_TERMINAL:
+        assert key in info
+    assert info["episode"]["l"] == len(trace)
+    # Cumulative episode return equals the summed per-step rewards (guards the
+    # env's _ep_return accumulation, not just the per-step reward formula).
+    assert info["episode"]["r"] == pytest.approx(sum(reward for _, reward, _ in trace))
+    # The terminal +1 is credited exactly once, on the terminal step; every prior
+    # step's reward is pure annealed shaping (the win-side mirror of
+    # test_terminal_reward_added_once_on_terminal_step).
+    for k, (t_before, reward, shaping) in enumerate(trace):
+        terminal_component = reward - beta(t_before, cfg) * sum(shaping.values())
+        expected = TERMINAL_WIN_REWARD if k == len(trace) - 1 else 0.0
+        assert terminal_component == pytest.approx(expected)
     env.close()
 
 
