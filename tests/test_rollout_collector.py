@@ -32,7 +32,7 @@ N_STEPS = 8
 MINIBATCH = 4
 # A single multi-action block: a legal mask every step, non-degenerate learnable
 # task (count 5 > 1, so no degenerate-task warning).
-ACTIVE_BLOCK = "CARD_REWARD_SELECT"
+ACTIVE_BLOCK = "REWARD_SELECT"
 # GAE knobs distinct from the ppo defaults (0.99 / 0.95) so a forwarded override
 # visibly changes the advantages/returns from the buffer-default result.
 DISTINCT_GAMMA = 0.5

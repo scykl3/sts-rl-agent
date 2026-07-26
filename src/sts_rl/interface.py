@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.3.0.
+INTERFACE_VERSION 0.4.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.3.0"
+INTERFACE_VERSION: str = "0.4.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -34,6 +34,20 @@ MAX_ENEMIES = 5
 POTION_SLOTS = 5
 PILE_MAX = 64
 CHOICE_MAX = 10
+
+# --- Reward-screen selection caps (combat / elite / chest REWARDS screen) ---
+# The REWARDS screen offers a heterogeneous, variable set of items the agent
+# takes one at a time -- taking one removes it and re-presents the rest -- until
+# it leaves. The flat REWARD_SELECT block reserves a fixed slot per takeable
+# item; each id-bearing category has a matching observation field so the agent
+# sees which card / relic / potion occupies a slot (the slot index alone carries
+# no meaning).
+MAX_REWARD_GOLD = 1  # a combat reward screen has a single gold pile
+MAX_REWARD_POTIONS = 3  # potion rewards presentable at once
+MAX_REWARD_RELICS = 3  # relic rewards presentable at once (elite / boss / chest)
+MAX_REWARD_CARD_GROUPS = 2  # card-choice groups (a second appears with Prayer Wheel)
+MAX_REWARD_CARDS_PER_GROUP = 4  # cards per group (4 with Question Card)
+MAX_REWARD_CARD_SLOTS = MAX_REWARD_CARD_GROUPS * MAX_REWARD_CARDS_PER_GROUP  # 8
 
 # --- Enum cardinalities (confirm against engine enums at startup) ----------
 N_CARD_IDS = 380  # CardId; engine max id 370
@@ -88,6 +102,21 @@ class ActionBlock:
         return self.start <= index < self.stop
 
 
+# --- REWARD_SELECT internal sub-layout --------------------------------------
+# One flat block covers the whole REWARDS screen; these offsets (relative to the
+# block start) carve it into per-item-type slots. Decode and the reward
+# observation fields both index off these, so the slot an action takes and the
+# slot the observation describes always line up.
+REWARD_GOLD_OFFSET = 0
+REWARD_POTION_OFFSET = REWARD_GOLD_OFFSET + MAX_REWARD_GOLD
+REWARD_RELIC_OFFSET = REWARD_POTION_OFFSET + MAX_REWARD_POTIONS
+REWARD_KEY_OFFSET = REWARD_RELIC_OFFSET + MAX_REWARD_RELICS
+REWARD_CARD_OFFSET = REWARD_KEY_OFFSET + 1
+REWARD_SINGING_BOWL_OFFSET = REWARD_CARD_OFFSET + MAX_REWARD_CARD_SLOTS
+REWARD_SKIP_OFFSET = REWARD_SINGING_BOWL_OFFSET + 1
+REWARD_SELECT_COUNT = REWARD_SKIP_OFFSET + 1
+
+
 # Ordered (name, count) specs. Counts are expressed in terms of the caps above
 # where applicable. Start values are derived contiguously below.
 _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
@@ -98,10 +127,14 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("USE_POTION_UNTARGETED", POTION_SLOTS),  # 5
     ("DISCARD_POTION", POTION_SLOTS),  # 5
     ("CARD_SELECT", CHOICE_MAX),  # 10
-    ("CARD_REWARD_SELECT", 5),
+    # REWARDS screen: one flat block, sub-divided by the REWARD_*_OFFSET slots
+    # above, covering gold / potions / relics / key / card choices / Singing
+    # Bowl / skip. Taking an item removes it and the screen re-presents the rest.
+    ("REWARD_SELECT", REWARD_SELECT_COUNT),  # 18
     ("MAP_SELECT", 7),
     ("SHOP_SELECT", 15),
-    ("REST_SELECT", 6),
+    ("REST_SELECT", 7),  # rest / smith / recall / lift / toke / dig / skip
+    ("TREASURE_SELECT", 2),  # open chest / skip
     ("EVENT_SELECT", 10),
     ("BOSS_RELIC_SELECT", 4),
     ("PROCEED", 1),
@@ -125,7 +158,7 @@ ACTION_BLOCKS: tuple[ActionBlock, ...] = _build_action_blocks()
 
 ACTION_DIM: int = sum(block.count for block in ACTION_BLOCKS)
 
-_EXPECTED_ACTION_DIM = 155
+_EXPECTED_ACTION_DIM = 171
 if ACTION_DIM != _EXPECTED_ACTION_DIM:
     raise InterfaceError(
         f"ACTION_DIM miscount: computed {ACTION_DIM}, expected "
@@ -193,6 +226,13 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("enemy_alive", np.float32, (MAX_ENEMIES,), "unit"),
     ObsField("screen_onehot", np.float32, (N_SCREENS,), "unit"),
     ObsField("map_context", np.float32, (MAP_CONTEXT_DIM,), "real"),
+    # Run-mode REWARDS-screen contents, slot-aligned with the REWARD_SELECT
+    # block's card / relic / potion sub-slots so the agent sees which item each
+    # takeable slot holds; the positional index alone is meaningless. Zero (PAD)
+    # outside a reward screen.
+    ObsField("reward_card_ids", np.int32, (MAX_REWARD_CARD_SLOTS,), "id", id_high=N_CARD_IDS - 1),
+    ObsField("reward_relic_ids", np.int32, (MAX_REWARD_RELICS,), "id", id_high=N_RELIC_IDS - 1),
+    ObsField("reward_potion_ids", np.int32, (MAX_REWARD_POTIONS,), "id", id_high=N_POTION_IDS - 1),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}

@@ -13,11 +13,11 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.3.0"
+    assert interface.INTERFACE_VERSION == "0.4.0"
 
 
-def test_action_dim_is_155():
-    assert interface.ACTION_DIM == 155
+def test_action_dim_is_171():
+    assert interface.ACTION_DIM == 171
 
 
 def test_action_dim_equals_sum_of_block_counts():
@@ -47,10 +47,11 @@ def _expected_block_spec():
         ("USE_POTION_UNTARGETED", interface.POTION_SLOTS),
         ("DISCARD_POTION", interface.POTION_SLOTS),
         ("CARD_SELECT", interface.CHOICE_MAX),
-        ("CARD_REWARD_SELECT", 5),
+        ("REWARD_SELECT", interface.REWARD_SELECT_COUNT),
         ("MAP_SELECT", 7),
         ("SHOP_SELECT", 15),
-        ("REST_SELECT", 6),
+        ("REST_SELECT", 7),
+        ("TREASURE_SELECT", 2),
         ("EVENT_SELECT", 10),
         ("BOSS_RELIC_SELECT", 4),
         ("PROCEED", 1),
@@ -73,7 +74,7 @@ def test_action_block_offsets_match_spec():
         start += count
 
     assert interface.ACTION_BLOCK_BY_NAME["END_TURN"].start == 0
-    assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == 154
+    assert interface.ACTION_BLOCK_BY_NAME["PROCEED"].stop == 170
     # CONFIRM_SELECT is the tail block, so its stop equals the full action dim.
     assert interface.ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].stop == interface.ACTION_DIM
 
@@ -86,6 +87,31 @@ def test_action_block_contains():
     assert block.contains(block.start - 1) is False
 
 
+def test_reward_select_sublayout_tiles_the_block():
+    # The REWARD_SELECT block is sub-divided by the REWARD_*_OFFSET slots; the
+    # offsets must tile the block exactly (no gaps, no overlap) and sum to its count.
+    i = interface
+    assert i.REWARD_GOLD_OFFSET == 0
+    assert i.REWARD_POTION_OFFSET == i.REWARD_GOLD_OFFSET + i.MAX_REWARD_GOLD
+    assert i.REWARD_RELIC_OFFSET == i.REWARD_POTION_OFFSET + i.MAX_REWARD_POTIONS
+    assert i.REWARD_KEY_OFFSET == i.REWARD_RELIC_OFFSET + i.MAX_REWARD_RELICS
+    assert i.REWARD_CARD_OFFSET == i.REWARD_KEY_OFFSET + 1
+    assert i.REWARD_SINGING_BOWL_OFFSET == i.REWARD_CARD_OFFSET + i.MAX_REWARD_CARD_SLOTS
+    assert i.REWARD_SKIP_OFFSET == i.REWARD_SINGING_BOWL_OFFSET + 1
+    assert i.REWARD_SELECT_COUNT == i.REWARD_SKIP_OFFSET + 1
+    assert i.ACTION_BLOCK_BY_NAME["REWARD_SELECT"].count == i.REWARD_SELECT_COUNT
+    assert i.MAX_REWARD_CARD_SLOTS == i.MAX_REWARD_CARD_GROUPS * i.MAX_REWARD_CARDS_PER_GROUP
+
+
+def test_reward_obs_fields_slot_aligned_with_block():
+    # The reward id observation fields must match the block's per-category slot
+    # counts, so obs slot i and action slot i refer to the same reward item.
+    by = interface.OBS_FIELD_BY_NAME
+    assert by["reward_card_ids"].shape == (interface.MAX_REWARD_CARD_SLOTS,)
+    assert by["reward_relic_ids"].shape == (interface.MAX_REWARD_RELICS,)
+    assert by["reward_potion_ids"].shape == (interface.MAX_REWARD_POTIONS,)
+
+
 # ---------------------------------------------------------------------------
 # Observation fields
 # ---------------------------------------------------------------------------
@@ -93,7 +119,7 @@ def test_action_block_contains():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 18
+    assert len(fields) == 21
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:
@@ -141,6 +167,9 @@ def test_id_fields_have_id_high():
         "potion_ids": interface.N_POTION_IDS - 1,
         "enemy_ids": interface.N_MONSTER_IDS - 1,
         "enemy_move_ids": interface.N_MONSTER_MOVE_IDS - 1,
+        "reward_card_ids": interface.N_CARD_IDS - 1,
+        "reward_relic_ids": interface.N_RELIC_IDS - 1,
+        "reward_potion_ids": interface.N_POTION_IDS - 1,
     }
     # Pin the exact set of id fields, so silently switching one to another
     # bounds value (which __post_init__ would happily accept) is caught.
@@ -173,10 +202,10 @@ def test_observation_space_matches_registry():
             assert sub.dtype == np.float32
 
 
-def test_action_space_is_discrete_155():
+def test_action_space_is_discrete_171():
     space = spaces.build_action_space()
     assert space == gym.spaces.Discrete(interface.ACTION_DIM)
-    assert space.n == 155
+    assert space.n == 171
 
 
 def test_build_spaces_returns_pair():

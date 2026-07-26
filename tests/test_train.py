@@ -63,7 +63,7 @@ HIDDEN = 32
 NUM_ITERATIONS = 5
 N_STEPS = 128
 LEARNING_RATE = 1e-2
-CARD_REWARD_BLOCK = "CARD_REWARD_SELECT"
+CARD_REWARD_BLOCK = "REWARD_SELECT"
 # Tiny holdout for the eval/checkpoint tests: the bandit eval env terminates every
 # episode in one step, so a handful of episodes keeps these tests fast.
 EVAL_EPISODES = 4
@@ -87,7 +87,7 @@ _BASE_CONFIG = TrainConfig(
 
 
 def _task_env() -> StubEnv:
-    """The exact task env: learnable reward gated on one CARD_REWARD_SELECT block."""
+    """The exact task env: learnable reward gated on one REWARD_SELECT block."""
     return StubEnv(reward_mode="learnable", active_blocks=(CARD_REWARD_BLOCK,))
 
 
