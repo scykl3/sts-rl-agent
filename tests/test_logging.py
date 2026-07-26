@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,6 +70,17 @@ def test_metrics_stream_round_trip(tmp_path: Path) -> None:
         {"step": 100, "loss": 1.5, "kl": 0.01},
         {"step": 200, "loss": 1.0, "kl": 0.02},
     ]
+
+
+def test_read_metrics_skip_malformed(tmp_path: Path) -> None:
+    (tmp_path / run_logging.METRICS_FILENAME).write_text(
+        '{"a": 1}\nnot json\n{"a": 2}\n', encoding="utf-8"
+    )
+    # Strict by default: a bad line raises.
+    with pytest.raises(json.JSONDecodeError):
+        run_logging.read_metrics(tmp_path)
+    # Opt-in tolerance skips the bad line and keeps the valid records.
+    assert run_logging.read_metrics(tmp_path, skip_malformed=True) == [{"a": 1}, {"a": 2}]
 
 
 def test_positional_step_overrides_metrics_step(tmp_path: Path) -> None:

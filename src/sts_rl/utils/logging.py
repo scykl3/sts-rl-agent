@@ -37,6 +37,11 @@ _ENGINE_CONFIG = _REPO_ROOT / "configs" / "engine.toml"
 MANIFEST_FILENAME = "manifest.json"
 METRICS_FILENAME = "metrics.jsonl"
 
+# The per-record x-axis key in metrics.jsonl. Written by log_metrics and read
+# back by downstream tooling (e.g. the dashboard), so it lives as one constant
+# rather than a literal repeated on both sides.
+STEP_KEY = "step"
+
 # Sentinel recorded when a provenance field cannot be resolved (e.g. git is
 # absent, or the run is not inside a checkout). Kept explicit so a replay reader
 # can tell "unknown" apart from a real value.
@@ -188,7 +193,7 @@ class RunLogger:
         """
         if self._metrics_file is None or self._metrics_file.closed:
             raise ValueError("cannot log metrics after the logger is closed")
-        record = {**dict(metrics), "step": step}
+        record = {**dict(metrics), STEP_KEY: step}
         self._metrics_file.write(json.dumps(record, default=str) + "\n")
         self._metrics_file.flush()
 
@@ -210,11 +215,23 @@ def read_manifest(run_dir: str | Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def read_metrics(run_dir: str | Path) -> list[dict[str, Any]]:
-    """Load ``metrics.jsonl`` as a list of records, skipping blank lines."""
+def read_metrics(run_dir: str | Path, *, skip_malformed: bool = False) -> list[dict[str, Any]]:
+    """Load ``metrics.jsonl`` as a list of records, skipping blank lines.
+
+    With ``skip_malformed=True`` a line that is not valid JSON is skipped rather
+    than raised. The jsonl format is meant to survive a crash mid-write, which
+    usually leaves a truncated final line; a reader that only wants to plot what
+    was logged should pass this. Off by default so a caller relying on strict
+    provenance still sees the error.
+    """
     path = Path(run_dir) / METRICS_FILENAME
     records: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
+        if not line.strip():
+            continue
+        try:
             records.append(json.loads(line))
+        except json.JSONDecodeError:
+            if not skip_malformed:
+                raise
     return records
