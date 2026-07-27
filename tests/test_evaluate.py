@@ -46,9 +46,14 @@ class _ScriptedEnv:
     behaviour.
     """
 
-    def __init__(self, outcomes: dict[int, _Outcome]) -> None:
+    def __init__(self, outcomes: dict[int, _Outcome], acts: dict[int, int] | None = None) -> None:
         self.observation_space, self.action_space = build_spaces()
         self._outcomes = outcomes
+        # Per-seed terminal act (1-based). run_episode reads "act" strictly, so a
+        # conformant double must always emit it: defaults every seed to the
+        # not-cleared Act 1 when no mapping is given, and takes the explicit
+        # per-seed act otherwise (used to drive the Act-1 clear-rate assertions).
+        self._acts = acts if acts is not None else {seed: 1 for seed in outcomes}
         self._obs_space = build_observation_space()
         self._obs_space.seed(0)
         self._seed = 0
@@ -79,6 +84,9 @@ class _ScriptedEnv:
                 hp=hp,
                 episode={"r": ret, "l": self._steps},
             )
+            # Terminal act is always advertised (run_episode reads it strictly):
+            # the explicit per-seed act, or the not-cleared Act 1 default.
+            info["act"] = self._acts[self._seed]
         reward = ret if terminated else 0.0
         return obs, reward, terminated, False, info
 
@@ -178,6 +186,7 @@ def test_as_dict_exposes_all_metrics_as_floats() -> None:
         avg_hp=10.0,
         avg_ep_len=6.0,
         avg_return=0.25,
+        act1_clear_rate=0.75,
     )
     flat = report.as_dict()
     assert set(flat) == {
@@ -187,9 +196,55 @@ def test_as_dict_exposes_all_metrics_as_floats() -> None:
         "avg_hp",
         "avg_ep_len",
         "avg_return",
+        "act1_clear_rate",
     }
     assert all(isinstance(v, float) for v in flat.values())
     assert flat["win_rate"] == pytest.approx(0.5)
+    assert flat["act1_clear_rate"] == pytest.approx(0.75)
+
+
+def test_act1_clear_rate_counts_terminal_act_at_or_above_act2() -> None:
+    """act1_clear_rate is the fraction of episodes whose terminal act reached Act 2.
+
+    acts {1, 2, 3, 1} -> two of four cleared Act 1 (act 2 and act 3), so the rate
+    is 2/4; each per-episode act is carried through onto EpisodeResult. win_rate is
+    unaffected (a run can clear Act 1 without a full-run win), locking that the two
+    metrics are independent.
+    """
+    # seed -> (won, floor, hp, length, ret); a distinct terminal act per seed.
+    outcomes: dict[int, _Outcome] = {
+        0: (False, 16, 0, 3, -1.0),  # died in Act 1
+        1: (False, 20, 0, 5, -1.0),  # died in Act 2 (cleared Act 1)
+        2: (True, 52, 30, 7, 1.0),  # won the run (reached Act 3)
+        3: (False, 8, 0, 2, -1.0),  # died in Act 1
+    }
+    acts = {0: 1, 1: 2, 2: 3, 3: 1}
+    env = _ScriptedEnv(outcomes, acts=acts)
+    report = evaluate(_policy(), env, seeds=list(outcomes), device=torch.device("cpu"))
+
+    assert report.act1_clear_rate == pytest.approx(2 / 4)
+    # win_rate keys only on `won`, so it stays the full-run victory fraction (1/4)
+    # even though half the runs cleared Act 1.
+    assert report.win_rate == pytest.approx(1 / 4)
+
+
+def test_run_episode_carries_terminal_act() -> None:
+    """run_episode reads the terminal act onto EpisodeResult."""
+    env = _ScriptedEnv({7: (False, 18, 0, 4, -1.0)}, acts={7: 2})
+    result = run_episode(_policy(), env, seed=7, device=torch.device("cpu"))
+    assert result.act == 2
+
+
+def test_act1_clear_rate_zero_when_all_terminal_act_is_act1() -> None:
+    """A double whose every terminal act is Act 1 yields a defined, zero clear rate.
+
+    Combat/stub eval never leaves Act 1, so a terminal act below ACT2_INDEX
+    contributes nothing to the clear rate; the metric stays well-defined at 0.0.
+    """
+    outcomes: dict[int, _Outcome] = {0: (True, 5, 30, 4, 1.0), 1: (False, 2, 0, 7, -1.0)}
+    env = _ScriptedEnv(outcomes, acts={0: 1, 1: 1})  # every terminal act is Act 1
+    report = evaluate(_policy(), env, seeds=list(outcomes), device=torch.device("cpu"))
+    assert report.act1_clear_rate == 0.0
 
 
 def test_make_holdout_seeds_is_reproducible_and_distinct() -> None:
@@ -246,7 +301,7 @@ class _RotatingMaskEnv:
         obs = self._obs_space.sample()
         info: dict = {"action_mask": self._mask_for(self._legal_index)}
         if terminated:
-            info.update(won=True, floor=1, hp=1, episode={"r": 1.0, "l": self._steps})
+            info.update(won=True, floor=1, act=1, hp=1, episode={"r": 1.0, "l": self._steps})
         return obs, 0.0, terminated, False, info
 
 
