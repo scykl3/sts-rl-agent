@@ -27,6 +27,15 @@ version's ``interface.py`` in git history (0.3.0 is git ``5651b2e``, the last
 The remap never hardcodes an absolute offset: old offsets come from the embedded
 old table and new offsets from the live :data:`~sts_rl.interface.ACTION_BLOCKS`,
 so both sides track their single source of truth.
+
+A second, independent migration widens the encoder's first trunk ``Linear`` when
+the observation encoder gains input features. Those new features are appended at
+the END of the pre-trunk concat (see :mod:`sts_rl.agent.encoder`), so an old
+checkpoint's trained input columns are the leading prefix: the migration copies
+them through and zero-inits the appended suffix columns, leaving the new pathway
+neutral so the warm-started combat behavior is preserved. It composes with the
+policy-head remap because the two touch disjoint tensors (``policy.logits.*`` vs
+the first trunk ``Linear``), so a checkpoint needing both is migrated by both.
 """
 
 from __future__ import annotations
@@ -52,6 +61,13 @@ logger = logging.getLogger(__name__)
 # layout, so they are the only ones remapped; every other key is copied as-is.
 POLICY_LOGITS_WEIGHT_KEY: str = "policy.logits.weight"
 POLICY_LOGITS_BIAS_KEY: str = "policy.logits.bias"
+
+# State-dict key of the encoder's first trunk ``Linear`` weight
+# (``ObsFeatureEncoder.trunk[0]``), shape ``(hidden, feature_dim)``. Its
+# ``feature_dim`` columns are the ONLY tensor dimension that changes when the
+# encoder gains input features, so it is the only tensor the trunk-width
+# migration rebuilds; every other key is copied through unchanged.
+TRUNK_INPUT_WEIGHT_KEY: str = "encoder.trunk.0.weight"
 
 # Historical action-block layouts, as ordered ``(name, count)`` specs copied
 # verbatim from each version's ``interface.py`` in git. Counts (not offsets) are
@@ -247,6 +263,80 @@ def migrate_policy_head(
     return migrated
 
 
+def migrate_encoder_trunk_width(
+    state_dict: dict[str, torch.Tensor], target_feature_dim: int
+) -> dict[str, torch.Tensor]:
+    """Widen the encoder's first trunk ``Linear`` to the current input width.
+
+    The encoder appends any new input features at the END of its pre-trunk concat
+    (see :mod:`sts_rl.agent.encoder`), so an old checkpoint's trained columns are
+    the leading prefix of the wider weight. This rebuilds
+    :data:`TRUNK_INPUT_WEIGHT_KEY` as ``(hidden, target_feature_dim)``, copies the
+    old columns into ``[:, :old_feat]``, and leaves the appended suffix columns
+    zero. Zeroing (rather than random-initializing) the suffix keeps the new
+    pathway neutral on the first forward, so the warm-started combat behavior the
+    checkpoint already learned is preserved rather than perturbed.
+
+    On the widen path, returns a NEW state_dict that shares NO tensor storage
+    with the input: the rebuilt weight is freshly allocated and every
+    carried-through tensor is cloned, matching :func:`migrate_policy_head`'s
+    discipline. An equal width is a no-op returning the input dict unchanged
+    (shared storage), so an already-current checkpoint loads verbatim.
+
+    Raises :class:`~sts_rl.interface.InterfaceError` if the trunk weight is absent
+    (not an ``ActorCritic`` checkpoint), if it is not 2-D, or if its width exceeds
+    ``target_feature_dim`` (shrinking the trunk input is unsupported - it would
+    drop trained columns).
+    """
+    if TRUNK_INPUT_WEIGHT_KEY not in state_dict:
+        raise InterfaceError(
+            "state_dict is missing the encoder first-trunk weight "
+            f"({TRUNK_INPUT_WEIGHT_KEY!r}); not an ActorCritic checkpoint?"
+        )
+
+    old_weight = state_dict[TRUNK_INPUT_WEIGHT_KEY]
+
+    # The first-trunk weight must be 2-D (hidden, feature_dim); guard before
+    # unpacking shape below so a malformed head fails typed here.
+    if old_weight.ndim != 2:
+        raise InterfaceError(
+            f"checkpoint first-trunk weight {TRUNK_INPUT_WEIGHT_KEY!r} must be "
+            f"2-D (hidden, feature_dim), got {old_weight.ndim}-D shape "
+            f"{tuple(old_weight.shape)}"
+        )
+
+    hidden, old_feat = old_weight.shape[0], old_weight.shape[1]
+    if old_feat == target_feature_dim:
+        return state_dict  # widths already match: no migration needed
+    if old_feat > target_feature_dim:
+        raise InterfaceError(
+            f"checkpoint encoder feature width {old_feat} exceeds the current "
+            f"{target_feature_dim}; cannot shrink the trunk input"
+        )
+
+    # old_feat < target: widen. Copy trained columns to the leading prefix and
+    # leave the appended suffix zero. new_zeros preserves dtype and device.
+    logger.info(
+        "encoder trunk-width migration widens first-trunk input %d -> %d, "
+        "zero-initializing %d appended suffix column(s)",
+        old_feat,
+        target_feature_dim,
+        target_feature_dim - old_feat,
+    )
+    # CAUTION: prefix-copy correctness assumes the encoder appends new features at
+    # the END of the concat; a mid-concat insertion would silently mismap columns.
+    new_weight = old_weight.new_zeros((hidden, target_feature_dim))
+    new_weight[:, :old_feat] = old_weight
+
+    # Clone every carried-through tensor so the returned dict shares no storage
+    # with the input; the rebuilt weight is already independent.
+    migrated = {
+        key: value.clone() for key, value in state_dict.items() if key != TRUNK_INPUT_WEIGHT_KEY
+    }
+    migrated[TRUNK_INPUT_WEIGHT_KEY] = new_weight
+    return migrated
+
+
 def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> ActorCritic:
     """Load a training checkpoint into an :class:`ActorCritic`, migrating if needed.
 
@@ -268,6 +358,14 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     downgrade a layout it does not know) and an unrecorded old version is rejected
     by :func:`migrate_policy_head`.
 
+    Independently, the encoder's first trunk ``Linear`` is widened when the
+    checkpoint's input width is narrower than the current encoder's feature dim
+    (the concat gained trailing features); see
+    :func:`migrate_encoder_trunk_width`. Both migrations compose: a checkpoint may
+    need the head remap, the trunk widening, both, or neither. Their target widths
+    are read from a freshly built ``ActorCritic`` so they track the live
+    architecture rather than any recorded constant.
+
     ``strict=True`` is deliberate: after migration every current key must be
     present and correctly shaped, so a missing or misshaped tensor is a hard
     error, not a silent partial load. ``map_location`` defaults to ``"cpu"`` so a
@@ -287,13 +385,21 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     hidden_dim: Any = payload[CHECKPOINT_HIDDEN_DIM_KEY]
     ckpt_version: str = payload[CHECKPOINT_INTERFACE_VERSION_KEY]
 
-    # A head already at the current width needs no remap, whatever the recorded
-    # version: an unchanged action layout across a version bump loads verbatim
-    # without a recorded old layout. Only a differing width is a genuine
-    # migration, and the reject-newer / unknown-version guards apply on that path.
+    # Build the target model first and read BOTH target dims from its own
+    # state_dict, so the two migrations size against a single source of truth (the
+    # live architecture) rather than any recorded constant.
+    model = ActorCritic(hidden_dim=hidden_dim)
+    target_state = model.state_dict()
+    target_action_dim = target_state[POLICY_LOGITS_WEIGHT_KEY].shape[0]
+    target_feature_dim = target_state[TRUNK_INPUT_WEIGHT_KEY].shape[1]
+
+    # Policy-head remap: only when the recorded head width differs from the live
+    # action layout. An unchanged layout across a version bump loads verbatim
+    # without a recorded old layout; the reject-newer / unknown-version guards
+    # apply only on this migration path.
     head_weight = model_state.get(POLICY_LOGITS_WEIGHT_KEY)
     head_width = head_weight.shape[0] if head_weight is not None else None
-    if head_width != ACTION_DIM:
+    if head_width != target_action_dim:
         if _version_tuple(ckpt_version) > _version_tuple(INTERFACE_VERSION):
             raise InterfaceError(
                 f"checkpoint interface {ckpt_version} is newer than the current "
@@ -301,6 +407,11 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
             )
         model_state = migrate_policy_head(model_state, from_version=ckpt_version)
 
-    model = ActorCritic(hidden_dim=hidden_dim)
+    # Trunk-width migration: independent of the head remap and composes with it.
+    # When the encoder gained input features the old first-trunk Linear is too
+    # narrow; widen it and zero-init the appended suffix. A no-op when the widths
+    # already match (verbatim load).
+    model_state = migrate_encoder_trunk_width(model_state, target_feature_dim)
+
     model.load_state_dict(model_state, strict=True)
     return model

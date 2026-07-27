@@ -20,6 +20,8 @@ to the hand/enemy slot order, so do NOT reorder):
     potion block POTION_SLOTS * POTION_EMBED_DIM + POTION_SLOTS
     passthrough  relics_multihot + player_powers + player_scalars
                  + screen_onehot + map_context
+    reward block MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM   (offered card-reward
+                 slots; slot order fixed - REWARD_SELECT action layout maps to it)
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from sts_rl.interface import (
     HAND_MAX,
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
+    MAX_REWARD_CARD_SLOTS,
     N_CARD_IDS,
     N_MONSTER_IDS,
     N_MONSTER_MOVE_IDS,
@@ -116,7 +119,9 @@ class ObsFeatureEncoder(nn.Module):
         passthrough = (
             N_RELIC_IDS + N_PLAYER_POWER_IDS + PLAYER_SCALAR_DIM + N_SCREENS + MAP_CONTEXT_DIM
         )
-        return hand + enemy + piles + potion + passthrough
+        # Offered reward-screen cards, embedded per slot (reuses card_embed).
+        reward = MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
+        return hand + enemy + piles + potion + passthrough + reward
 
     def _pool_pile(self, pile_ids: Tensor) -> Tensor:
         """Mean+max pool a pile's card embeddings over the pile (slot) dim.
@@ -197,7 +202,14 @@ class ObsFeatureEncoder(nn.Module):
             dim=1,
         )
 
-        return torch.cat([hand, enemy, piles, potion, passthrough], dim=1)
+        # REWARD: per-slot offered-card embedding, flattened. Slot order is fixed
+        # (the REWARD_SELECT action layout maps to it, like hand); reuses
+        # card_embed, so PAD_ID slots contribute a zero vector. Appended LAST so
+        # the checkpoint migration widens the trunk by a clean zero-init suffix.
+        reward_emb = self.card_embed(obs["reward_card_ids"].long())  # (B, SLOTS, C)
+        reward = reward_emb.reshape(batch, -1)
+
+        return torch.cat([hand, enemy, piles, potion, passthrough, reward], dim=1)
 
     def forward(self, obs: dict[str, Tensor]) -> Tensor:
         """Return the shared trunk features of shape ``(B, output_dim)``."""

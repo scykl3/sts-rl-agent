@@ -50,7 +50,8 @@ def _expected_feature_dim() -> int:
         + interface.N_SCREENS
         + interface.MAP_CONTEXT_DIM
     )
-    return hand + enemy + piles + potion + passthrough
+    reward = interface.MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
+    return hand + enemy + piles + potion + passthrough + reward
 
 
 def test_forward_output_shape():
@@ -117,6 +118,21 @@ def test_all_pad_id_fields_contribute_zero_embedding():
     assert torch.equal(pooled, torch.zeros(1, 2 * CARD_EMBED_DIM))
 
 
+def test_reward_block_is_zero_when_all_pad():
+    """All-PAD reward_card_ids -> the trailing reward block is exactly zero.
+
+    Relies on card_embed's padding_idx row (no masking added): empty reward slots
+    contribute a zero vector, so the appended reward columns vanish. Slicing the
+    LAST reward-width columns also locks the append-at-end placement.
+    """
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    obs["reward_card_ids"] = torch.full_like(obs["reward_card_ids"], interface.PAD_ID)
+    feats = enc.encode_features(obs)
+    reward_width = interface.MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
+    assert torch.equal(feats[:, -reward_width:], torch.zeros(BATCH, reward_width))
+
+
 def test_gradient_flows_to_embeddings():
     enc = ObsFeatureEncoder()
     out = enc(sample_observation_batch(BATCH))
@@ -124,6 +140,29 @@ def test_gradient_flows_to_embeddings():
     assert enc.card_embed.weight.grad is not None
     assert enc.enemy_embed.weight.grad is not None
     assert enc.potion_embed.weight.grad is not None
+
+
+def test_gradient_flows_through_reward_path():
+    """A real card in reward_card_ids (all other card fields PAD) reaches card_embed.
+
+    Isolates the reward path: every other card-id field is PAD (padding_idx row 0
+    receives no gradient), so a nonzero card_embed gradient can only come from the
+    reward block, proving encode_features wires reward_card_ids into the shared
+    table. The seed keeps the sparse-input ReLU liveness deterministic.
+    """
+    torch.manual_seed(0)
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    for name in ("hand_ids", "draw_ids", "discard_ids", "exhaust_ids", "reward_card_ids"):
+        obs[name] = torch.full_like(obs[name], interface.PAD_ID)
+    real_id = interface.PAD_ID + 1  # any non-PAD card id
+    obs["reward_card_ids"][:, 0] = real_id
+    enc(obs).sum().backward()
+    grad = enc.card_embed.weight.grad
+    assert grad is not None
+    # Only the reward slot's id can carry gradient; the PAD row must stay zero.
+    assert torch.count_nonzero(grad[real_id]) > 0
+    assert torch.equal(grad[interface.PAD_ID], torch.zeros(CARD_EMBED_DIM))
 
 
 def test_deterministic_in_eval_mode():

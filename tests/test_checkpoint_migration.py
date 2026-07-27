@@ -24,16 +24,25 @@ from sts_rl.agent.checkpoint_migration import (
     OLD_ACTION_LAYOUTS,
     POLICY_LOGITS_BIAS_KEY,
     POLICY_LOGITS_WEIGHT_KEY,
+    TRUNK_INPUT_WEIGHT_KEY,
     _version_tuple,
     load_checkpoint,
+    migrate_encoder_trunk_width,
     migrate_policy_head,
 )
+from sts_rl.agent.encoder import CARD_EMBED_DIM
 from sts_rl.agent.train import (
     CHECKPOINT_HIDDEN_DIM_KEY,
     CHECKPOINT_INTERFACE_VERSION_KEY,
     CHECKPOINT_MODEL_KEY,
 )
-from sts_rl.interface import ACTION_BLOCK_BY_NAME, ACTION_DIM, INTERFACE_VERSION, InterfaceError
+from sts_rl.interface import (
+    ACTION_BLOCK_BY_NAME,
+    ACTION_DIM,
+    INTERFACE_VERSION,
+    MAX_REWARD_CARD_SLOTS,
+    InterfaceError,
+)
 
 # Small trunk width keeps the seeded head tiny; the migration is width-agnostic.
 HIDDEN = 4
@@ -51,6 +60,10 @@ _BLOCK_CODE_STRIDE = 1000
 # must zero-initialize them. REWARD_SELECT is deliberately here: 0.3.0's
 # CARD_REWARD_SELECT is a different block (name, width, semantics), not its source.
 NEW_ONLY_BLOCKS = ("REWARD_SELECT", "TREASURE_SELECT")
+
+# Width of the encoder's appended card-vision block, derived symbolically so the
+# trunk-width round-trip tracks the interface rather than a hardcoded literal.
+REWARD_BLOCK_WIDTH = MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
 
 
 def _seed_old_head(hidden: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -86,6 +99,22 @@ def _build_old_state_dict(hidden: int = HIDDEN) -> dict[str, torch.Tensor]:
     state_dict[POLICY_LOGITS_WEIGHT_KEY] = weight
     state_dict[POLICY_LOGITS_BIAS_KEY] = bias
     return state_dict
+
+
+def _build_current_state_dict(hidden: int = HIDDEN) -> dict[str, torch.Tensor]:
+    """A full current-layout ActorCritic state_dict (head and trunk at live widths).
+
+    Cloned so it owns its tensors. The trunk-width round-trip swaps in a narrower
+    first-trunk weight while leaving every other tensor at its current shape, so a
+    strict load exercises only the widening.
+    """
+    reference = ActorCritic(hidden_dim=hidden)
+    return {key: value.clone() for key, value in reference.state_dict().items()}
+
+
+def _current_feature_dim(hidden: int = HIDDEN) -> int:
+    """The live encoder's first-trunk in_features, read from a fresh model."""
+    return int(ActorCritic(hidden_dim=hidden).state_dict()[TRUNK_INPUT_WEIGHT_KEY].shape[1])
 
 
 def test_migrated_head_has_current_action_dim_and_loads_strict() -> None:
@@ -410,6 +439,9 @@ def test_load_checkpoint_same_version_loads_verbatim(tmp_path) -> None:
     model = load_checkpoint(path)
     assert torch.equal(model.policy.logits.weight, reference.policy.logits.weight)
     assert torch.equal(model.encoder.card_embed.weight, reference.encoder.card_embed.weight)
+    # The trunk no-op path protects this: an already-current first-trunk weight
+    # loads byte-identical, not silently rebuilt.
+    assert torch.equal(model.encoder.trunk[0].weight, reference.encoder.trunk[0].weight)
 
 
 def test_load_checkpoint_equal_width_head_loads_verbatim(tmp_path) -> None:
@@ -449,3 +481,156 @@ def test_load_checkpoint_rejects_missing_key(tmp_path) -> None:
     torch.save({CHECKPOINT_MODEL_KEY: {}}, path)
     with pytest.raises(InterfaceError, match="missing required key"):
         load_checkpoint(path)
+
+
+def test_trunk_width_migration_preserves_prefix_and_zeros_suffix() -> None:
+    """Widening the first-trunk Linear copies old columns and zero-inits the suffix.
+
+    Synthesizes a narrower (pre-card-vision) first-trunk weight with an arange
+    sentinel so every original column is identifiable, migrates to the current
+    feature dim, and loads strict into a fresh ActorCritic. Asserts (a) it loads,
+    (b) the leading old columns survive, and (c) the appended suffix is exactly
+    zero - the append-at-end coupling with the encoder.
+    """
+    target = _current_feature_dim()
+    old_feat = target - REWARD_BLOCK_WIDTH  # the pre-card-vision input width
+    assert old_feat < target  # guard the premise: the encoder actually widened
+
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+
+    migrated = migrate_encoder_trunk_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :old_feat], old_weight)  # (b) leading columns preserved
+    assert torch.count_nonzero(new_weight[:, old_feat:]) == 0  # (c) suffix exactly zero
+
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)  # (a) loads strict
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
+def test_migrate_trunk_equal_width_is_noop() -> None:
+    """An already-current width is a no-op: the input dict is returned unchanged."""
+    target = _current_feature_dim()
+    state = _build_current_state_dict()  # its first-trunk weight is already at target
+    migrated = migrate_encoder_trunk_width(state, target)
+    # Same object (and same tensor) returned, so an already-current checkpoint
+    # loads verbatim rather than through a needless rebuild.
+    assert migrated is state
+    assert migrated[TRUNK_INPUT_WEIGHT_KEY] is state[TRUNK_INPUT_WEIGHT_KEY]
+
+
+def test_migrate_trunk_output_is_isolated_copy() -> None:
+    """After a widen, mutating a carried-through tensor leaves the input unchanged.
+
+    The widen path clones every carried-through tensor, so the returned dict
+    shares no storage with the caller's; this guards against a shallow copy that
+    would alias them (identity and value, not merely torch.equal). Mirrors the
+    head migration's isolation test.
+    """
+    target = _current_feature_dim()
+    old_feat = target - REWARD_BLOCK_WIDTH
+    state = _build_current_state_dict()
+    narrow = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = narrow
+    migrated = migrate_encoder_trunk_width(state, target)
+
+    # A carried-through (non-trunk) float tensor: distinct object, not aliased.
+    key = next(
+        k for k, v in migrated.items() if k != TRUNK_INPUT_WEIGHT_KEY and v.is_floating_point()
+    )
+    assert migrated[key] is not state[key]
+    before = state[key].clone()
+    migrated[key].add_(1.0)  # mutate the output tensor in place
+    assert torch.equal(state[key], before)  # input unchanged: no shared storage
+    assert not torch.equal(state[key], migrated[key])
+
+
+def test_migrate_trunk_rejects_missing_key() -> None:
+    """A state_dict without the first-trunk weight is rejected (not an ActorCritic)."""
+    broken = _build_current_state_dict()
+    del broken[TRUNK_INPUT_WEIGHT_KEY]
+    with pytest.raises(InterfaceError, match="missing the encoder first-trunk weight"):
+        migrate_encoder_trunk_width(broken, _current_feature_dim())
+
+
+def test_migrate_trunk_rejects_non_2d() -> None:
+    """A malformed 1-D first-trunk weight fails typed, not with a bare error."""
+    broken = _build_current_state_dict()
+    broken[TRUNK_INPUT_WEIGHT_KEY] = broken[TRUNK_INPUT_WEIGHT_KEY].reshape(-1)
+    with pytest.raises(InterfaceError, match="must be 2-D"):
+        migrate_encoder_trunk_width(broken, _current_feature_dim())
+
+
+def test_migrate_trunk_rejects_shrink() -> None:
+    """A trunk wider than the target is rejected: shrinking would drop trained columns."""
+    target = _current_feature_dim()
+    state = _build_current_state_dict()
+    # Over-wide the trunk so a migration would have to shrink (old_feat > target).
+    state[TRUNK_INPUT_WEIGHT_KEY] = torch.zeros(HIDDEN, target + 1)
+    with pytest.raises(InterfaceError, match="cannot shrink the trunk input"):
+        migrate_encoder_trunk_width(state, target)
+
+
+def test_load_checkpoint_widens_narrow_trunk(tmp_path) -> None:
+    """A warm-start checkpoint with the pre-card-vision (narrower) trunk widens on load.
+
+    The end-to-end deliverable: an existing current-layout checkpoint whose
+    encoder predates the reward block loads into the now-wider trunk via
+    load_checkpoint, its trained columns preserved and the appended card-vision
+    columns zero-initialized (so combat competence starts unperturbed).
+    """
+    target = _current_feature_dim()
+    old_feat = target - REWARD_BLOCK_WIDTH
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+    path = tmp_path / "warm.pt"
+    _write_checkpoint(path, state, INTERFACE_VERSION, HIDDEN)
+
+    model = load_checkpoint(path)
+    loaded = model.encoder.trunk[0].weight.detach()
+    assert loaded.shape == (HIDDEN, target)
+    assert torch.equal(loaded[:, :old_feat], old_weight)
+    assert torch.count_nonzero(loaded[:, old_feat:]) == 0
+
+
+def test_load_checkpoint_composes_head_remap_and_trunk_widen(tmp_path) -> None:
+    """One checkpoint needing BOTH migrations: old-layout head AND a narrow trunk.
+
+    The real warm-start scenario - a 0.3.0-layout checkpoint whose encoder also
+    predates the reward block. load_checkpoint must compose the name-aware head
+    remap with the trunk widening on the single payload: CONFIRM_SELECT lands at
+    its live offset, and the trunk widens with its sentinel prefix preserved and
+    the appended suffix zero.
+    """
+    old_state = _build_old_state_dict()
+    old_head_weight = old_state[POLICY_LOGITS_WEIGHT_KEY]
+
+    target = _current_feature_dim()
+    old_feat = target - REWARD_BLOCK_WIDTH  # pre-card-vision input width
+    assert old_feat < target  # guard the premise: the encoder actually widened
+    old_trunk = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    old_state[TRUNK_INPUT_WEIGHT_KEY] = old_trunk
+
+    path = tmp_path / "compose.pt"
+    _write_checkpoint(path, old_state, OLD_VERSION, HIDDEN)
+
+    model = load_checkpoint(path)
+
+    # (a) Head remapped to the current layout; CONFIRM_SELECT at its LIVE offset.
+    assert model.policy.logits.weight.shape == (ACTION_DIM, HIDDEN)
+    confirm_old_start = OLD_LAYOUT["CONFIRM_SELECT"][0]
+    confirm_new_start = ACTION_BLOCK_BY_NAME["CONFIRM_SELECT"].start
+    assert torch.equal(
+        model.policy.logits.weight[confirm_new_start], old_head_weight[confirm_old_start]
+    )
+
+    # (b) Trunk widened to the current feature dim; sentinel prefix preserved,
+    # appended suffix exactly zero.
+    trunk = model.encoder.trunk[0].weight.detach()
+    assert trunk.shape == (HIDDEN, target)
+    assert torch.equal(trunk[:, :old_feat], old_trunk)
+    assert torch.count_nonzero(trunk[:, old_feat:]) == 0
