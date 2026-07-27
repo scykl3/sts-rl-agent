@@ -39,7 +39,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import gymnasium as gym
@@ -84,6 +84,30 @@ CHECKPOINT_INTERFACE_VERSION_KEY: str = "interface_version"
 CHECKPOINT_ITERATION_KEY: str = "iteration"
 CHECKPOINT_STEP_KEY: str = "global_step"
 CHECKPOINT_WIN_RATE_KEY: str = "win_rate"
+# best.pt-only provenance: the metric it was ranked on (NAME) and that metric's
+# selected value, so the best checkpoint is self-describing about its ranking even
+# when best_metric != win_rate (win_rate above is still recorded for provenance, but
+# it is not the ranked value then). Written only on best.pt; both are
+# weights_only-safe (a str + a float).
+CHECKPOINT_BEST_METRIC_KEY: str = "best_metric"
+CHECKPOINT_BEST_METRIC_VALUE_KEY: str = "best_metric_value"
+
+# Default ranked metric: the EvalReport field that ranks best.pt and
+# TrainHistory.best_eval, and is additionally surfaced in the periodic-eval log.
+# "win_rate" preserves the original combat behavior; run-mode overrides it with a
+# progress metric (e.g. act1_clear_rate) because full-run win_rate is ~0 for a long
+# time. Must name an EvalReport field (validated in TrainConfig.__post_init__).
+DEFAULT_BEST_METRIC: str = "win_rate"
+
+# Valid best_metric names: the float-typed metric fields of EvalReport (win_rate,
+# the avg_* aggregates, and act1_clear_rate), derived from the dataclass so a new
+# float metric is rankable without editing a list here. The int n_episodes is
+# excluded - it is a constant episode count, not a progress metric, so ranking on it
+# is degenerate. f.type is the annotation STRING here (PEP 563 postponed
+# evaluation), so the filter matches "float".
+EVAL_METRIC_FIELDS: frozenset[str] = frozenset(
+    f.name for f in fields(EvalReport) if f.type == "float"
+)
 
 
 @dataclass(frozen=True)
@@ -125,6 +149,12 @@ class TrainConfig:
     eval_episodes: int = DEFAULT_EVAL_EPISODES
     eval_seed_base: int = DEFAULT_EVAL_SEED_BASE
     checkpoint_dir: str | None = None
+    # The EvalReport field used to (a) rank best.pt / TrainHistory.best_eval and
+    # (b) additionally surface in the periodic-eval log line. Default "win_rate"
+    # keeps combat behavior identical; run-mode overrides it (e.g. "act1_clear_rate")
+    # because full-run win_rate is ~0 for a long time, so every eval ties at 0 and
+    # best.pt would be degenerate. Validated in __post_init__.
+    best_metric: str = DEFAULT_BEST_METRIC
 
     def __post_init__(self) -> None:
         # Fail at construction on a degenerate budget rather than silently
@@ -152,6 +182,15 @@ class TrainConfig:
         # a positive iteration count, so fail at construction like the other knobs.
         if self.eval_every is not None and self.eval_every <= 0:
             raise ValueError(f"eval_every must be positive when set, got {self.eval_every}")
+        # best_metric must name a float metric field of EvalReport (see
+        # EVAL_METRIC_FIELDS); reject an unknown name at construction rather than
+        # letting a typo surface as a cryptic getattr AttributeError deep in
+        # best_eval/the loop.
+        if self.best_metric not in EVAL_METRIC_FIELDS:
+            raise ValueError(
+                f"best_metric must be one of {sorted(EVAL_METRIC_FIELDS)}, "
+                f"got {self.best_metric!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -197,20 +236,23 @@ class TrainHistory:
     ``actor_critic`` is returned so a caller (evaluation, checkpointing, a sample
     playthrough) can use the trained network directly without re-threading it.
     ``eval_reports`` holds the periodic-eval snapshots (empty when ``eval_every``
-    is unset); :meth:`best_eval` is the highest-win-rate snapshot, mirroring which
+    is unset); :meth:`best_eval` is the highest-``best_metric`` snapshot, mirroring which
     run produced ``best.pt``.
     """
 
     records: list[IterationRecord]
     actor_critic: ActorCritic
     eval_reports: list[EvalRecord] = field(default_factory=list)
+    # The EvalReport field best_eval ranks on; set from TrainConfig.best_metric by
+    # train(). Defaulted so a directly-constructed history ranks on win_rate.
+    best_metric: str = DEFAULT_BEST_METRIC
 
     def mean_episode_returns(self) -> list[float | None]:
         """Per-iteration mean episode return (``None`` where no episode ended)."""
         return [record.collect.mean_episode_return for record in self.records]
 
     def best_eval(self) -> EvalRecord | None:
-        """Highest-win-rate eval snapshot, or ``None`` if no periodic eval ran.
+        """Highest-ranked eval snapshot by ``best_metric``, or ``None`` if none ran.
 
         Ties resolve to the EARLIEST such snapshot (``max`` returns the first
         maximal element), matching the strictly-greater ``best.pt`` overwrite rule
@@ -218,7 +260,7 @@ class TrainHistory:
         """
         if not self.eval_reports:
             return None
-        return max(self.eval_reports, key=lambda record: record.report.win_rate)
+        return max(self.eval_reports, key=lambda record: getattr(record.report, self.best_metric))
 
 
 def train(
@@ -367,7 +409,7 @@ def train(
 
     records: list[IterationRecord] = []
     eval_reports: list[EvalRecord] = []
-    best_win_rate: float | None = None
+    best_metric_value: float | None = None
     global_step = 0
     for iteration in range(config.num_iterations):
         # CleanRL linear LR decay: iteration 0 keeps the full learning_rate and
@@ -437,18 +479,37 @@ def train(
                     report=report,
                 )
             )
-            logger.info(
-                "eval iter=%d global_step=%d win_rate=%.3f",
-                iteration,
-                global_step,
-                report.win_rate,
-            )
-            # New best (STRICTLY greater) overwrites best.pt; a tie keeps the
-            # earlier best, matching TrainHistory.best_eval.
+            # This eval's ranked metric: win_rate by default (combat), a progress
+            # metric (e.g. act1_clear_rate) in run-mode. Ranks best.pt below and is
+            # surfaced in the log line when it differs from the always-shown win_rate.
+            metric_value: float = getattr(report, config.best_metric)
+            # Always log win_rate; for run-mode (best_metric != win_rate) also append
+            # the ranked metric, whose curve is the informative one while full-run
+            # win_rate sits at ~0. Combat logs byte-identically (no always-zero field).
+            if config.best_metric == DEFAULT_BEST_METRIC:
+                logger.info(
+                    "eval iter=%d global_step=%d win_rate=%.3f",
+                    iteration,
+                    global_step,
+                    report.win_rate,
+                )
+            else:
+                logger.info(
+                    "eval iter=%d global_step=%d win_rate=%.3f %s=%.3f",
+                    iteration,
+                    global_step,
+                    report.win_rate,
+                    config.best_metric,
+                    metric_value,
+                )
+            # New best (STRICTLY greater) overwrites best.pt; a tie keeps the earlier
+            # best, matching TrainHistory.best_eval. Ranks on the configured
+            # best_metric (win_rate by default); the checkpoint still records
+            # report.win_rate for provenance - only the ranking metric changes.
             if checkpoint_dir_path is not None and (
-                best_win_rate is None or report.win_rate > best_win_rate
+                best_metric_value is None or metric_value > best_metric_value
             ):
-                best_win_rate = report.win_rate
+                best_metric_value = metric_value
                 _save_checkpoint(
                     checkpoint_dir_path,
                     BEST_CHECKPOINT_NAME,
@@ -457,6 +518,8 @@ def train(
                     iteration=iteration,
                     global_step=global_step,
                     win_rate=report.win_rate,
+                    best_metric=config.best_metric,
+                    best_metric_value=metric_value,
                 )
 
     # last.pt always captures the final trained weights. Its win_rate is the final
@@ -475,7 +538,12 @@ def train(
             win_rate=last_win_rate,
         )
 
-    return TrainHistory(records=records, actor_critic=actor_critic, eval_reports=eval_reports)
+    return TrainHistory(
+        records=records,
+        actor_critic=actor_critic,
+        eval_reports=eval_reports,
+        best_metric=config.best_metric,
+    )
 
 
 def _log_iteration(
@@ -524,6 +592,8 @@ def _save_checkpoint(
     iteration: int,
     global_step: int,
     win_rate: float | None,
+    best_metric: str | None = None,
+    best_metric_value: float | None = None,
 ) -> None:
     """Atomically write one checkpoint: a state_dict payload, not a pickled module.
 
@@ -541,6 +611,13 @@ def _save_checkpoint(
     so a checkpoint reloads without externally knowing the architecture - rebuild
     ``ActorCritic(hidden_dim=ckpt[CHECKPOINT_HIDDEN_DIM_KEY])`` then
     ``load_state_dict``.
+
+    ``best_metric``/``best_metric_value`` are recorded only when passed - the best.pt
+    call site passes the ranked metric name and its selected value, so best.pt is
+    self-describing about what it was ranked on (distinct from the always-recorded
+    ``win_rate`` provenance). last.pt omits both (it passes neither), since no ranked
+    value applies to a final-weights checkpoint. Both are ``weights_only``-safe (a
+    ``str`` and a ``float``).
     """
     payload: dict[str, object] = {
         CHECKPOINT_MODEL_KEY: copy.deepcopy(actor_critic.state_dict()),
@@ -550,6 +627,11 @@ def _save_checkpoint(
         CHECKPOINT_STEP_KEY: global_step,
         CHECKPOINT_WIN_RATE_KEY: win_rate,
     }
+    # best.pt records what it was ranked on (metric name + selected value); recorded
+    # only when a name is passed, so last.pt's payload stays unchanged.
+    if best_metric is not None:
+        payload[CHECKPOINT_BEST_METRIC_KEY] = best_metric
+        payload[CHECKPOINT_BEST_METRIC_VALUE_KEY] = best_metric_value
     final_path = checkpoint_dir / filename
     # Sibling temp in the SAME dir keeps os.replace a single-filesystem atomic
     # rename (a cross-device os.replace would raise instead).

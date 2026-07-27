@@ -370,6 +370,56 @@ def test_main_wires_warm_start_net_and_derived_width_into_train(
     assert config.hidden_dim == warm_trunk_width == warm_width
 
 
+def test_main_builds_config_with_run_best_metric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() builds its TrainConfig with best_metric=RUN_BEST_METRIC (act1_clear_rate).
+
+    Run mode ranks best.pt / TrainHistory.best_eval on the Act 1 clear rate, not the
+    default win_rate: full-run win_rate is ~0 for a long time, so every early eval
+    ties at 0 and best.pt would be degenerate. Engine-free: train and StsRunEnv are
+    stubbed. Revert-verify: drop best_metric=RUN_BEST_METRIC from the TrainConfig
+    build and config.best_metric falls back to the win_rate default, failing this.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_train(
+        _env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        captured["config"] = config
+        # A last eval snapshot over the driver's DEFAULT band keeps
+        # _final_eval_report on the reuse path, so the final eval needs neither the
+        # engine nor a stubbed evaluate.
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+
+    # Bind main()'s deferred StsRunEnv import to the engine-free stub.
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _StubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+
+    monkeypatch.setattr(sys, "argv", ["train_run"])
+
+    train_run.main()
+
+    config = cast(TrainConfig, captured["config"])
+    assert config.best_metric == train_run.RUN_BEST_METRIC == "act1_clear_rate"
+
+
 def test_arg_parser_has_no_encounters_knob() -> None:
     """Run mode has no encounter pool, so --encounters (combat-only) is absent."""
     with pytest.raises(SystemExit):

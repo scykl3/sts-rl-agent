@@ -46,6 +46,7 @@ from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import (
     DEFAULT_LEARNING_RATE,
+    EvalRecord,
     IterationRecord,
     TrainConfig,
     TrainHistory,
@@ -360,6 +361,9 @@ def test_config_defaults_are_symbolic() -> None:
     assert config.checkpoint_dir is None
     assert config.eval_episodes == train_module.DEFAULT_EVAL_EPISODES
     assert config.eval_seed_base == train_module.DEFAULT_EVAL_SEED_BASE
+    # best_metric default ranks on full-run win rate (MUST stay win_rate; run-mode
+    # overrides it). Locked to the concrete value, not just the constant.
+    assert config.best_metric == train_module.DEFAULT_BEST_METRIC == "win_rate"
 
 
 def test_anneal_lr_decays_learning_rate() -> None:
@@ -701,6 +705,295 @@ def test_eval_and_checkpoint_default_off(tmp_path: Path) -> None:
     assert history.best_eval() is None
     # checkpoint_dir was None, so nothing is written anywhere (tmp_path stays empty).
     assert list(tmp_path.iterdir()) == []
+
+
+# -- Configurable best_metric (best.pt / best_eval ranking) ------------------
+
+
+def _eval_record(iteration: int, *, win_rate: float, act1_clear_rate: float) -> EvalRecord:
+    """An EvalRecord with distinguishable win_rate and act1_clear_rate.
+
+    Built directly (no train() run) so the best_metric ranking tests stay
+    engine-free and fast; only the two ranked fields carry meaningful values.
+    """
+    return EvalRecord(
+        iteration=iteration,
+        global_step=(iteration + 1) * N_STEPS,
+        eval_seed_base=train_module.DEFAULT_EVAL_SEED_BASE,
+        report=EvalReport(
+            n_episodes=EVAL_EPISODES,
+            win_rate=win_rate,
+            avg_floor=0.0,
+            avg_hp=0.0,
+            avg_ep_len=1.0,
+            avg_return=win_rate,
+            act1_clear_rate=act1_clear_rate,
+        ),
+    )
+
+
+def test_best_eval_ranks_on_configured_metric() -> None:
+    """best_eval ranks on best_metric: with best_metric=act1_clear_rate it picks the
+    clear-rate winner even when a DIFFERENT snapshot holds the max win_rate.
+
+    Revert-verify: restore the hardcoded record.report.win_rate ranking and best_eval
+    returns the win_rate winner (iter 0), failing the iter-1 assertion.
+    """
+    # iter 0 holds the max win_rate; iter 1 the max act1_clear_rate. Ranking on
+    # act1_clear_rate must select iter 1.
+    reports = [
+        _eval_record(0, win_rate=0.9, act1_clear_rate=0.1),
+        _eval_record(1, win_rate=0.2, act1_clear_rate=0.8),
+    ]
+    history = TrainHistory(
+        records=[],
+        actor_critic=ActorCritic(hidden_dim=HIDDEN),
+        eval_reports=reports,
+        best_metric="act1_clear_rate",
+    )
+    best = history.best_eval()
+    assert best is not None
+    assert best.iteration == 1
+    assert best.report.act1_clear_rate == 0.8
+
+
+def test_best_eval_default_ranks_on_win_rate() -> None:
+    """Default best_metric=win_rate ranks by win_rate (the unchanged combat path).
+
+    Same records as the configured-metric test, but the default selects the win_rate
+    winner (iter 0), NOT the clear-rate winner - guarding that the default is
+    behaviour-identical to the prior hardcoded win_rate ranking.
+    """
+    reports = [
+        _eval_record(0, win_rate=0.9, act1_clear_rate=0.1),
+        _eval_record(1, win_rate=0.2, act1_clear_rate=0.8),
+    ]
+    history = TrainHistory(
+        records=[],
+        actor_critic=ActorCritic(hidden_dim=HIDDEN),
+        eval_reports=reports,
+    )  # best_metric defaults to win_rate
+    best = history.best_eval()
+    assert best is not None
+    assert best.iteration == 0
+    assert best.report.win_rate == 0.9
+
+
+def test_config_rejects_unknown_best_metric() -> None:
+    """best_metric must name an EvalReport field; an unknown name fails at construction.
+
+    Revert-verify: drop the __post_init__ best_metric guard and this no longer raises
+    - the bad name would instead surface as a getattr AttributeError deep in
+    best_eval / the training loop.
+    """
+    with pytest.raises(ValueError, match="best_metric"):
+        dataclasses.replace(_BASE_CONFIG, best_metric="not_a_field")
+
+
+def test_config_accepts_valid_non_default_best_metric() -> None:
+    """A real EvalReport field name other than the default passes __post_init__."""
+    config = dataclasses.replace(_BASE_CONFIG, best_metric="act1_clear_rate")
+    assert config.best_metric == "act1_clear_rate"
+
+
+def test_best_checkpoint_ranks_on_configured_metric(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In-loop best.pt ranks on config.best_metric, not win_rate.
+
+    Scripts evals whose win_rate and act1_clear_rate maxima fall on DIFFERENT
+    iterations; with best_metric=act1_clear_rate, best.pt must be captured at the
+    clear-rate-max iteration. The checkpoint still records that iteration's win_rate
+    (provenance unchanged); only the ranking metric changed.
+
+    Revert-verify: restore the hardcoded report.win_rate overwrite rule and best.pt
+    lands on the win_rate-max iteration (0), failing the iter-1 assertion.
+    """
+    # (win_rate, act1_clear_rate) per iteration: win_rate peaks at iter 0,
+    # act1_clear_rate peaks at iter 1.
+    metric_seq = [(0.9, 0.1), (0.2, 0.8)]
+    reports = iter(metric_seq)
+
+    def _fake_evaluate(
+        _policy: object, _env: object, seeds: object, **_kwargs: object
+    ) -> EvalReport:
+        win_rate, clear_rate = next(reports)
+        return EvalReport(
+            n_episodes=EVAL_EPISODES,
+            win_rate=win_rate,
+            avg_floor=0.0,
+            avg_hp=0.0,
+            avg_ep_len=1.0,
+            avg_return=win_rate,
+            act1_clear_rate=clear_rate,
+        )
+
+    monkeypatch.setattr(train_module, "evaluate", _fake_evaluate)
+
+    config = _config(
+        num_iterations=len(metric_seq),
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        checkpoint_dir=str(tmp_path),
+        best_metric="act1_clear_rate",
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    best_ckpt = torch.load(tmp_path / train_module.BEST_CHECKPOINT_NAME, weights_only=True)
+    # act1_clear_rate peaks at iter 1, so best.pt is captured there (not iter 0, the
+    # win_rate peak); the recorded win_rate is iter 1's win_rate (0.2), unchanged.
+    assert best_ckpt[train_module.CHECKPOINT_ITERATION_KEY] == 1
+    assert best_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] == 0.2
+
+    best_eval = history.best_eval()
+    assert best_eval is not None
+    assert best_eval.iteration == 1
+    assert best_eval.report.act1_clear_rate == 0.8
+
+
+def test_best_checkpoint_records_ranked_metric_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """best.pt is self-describing about what it was ranked on: it records the ranked
+    metric NAME and its selected VALUE, while last.pt records neither.
+
+    Without this best.pt stored only win_rate, so a best.pt selected on
+    act1_clear_rate looked worse than a non-selected checkpoint by its only recorded
+    metric. The two provenance keys make the ranked value explicit and
+    weights_only-safe (a str + a float). Mirrors
+    test_best_checkpoint_ranks_on_configured_metric's engine-free scenario.
+
+    Revert-verify: drop best_metric/best_metric_value from the best.pt _save_checkpoint
+    call (or the payload-augmentation branch) and the key-present assertions fail; the
+    last.pt key-absent assertions guard against leaking a ranked value onto the
+    final-weights checkpoint.
+    """
+    # act1_clear_rate peaks at iter 1 (0.8); best.pt is captured there and must record
+    # ("act1_clear_rate", 0.8), distinct from that iteration's win_rate (0.2).
+    metric_seq = [(0.9, 0.1), (0.2, 0.8)]
+    reports = iter(metric_seq)
+
+    def _fake_evaluate(
+        _policy: object, _env: object, seeds: object, **_kwargs: object
+    ) -> EvalReport:
+        win_rate, clear_rate = next(reports)
+        return EvalReport(
+            n_episodes=EVAL_EPISODES,
+            win_rate=win_rate,
+            avg_floor=0.0,
+            avg_hp=0.0,
+            avg_ep_len=1.0,
+            avg_return=win_rate,
+            act1_clear_rate=clear_rate,
+        )
+
+    monkeypatch.setattr(train_module, "evaluate", _fake_evaluate)
+
+    config = _config(
+        num_iterations=len(metric_seq),
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        checkpoint_dir=str(tmp_path),
+        best_metric="act1_clear_rate",
+    )
+    train(_bandit_env(), config, eval_env=_bandit_env())
+
+    best_ckpt = torch.load(tmp_path / train_module.BEST_CHECKPOINT_NAME, weights_only=True)
+    # best.pt records the ranked metric name + its selected value (the clear-rate max),
+    # distinct from the provenance win_rate it also still records.
+    assert best_ckpt[train_module.CHECKPOINT_BEST_METRIC_KEY] == "act1_clear_rate"
+    assert best_ckpt[train_module.CHECKPOINT_BEST_METRIC_VALUE_KEY] == 0.8
+    assert best_ckpt[train_module.CHECKPOINT_WIN_RATE_KEY] == 0.2
+
+    # last.pt is the final weights, not a ranked "best", so the provenance keys are
+    # absent - the last.pt call site passes neither.
+    last_ckpt = torch.load(tmp_path / train_module.LAST_CHECKPOINT_NAME, weights_only=True)
+    assert train_module.CHECKPOINT_BEST_METRIC_KEY not in last_ckpt
+    assert train_module.CHECKPOINT_BEST_METRIC_VALUE_KEY not in last_ckpt
+
+
+def test_eval_log_shape_combat_vs_run_mode(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The periodic-eval log line is shape-stable for combat and gains only the ranked
+    metric in run-mode.
+
+    With the default best_metric (win_rate) the eval line keeps the original
+    ``eval iter=... win_rate=...`` shape (no extra metric field appended); with
+    best_metric=act1_clear_rate it additionally carries a trailing
+    ``act1_clear_rate=`` field on the SAME line. Engine-free via the bandit env + a
+    monkeypatched evaluate, mirroring test_best_checkpoint_ranks_on_configured_metric.
+
+    Revert-verify: collapse the two log branches to a single always-append form and
+    the default-mode assertion (no ``act1_clear_rate=``) fails; collapse to the
+    always-combat form and the run-mode assertion fails.
+    """
+
+    def _fake_evaluate(
+        _policy: object, _env: object, seeds: object, **_kwargs: object
+    ) -> EvalReport:
+        return EvalReport(
+            n_episodes=EVAL_EPISODES,
+            win_rate=0.5,
+            avg_floor=0.0,
+            avg_hp=0.0,
+            avg_ep_len=1.0,
+            avg_return=0.5,
+            act1_clear_rate=0.25,
+        )
+
+    monkeypatch.setattr(train_module, "evaluate", _fake_evaluate)
+
+    def _eval_line(best_metric: str) -> str:
+        """Run one eval iteration under best_metric and return its single eval log line."""
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=train_module.__name__):
+            train(
+                _bandit_env(),
+                _config(
+                    num_iterations=1,
+                    eval_every=1,
+                    eval_episodes=EVAL_EPISODES,
+                    best_metric=best_metric,
+                ),
+                eval_env=_bandit_env(),
+            )
+        eval_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == train_module.__name__ and r.getMessage().startswith("eval iter=")
+        ]
+        assert len(eval_lines) == 1
+        return eval_lines[0]
+
+    # Combat/default: the original shape, with win_rate as the final field and no
+    # ranked-metric field appended.
+    default_line = _eval_line(train_module.DEFAULT_BEST_METRIC)
+    assert "win_rate=" in default_line
+    assert "act1_clear_rate=" not in default_line
+    assert default_line.split()[-1].startswith("win_rate=")
+
+    # Run-mode: the ranked progress metric is appended to the SAME line as a trailing
+    # field, while win_rate stays present.
+    run_line = _eval_line("act1_clear_rate")
+    assert "win_rate=" in run_line
+    assert "act1_clear_rate=" in run_line
+    assert run_line.split()[-1].startswith("act1_clear_rate=")
+
+
+def test_config_rejects_int_n_episodes_as_best_metric() -> None:
+    """n_episodes is a real EvalReport field but int (a constant episode count), so the
+    float-only EVAL_METRIC_FIELDS excludes it and ranking on it is rejected.
+
+    Guards the float-only restriction on EVAL_METRIC_FIELDS: were it derived from ALL
+    EvalReport fields, n_episodes would be wrongly accepted as a rankable metric.
+
+    Revert-verify: derive EVAL_METRIC_FIELDS from all fields again (drop the
+    ``f.type == "float"`` filter) and n_episodes is accepted, so this no longer raises.
+    """
+    assert "n_episodes" not in train_module.EVAL_METRIC_FIELDS
+    with pytest.raises(ValueError, match="best_metric"):
+        dataclasses.replace(_BASE_CONFIG, best_metric="n_episodes")
 
 
 # -- Vectorized (num_envs > 1) path ------------------------------------------
