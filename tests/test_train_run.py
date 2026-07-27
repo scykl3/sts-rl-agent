@@ -420,6 +420,87 @@ def test_main_builds_config_with_run_best_metric(monkeypatch: pytest.MonkeyPatch
     assert config.best_metric == train_run.RUN_BEST_METRIC == "act1_clear_rate"
 
 
+def test_arg_parser_warmup_and_early_stop_defaults() -> None:
+    """The parser exposes the warmup + early-stop knobs, all defaulting OFF.
+
+    Locks the opt-in contract: --value-warmup-iters defaults 0, --early-stop-patience
+    defaults None, --early-stop-min-delta defaults 0.0, so the driver's default behavior
+    is unchanged. Built engine-free.
+    """
+    args = train_run.build_arg_parser().parse_args([])
+    assert args.value_warmup_iters == 0
+    assert args.early_stop_patience is None
+    assert args.early_stop_min_delta == 0.0
+
+
+def test_main_wires_warmup_and_early_stop_into_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() flows the warmup + early-stop CLI flags into the TrainConfig.
+
+    Engine-free: train and StsRunEnv are stubbed. Passing non-default values on argv and
+    asserting they reach the config guards the CLI->TrainConfig wire.
+
+    Revert-verify: drop any of the three TrainConfig kwargs in main() and that field
+    falls back to its OFF default, failing the matching assertion.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_train(
+        _env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        captured["config"] = config
+        # A last eval snapshot over the driver's DEFAULT band keeps _final_eval_report on
+        # the reuse path, so the final eval needs neither the engine nor a stubbed evaluate.
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+
+    # Bind main()'s deferred StsRunEnv import to the engine-free stub.
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _StubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_run",
+            "--value-warmup-iters",
+            "3",
+            # early_stop_patience requires eval_every (TrainConfig rejects the no-op
+            # combination), so pass --eval-every alongside the early-stop flags.
+            "--eval-every",
+            "2",
+            "--early-stop-patience",
+            "5",
+            "--early-stop-min-delta",
+            "0.02",
+        ],
+    )
+
+    train_run.main()
+
+    config = cast(TrainConfig, captured["config"])
+    assert config.value_warmup_iters == 3
+    assert config.eval_every == 2
+    assert config.early_stop_patience == 5
+    assert config.early_stop_min_delta == 0.02
+
+
 def test_arg_parser_has_no_encounters_knob() -> None:
     """Run mode has no encounter pool, so --encounters (combat-only) is absent."""
     with pytest.raises(SystemExit):

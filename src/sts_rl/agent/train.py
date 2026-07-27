@@ -29,7 +29,10 @@ runs the original single-env path unchanged.
 
 Opt-in add-ons: ``target_kl`` early-stop (via ``PPOConfig``), learning-rate
 annealing (``anneal_lr``), periodic holdout evaluation (``eval_every`` plus a
-separate ``eval_env``), and best/last checkpointing (``checkpoint_dir``).
+separate ``eval_env``), best/last checkpointing (``checkpoint_dir``), value-head
+warmup (``value_warmup_iters``: freeze the trunk + policy head so the leading
+iterations train only the critic), and plateau early-stop
+(``early_stop_patience`` / ``early_stop_min_delta`` on the ranked eval metric).
 ``explained_variance`` is now logged every iteration (always on, not opt-in).
 Every add-on defaults OFF, so leaving them unset reproduces the prior behavior.
 """
@@ -155,6 +158,21 @@ class TrainConfig:
     # because full-run win_rate is ~0 for a long time, so every eval ties at 0 and
     # best.pt would be degenerate. Validated in __post_init__.
     best_metric: str = DEFAULT_BEST_METRIC
+    # Value-head warmup: for the first value_warmup_iters iterations, freeze the
+    # encoder trunk AND the policy head so only the critic (value head) trains.
+    # This calibrates the value function to full-run returns on the fixed
+    # (warm-started) representation before gradients are allowed to flow into the
+    # shared trunk - a miscalibrated combat value head otherwise corrupts the trunk
+    # early. Default 0 disables it (behavior unchanged); validated in __post_init__.
+    # With anneal_lr, the warmup iterations consume the LR schedule (it is not offset
+    # to the unfreeze), so the trunk unfreezes at the already-reduced learning rate.
+    value_warmup_iters: int = 0
+    # Plateau early-stop on the ranked eval metric (best_metric): stop once
+    # early_stop_patience consecutive POST-warmup evals fail to improve the running
+    # best by more than early_stop_min_delta. Both default OFF (patience None), so an
+    # unset config runs all num_iterations exactly as before. Validated in __post_init__.
+    early_stop_patience: int | None = None
+    early_stop_min_delta: float = 0.0
 
     def __post_init__(self) -> None:
         # Fail at construction on a degenerate budget rather than silently
@@ -190,6 +208,41 @@ class TrainConfig:
             raise ValueError(
                 f"best_metric must be one of {sorted(EVAL_METRIC_FIELDS)}, "
                 f"got {self.best_metric!r}"
+            )
+        # Value-head warmup is a non-negative iteration count (0 disables); a
+        # negative count is meaningless, so reject it at construction.
+        if self.value_warmup_iters < 0:
+            raise ValueError(
+                f"value_warmup_iters must be non-negative, got {self.value_warmup_iters}"
+            )
+        # A warmup spanning the whole run never lifts the freeze: the unfreeze is gated
+        # on iteration == value_warmup_iters, but iteration only reaches
+        # num_iterations - 1, so value_warmup_iters >= num_iterations would silently
+        # train a frozen trunk + policy for every iteration. Require at least one
+        # post-warmup iteration.
+        if self.value_warmup_iters > 0 and self.value_warmup_iters >= self.num_iterations:
+            raise ValueError(
+                f"value_warmup_iters ({self.value_warmup_iters}) must be < "
+                f"num_iterations ({self.num_iterations})"
+            )
+        # Early-stop is opt-in (patience None disables); when set, the patience must
+        # be a positive number of evals and min_delta a non-negative threshold, so
+        # fail at construction like the other knobs.
+        if self.early_stop_patience is not None and self.early_stop_patience <= 0:
+            raise ValueError(
+                f"early_stop_patience must be positive when set, got {self.early_stop_patience}"
+            )
+        # Early-stop acts only inside the periodic-eval branch (it plateaus on eval
+        # metrics), so early_stop_patience without eval_every would be a silent no-op.
+        # Reject it so a requested early stop always has the evals it needs to act on.
+        if self.early_stop_patience is not None and self.eval_every is None:
+            raise ValueError(
+                "early_stop_patience is set but eval_every is None; early stop acts on "
+                "periodic-eval metrics, so eval_every must be set for it to take effect"
+            )
+        if self.early_stop_min_delta < 0.0:
+            raise ValueError(
+                f"early_stop_min_delta must be non-negative, got {self.early_stop_min_delta}"
             )
 
 
@@ -237,7 +290,8 @@ class TrainHistory:
     playthrough) can use the trained network directly without re-threading it.
     ``eval_reports`` holds the periodic-eval snapshots (empty when ``eval_every``
     is unset); :meth:`best_eval` is the highest-``best_metric`` snapshot, mirroring which
-    run produced ``best.pt``.
+    run produced ``best.pt``. ``stopped_early`` is True when plateau early-stop ended the
+    run before ``num_iterations`` (False otherwise, including a normal full run).
     """
 
     records: list[IterationRecord]
@@ -246,6 +300,10 @@ class TrainHistory:
     # The EvalReport field best_eval ranks on; set from TrainConfig.best_metric by
     # train(). Defaulted so a directly-constructed history ranks on win_rate.
     best_metric: str = DEFAULT_BEST_METRIC
+    # True when plateau early-stop broke the loop before num_iterations; set by
+    # train(). Defaulted False so a directly-constructed history (or a normal
+    # full-length run) reads as not-early-stopped.
+    stopped_early: bool = False
 
     def mean_episode_returns(self) -> list[float | None]:
         """Per-iteration mean episode return (``None`` where no episode ended)."""
@@ -294,6 +352,15 @@ def train(
     best-win-rate eval writes ``best.pt`` and the final weights write ``last.pt``
     (state_dicts, saved atomically); a ``checkpoint_dir`` without ``eval_every``
     writes only ``last.pt`` (there are no eval win rates to rank a best).
+
+    ``config.value_warmup_iters`` (default 0, off) freezes the encoder trunk and
+    policy head for that many leading iterations so only the value head trains,
+    calibrating the critic on the fixed (warm-started) representation before
+    gradients reach the shared trunk; the freeze is lifted at the boundary
+    iteration. ``config.early_stop_patience`` (default None, off) stops the loop
+    early once that many consecutive POST-warmup evals fail to improve the ranked
+    ``best_metric`` by more than ``config.early_stop_min_delta``; the post-loop
+    ``last.pt`` write and history return still run, so a stopped run is saved.
 
     ``init_actor_critic`` warm-starts training from a pre-built network (e.g. a
     checkpoint loaded and migrated by
@@ -410,8 +477,39 @@ def train(
     records: list[IterationRecord] = []
     eval_reports: list[EvalRecord] = []
     best_metric_value: float | None = None
+    # Early-stop state (used only when config.early_stop_patience is set): the best
+    # POST-warmup eval metric seen so far and the number of consecutive evals since
+    # that have not improved it by more than early_stop_min_delta. Kept SEPARATE from
+    # best_metric_value (which ranks best.pt over every eval) because early-stop skips
+    # warmup-period evals and applies the min_delta threshold.
+    es_best: float | None = None
+    stale_evals = 0
+    # Records whether plateau early-stop broke the loop before num_iterations;
+    # propagated to the returned TrainHistory. Stays False on a normal full-length run.
+    stopped_early = False
+    # Value-head warmup: freeze the trunk + policy head up front so the first
+    # value_warmup_iters iterations train only the critic (see
+    # _set_trunk_and_policy_requires_grad). warmup_active tracks the frozen state so
+    # the freeze is lifted exactly once at the boundary iteration below. Disabled (no
+    # freeze) when value_warmup_iters == 0, the default.
+    warmup_active = config.value_warmup_iters > 0
+    if warmup_active:
+        _set_trunk_and_policy_requires_grad(actor_critic, requires_grad=False)
+        logger.info(
+            "value-head warmup: freezing trunk + policy for %d iters (critic-only)",
+            config.value_warmup_iters,
+        )
     global_step = 0
     for iteration in range(config.num_iterations):
+        # Lift the warmup freeze exactly at the boundary iteration: from here on
+        # gradients flow into the trunk + policy again, now that the critic has been
+        # calibrated on the fixed representation.
+        if warmup_active and iteration == config.value_warmup_iters:
+            _set_trunk_and_policy_requires_grad(actor_critic, requires_grad=True)
+            warmup_active = False
+            logger.info(
+                "value-head warmup complete at iter %d: unfreezing trunk + policy", iteration
+            )
         # CleanRL linear LR decay: iteration 0 keeps the full learning_rate and
         # the rate decays toward ~0 across the run (the final frac is
         # 1/num_iterations, never exactly 0). Opt-in; constant LR otherwise.
@@ -522,6 +620,33 @@ def train(
                     best_metric_value=metric_value,
                 )
 
+            # Plateau early-stop (opt-in via early_stop_patience). Count only
+            # POST-warmup evals (iteration >= value_warmup_iters): during warmup the
+            # policy is frozen, so its greedy eval metric is flat by construction and
+            # must not count toward the plateau. A new best (by more than min_delta)
+            # resets the stale streak; otherwise it grows, and once it reaches
+            # patience we stop and BREAK - the flat back-half of a converged run is
+            # wasted compute. es_best tracks the SAME metric best.pt ranks on
+            # (config.best_metric), so early-stop and best.pt follow one signal.
+            if config.early_stop_patience is not None and iteration >= config.value_warmup_iters:
+                if es_best is None or metric_value > es_best + config.early_stop_min_delta:
+                    es_best = metric_value
+                    stale_evals = 0
+                else:
+                    stale_evals += 1
+                    if stale_evals >= config.early_stop_patience:
+                        logger.info(
+                            "early stop at iter %d: %s did not improve by more than %g "
+                            "over %d evals (best %.3f)",
+                            iteration,
+                            config.best_metric,
+                            config.early_stop_min_delta,
+                            config.early_stop_patience,
+                            es_best,
+                        )
+                        stopped_early = True
+                        break
+
     # last.pt always captures the final trained weights. Its win_rate is the final
     # iteration's eval win rate when eval ran (the final iteration is always an
     # eval iteration above), else None - the checkpoint_dir-without-eval_every case
@@ -533,7 +658,10 @@ def train(
             LAST_CHECKPOINT_NAME,
             actor_critic,
             hidden_dim=config.hidden_dim,
-            iteration=config.num_iterations - 1,
+            # The live loop variable, not num_iterations - 1: on a normal completion it
+            # equals num_iterations - 1, but after an early-stop break it is the actual
+            # stop iteration (recording num_iterations - 1 there would overstate the run).
+            iteration=iteration,
             global_step=global_step,
             win_rate=last_win_rate,
         )
@@ -543,7 +671,33 @@ def train(
         actor_critic=actor_critic,
         eval_reports=eval_reports,
         best_metric=config.best_metric,
+        stopped_early=stopped_early,
     )
+
+
+def _set_trunk_and_policy_requires_grad(actor_critic: ActorCritic, *, requires_grad: bool) -> None:
+    """Toggle ``requires_grad`` on the encoder trunk and policy head (value head untouched).
+
+    The value-head warmup freezes the trunk + policy head for the first
+    ``value_warmup_iters`` iterations so only the critic trains, calibrating the
+    value function on the fixed (warm-started) representation before gradients reach
+    the shared trunk. Freezing via ``requires_grad`` is sufficient: the single
+    ``Adam(actor_critic.parameters())`` skips any param whose grad stays ``None``
+    (``optimizer.zero_grad`` nulls grads each step and ``backward`` never populates a
+    frozen leaf), and ``clip_grad_norm_`` ignores ``None`` grads too - so no separate
+    optimizer or param-group surgery is needed. Restoring ``requires_grad=True`` lets
+    Adam lazily initialize fresh state for the trunk on its first post-warmup grad.
+
+    This ``requires_grad`` freeze is COMPLETE only because the encoder has no
+    BatchNorm/LayerNorm/Dropout: those layers carry running statistics or eval-mode
+    behavior that keep updating in training mode even with grads off, so a future norm
+    or dropout layer would additionally need ``.eval()`` (a training-mode toggle) to be
+    truly frozen.
+    """
+    for param in actor_critic.encoder.parameters():
+        param.requires_grad = requires_grad
+    for param in actor_critic.policy.parameters():
+        param.requires_grad = requires_grad
 
 
 def _log_iteration(
