@@ -254,6 +254,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="directory for best.pt/last.pt checkpoints (unset disables checkpointing)",
     )
+    parser.add_argument(
+        "--value-warmup-iters",
+        type=int,
+        default=0,
+        help="freeze the trunk + policy head for the first N iterations so only the "
+        "value head trains (0 disables; calibrates the critic before it can corrupt "
+        "the shared trunk)",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=None,
+        help="stop once this many consecutive post-warmup evals fail to improve the "
+        "ranked metric (unset disables early stop)",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=0.0,
+        help="minimum ranked-metric gain that counts as an improvement for early stop; "
+        "the eval metric is noisy (a ~100-episode clear rate has std ~0.03-0.04), so set "
+        "this above roughly one eval-std to avoid noise-driven premature or deferred stops",
+    )
     return parser
 
 
@@ -373,6 +396,11 @@ def main() -> None:
         eval_episodes=args.eval_episodes,
         eval_seed_base=args.eval_base_seed,
         checkpoint_dir=args.checkpoint_dir,
+        # Opt-in warmup + early-stop, passed explicitly at run time; defaults OFF
+        # (warmup 0, patience None) leave the driver's default behavior unchanged.
+        value_warmup_iters=args.value_warmup_iters,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
         # Rank best.pt / best_eval on the Act 1 clear rate, not the default win_rate
         # (full-run win_rate is ~0 for a long time; see RUN_BEST_METRIC).
         best_metric=RUN_BEST_METRIC,

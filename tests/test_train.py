@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import make_stub_vec_env
+from conftest import make_stub_vec_env, sample_observation_batch
 
 import sts_rl.agent.train as train_module
 from sts_rl.agent.actor_critic import ActorCritic
@@ -54,7 +54,7 @@ from sts_rl.agent.train import (
 )
 from sts_rl.env.stub_env import StubEnv
 from sts_rl.eval import EvalReport
-from sts_rl.interface import INTERFACE_VERSION
+from sts_rl.interface import ACTION_DIM, INTERFACE_VERSION
 
 # Small, fast, deterministic settings for the loop under test. HIDDEN is well
 # below the interface default so a run is cheap; it is a training knob, not an
@@ -364,6 +364,11 @@ def test_config_defaults_are_symbolic() -> None:
     # best_metric default ranks on full-run win rate (MUST stay win_rate; run-mode
     # overrides it). Locked to the concrete value, not just the constant.
     assert config.best_metric == train_module.DEFAULT_BEST_METRIC == "win_rate"
+    # Value-head warmup + plateau early-stop default OFF, so an unset config is
+    # behaviour-identical to the pre-feature loop.
+    assert config.value_warmup_iters == 0
+    assert config.early_stop_patience is None
+    assert config.early_stop_min_delta == 0.0
 
 
 def test_anneal_lr_decays_learning_rate() -> None:
@@ -1113,3 +1118,409 @@ def test_vectorized_diagnostics_finite_and_sane() -> None:
         # Single-step bandit envs terminate on every transition, so the pooled
         # episode count equals the total transitions collected this iteration.
         assert record.collect.n_episodes == record.collect.n_steps
+
+
+# -- Value-head warmup + plateau early-stop ----------------------------------
+
+
+def _snapshot(module: torch.nn.Module) -> list[torch.Tensor]:
+    """Detached clones of every parameter, for change-detection across a train() run."""
+    return [p.detach().clone() for p in module.parameters()]
+
+
+def _any_param_changed(before: list[torch.Tensor], module: torch.nn.Module) -> bool:
+    """True if any parameter of ``module`` now differs from its snapshot in ``before``."""
+    return any(not torch.equal(b, p) for b, p in zip(before, module.parameters()))
+
+
+def _scripted_evaluate(metric_seq: list[float]) -> object:
+    """A monkeypatch stand-in for evaluate() returning a scripted win_rate per call.
+
+    The bandit env's win outcome is policy-independent, so it cannot exercise a
+    controlled eval curve; scripting evaluate() drives the early-stop logic
+    deterministically (mirroring the best_metric ranking tests). best_metric defaults
+    to win_rate here, so the scripted value is the ranked metric.
+    """
+    reports = iter(metric_seq)
+
+    def _fake_evaluate(
+        _policy: object, _env: object, seeds: object, **_kwargs: object
+    ) -> EvalReport:
+        win_rate = next(reports)
+        return EvalReport(
+            n_episodes=EVAL_EPISODES,
+            win_rate=win_rate,
+            avg_floor=0.0,
+            avg_hp=0.0,
+            avg_ep_len=1.0,
+            avg_return=win_rate,
+        )
+
+    return _fake_evaluate
+
+
+def test_value_warmup_freezes_trunk_and_policy_then_unfreezes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through the loop: the trunk + policy stay frozen for the whole warmup, then unfreeze.
+
+    warmup=1 < num_iterations=2 respects the guard that a warmup must leave at least one
+    post-warmup iteration (a warmup spanning the whole run is rejected - see
+    test_config_rejects_warmup_ge_num_iterations), so no valid config ends while still
+    frozen. To observe the freeze through the loop, snapshot the params at the boundary
+    unfreeze - train() calls _set_trunk_and_policy_requires_grad(requires_grad=True) once,
+    at the start of iteration value_warmup_iters, after every warmup iteration has run: at
+    that point the trunk + policy must still equal their init (frozen through all of
+    warmup) while the value head has moved (only the critic trained during warmup). After
+    the full run the trunk has moved too, so the boundary unfreeze restored trunk
+    gradients. The per-backward grad freeze itself is locked directly in
+    test_value_warmup_gradients_only_reach_value_head. The injected net makes the params
+    observable (train() asserts its width matches config.hidden_dim, HIDDEN here).
+
+    Revert-verify: drop the warmup freeze and the boundary "still equals init" assertions
+    fail; drop the boundary unfreeze and the post-run "trunk moved" assertion fails.
+    """
+    torch.manual_seed(SEED)
+    net = ActorCritic(hidden_dim=HIDDEN)
+    trunk_init = _snapshot(net.encoder)
+    policy_init = _snapshot(net.policy)
+    value_init = _snapshot(net.value)
+
+    # Capture the params at the boundary unfreeze - the single requires_grad=True toggle
+    # train() makes once every warmup iteration has completed - by spying the helper. The
+    # spy only reads (detach().clone()) and defers to the real toggle, so training is
+    # unchanged.
+    real_toggle = train_module._set_trunk_and_policy_requires_grad
+    at_boundary: dict[str, list[torch.Tensor]] = {}
+
+    def _spy(actor_critic: ActorCritic, *, requires_grad: bool) -> None:
+        if requires_grad:  # the boundary unfreeze, not the pre-loop freeze
+            at_boundary["trunk"] = _snapshot(actor_critic.encoder)
+            at_boundary["policy"] = _snapshot(actor_critic.policy)
+            at_boundary["value"] = _snapshot(actor_critic.value)
+        real_toggle(actor_critic, requires_grad=requires_grad)
+
+    monkeypatch.setattr(train_module, "_set_trunk_and_policy_requires_grad", _spy)
+
+    train(_bandit_env(), _config(num_iterations=2, value_warmup_iters=1), init_actor_critic=net)
+
+    # The unfreeze fired, and at that boundary the trunk + policy still equal their init
+    # (frozen through all of warmup) while the value head has already moved.
+    assert at_boundary  # boundary unfreeze happened
+    assert all(torch.equal(i, b) for i, b in zip(trunk_init, at_boundary["trunk"]))
+    assert all(torch.equal(i, b) for i, b in zip(policy_init, at_boundary["policy"]))
+    assert any(not torch.equal(i, b) for i, b in zip(value_init, at_boundary["value"]))
+    # After the full run the trunk moved: the boundary unfreeze restored trunk gradients.
+    assert _any_param_changed(trunk_init, net.encoder)
+
+
+def test_value_warmup_gradients_only_reach_value_head() -> None:
+    """During warmup only the value head receives gradients; trunk + policy stay grad None.
+
+    Exercises the exact freeze mechanism train() uses
+    (``_set_trunk_and_policy_requires_grad``): after one backward through BOTH heads,
+    every frozen trunk/policy leaf has ``grad is None`` (a frozen leaf never
+    accumulates) while the value head's params do get grads. This is the gradient-flow
+    claim behind the warmup - the single Adam then skips the None-grad params, so only
+    the critic steps, and the PPO update does not error with a frozen policy.
+
+    Revert-verify: drop the freeze call and the trunk/policy params get grads too,
+    failing the ``grad is None`` assertions.
+    """
+    torch.manual_seed(SEED)
+    net = ActorCritic(hidden_dim=HIDDEN)
+    train_module._set_trunk_and_policy_requires_grad(net, requires_grad=False)
+
+    # A legal-prefix mask (True over [0, K)) guarantees a legal action per row, and
+    # action 0 is always legal, so the masked policy head builds a valid distribution.
+    batch = 4
+    legal_prefix = 5
+    obs = sample_observation_batch(batch)
+    mask = torch.zeros(batch, ACTION_DIM, dtype=torch.bool)
+    mask[:, :legal_prefix] = True
+    actions = torch.zeros(batch, dtype=torch.long)
+    log_prob, entropy, value = net.evaluate_actions(obs, mask, actions)
+    # Sum BOTH heads' outputs so a missing value-head grad would surface as a failure;
+    # the frozen policy terms contribute no grad but must not error.
+    (value.sum() + log_prob.sum() + entropy.sum()).backward()
+
+    assert all(p.grad is None for p in net.encoder.parameters())  # trunk frozen
+    assert all(p.grad is None for p in net.policy.parameters())  # policy frozen
+    assert all(p.grad is not None for p in net.value.parameters())  # critic trains
+
+
+def test_early_stop_triggers_on_plateau(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A flat eval metric trips early-stop: the loop BREAKS before num_iterations, yet
+    last.pt is still written (the post-loop code runs).
+
+    evaluate() is scripted to a constant win_rate, so the ranked metric never improves.
+    With patience=2 and eval every iteration, the first eval sets the baseline and the
+    next two are stale, so the loop breaks at iteration 2 (1 baseline + patience stale
+    evals) instead of running all num_iterations. last.pt must still exist afterward -
+    a stopped run is saved - and the stop is logged once.
+
+    Revert-verify: remove the early-stop break and the loop runs all num_iterations, so
+    len(records) == num_iterations and this fails.
+    """
+    num_iterations = 6
+    patience = 2
+    monkeypatch.setattr(train_module, "evaluate", _scripted_evaluate([0.5] * num_iterations))
+
+    config = _config(
+        num_iterations=num_iterations,
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        checkpoint_dir=str(tmp_path),
+        early_stop_patience=patience,
+    )
+    with caplog.at_level(logging.INFO, logger=train_module.__name__):
+        history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    # Broke early: baseline eval + patience stale evals, then stop.
+    assert len(history.records) == 1 + patience
+    assert len(history.records) < num_iterations
+    # Post-loop code still ran despite the break: last.pt is written.
+    assert (tmp_path / train_module.LAST_CHECKPOINT_NAME).exists()
+    # The stop is logged exactly once, with the expected line shape.
+    stop_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == train_module.__name__ and r.getMessage().startswith("early stop at iter")
+    ]
+    assert len(stop_lines) == 1
+
+
+def test_early_stop_records_true_stop_iteration_and_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After an early stop, last.pt records the ACTUAL stop iteration and history is flagged
+    stopped_early - not num_iterations-1, which would overstate how long the run trained.
+
+    A constant scripted metric plateaus, so patience stale evals after the baseline break
+    the loop. The break iteration's IterationRecord is appended before the stop check, so
+    the stop iteration is len(records)-1, strictly below num_iterations-1. last.pt's
+    recorded iteration must equal that stop iteration and history.stopped_early must be True.
+
+    Revert-verify: restore iteration=config.num_iterations-1 in the last.pt write and the
+    recorded-iteration assertion fails (it would read 5, not the stop iteration); drop
+    stopped_early=True on the break and the flag assertion fails.
+    """
+    num_iterations = 6
+    patience = 2
+    monkeypatch.setattr(train_module, "evaluate", _scripted_evaluate([0.5] * num_iterations))
+
+    config = _config(
+        num_iterations=num_iterations,
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        checkpoint_dir=str(tmp_path),
+        early_stop_patience=patience,
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    # The break iteration's record is the last appended, so its index is the stop iteration.
+    stop_iteration = len(history.records) - 1
+    assert stop_iteration < num_iterations - 1  # the run really did stop early
+    assert history.stopped_early is True
+
+    last_ckpt = torch.load(tmp_path / train_module.LAST_CHECKPOINT_NAME, weights_only=True)
+    # last.pt records the true stop iteration, not num_iterations-1.
+    assert last_ckpt[train_module.CHECKPOINT_ITERATION_KEY] == stop_iteration
+    assert last_ckpt[train_module.CHECKPOINT_ITERATION_KEY] != num_iterations - 1
+
+
+def test_full_run_reports_not_stopped_early(standard_history: TrainHistory) -> None:
+    """A run that completes all num_iterations is not flagged stopped_early.
+
+    Guards the default-False path: without an early stop the flag stays False, and (via
+    test_checkpointing_writes_best_and_last) the last.pt iteration is num_iterations-1, so
+    the live-iteration last.pt write is behaviour-identical on the normal path.
+    """
+    assert standard_history.stopped_early is False
+
+
+def test_early_stop_ignored_when_metric_improves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A strictly-improving eval metric never trips early-stop: the loop runs to the end.
+
+    Each eval beats the previous by more than min_delta (0), so the stale streak resets
+    every time and patience is never reached. Guards that early-stop fires only on a
+    real plateau, not on a still-improving run.
+    """
+    num_iterations = 5
+    monkeypatch.setattr(train_module, "evaluate", _scripted_evaluate([0.1, 0.2, 0.3, 0.4, 0.5]))
+
+    config = _config(
+        num_iterations=num_iterations,
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        early_stop_patience=2,
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    assert len(history.records) == num_iterations  # ran to the end, no early stop
+
+
+def test_early_stop_min_delta_counts_small_gains_as_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gains smaller than min_delta do NOT reset the stale streak, so a slowly-creeping
+    metric still trips early-stop.
+
+    With min_delta=0.05 and per-eval gains of 0.01, each eval "improves" numerically but
+    by less than min_delta, so it counts as stale; patience=2 then breaks. Pins that the
+    threshold, not mere monotonic increase, defines an improvement.
+
+    Revert-verify: drop the ``+ early_stop_min_delta`` term and the 0.01 gains count as
+    improvements, so the stale streak never builds and the loop runs to the end.
+    """
+    num_iterations = 6
+    patience = 2
+    monkeypatch.setattr(
+        train_module, "evaluate", _scripted_evaluate([0.50, 0.51, 0.52, 0.53, 0.54, 0.55])
+    )
+
+    config = _config(
+        num_iterations=num_iterations,
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        early_stop_patience=patience,
+        early_stop_min_delta=0.05,
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    assert len(history.records) < num_iterations
+    assert len(history.records) == 1 + patience
+
+
+def test_warmup_evals_excluded_from_early_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warmup-period evals do not count toward the early-stop stale streak.
+
+    During warmup the policy is frozen, so its greedy eval metric is flat by
+    construction; counting those flat evals would trip early-stop spuriously. With
+    value_warmup_iters=3, patience=2, and a metric that is flat through warmup then
+    improves afterward, the loop must NOT stop during warmup and must run to the end.
+
+    Revert-verify: drop the ``iteration >= config.value_warmup_iters`` guard and the
+    flat warmup evals build the stale streak, tripping early-stop before num_iterations.
+    """
+    num_iterations = 6
+    warmup = 3
+    # Flat through warmup (iters 0-2), then strictly improving (iters 3-5).
+    monkeypatch.setattr(
+        train_module, "evaluate", _scripted_evaluate([0.5, 0.5, 0.5, 0.6, 0.7, 0.8])
+    )
+
+    config = _config(
+        num_iterations=num_iterations,
+        eval_every=1,
+        eval_episodes=EVAL_EPISODES,
+        value_warmup_iters=warmup,
+        early_stop_patience=2,
+    )
+    history = train(_bandit_env(), config, eval_env=_bandit_env())
+
+    assert len(history.records) == num_iterations  # warmup evals ignored; post-warmup improves
+
+
+def test_warmup_and_early_stop_defaults_off() -> None:
+    """value_warmup_iters=0 + early_stop_patience=None reproduce the prior loop exactly.
+
+    Explicitly passing the disabled values yields bit-identical trained params to
+    omitting them, so the new knobs default to the prior behaviour (revert-safe).
+    """
+    config_omitted = _config(num_iterations=3)
+    config_explicit = _config(
+        num_iterations=3, value_warmup_iters=0, early_stop_patience=None, early_stop_min_delta=0.0
+    )
+    omitted = train(_bandit_env(), config_omitted)
+    explicit = train(_bandit_env(), config_explicit)
+    assert _param_checksum(omitted.actor_critic) == _param_checksum(explicit.actor_critic)
+
+
+@pytest.mark.parametrize("value", [-1, -5])
+def test_config_rejects_negative_value_warmup(value: int) -> None:
+    """value_warmup_iters must be non-negative; a negative count fails at construction.
+
+    Revert-verify: drop the __post_init__ value_warmup_iters guard and value_warmup_iters=-1
+    constructs without raising.
+    """
+    with pytest.raises(ValueError, match="value_warmup_iters"):
+        dataclasses.replace(_BASE_CONFIG, value_warmup_iters=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, -8])
+def test_config_rejects_non_positive_early_stop_patience(value: int) -> None:
+    """early_stop_patience, when set, must be a positive number of evals; None disables it.
+
+    Revert-verify: drop the __post_init__ patience guard and early_stop_patience=0
+    constructs without raising.
+    """
+    with pytest.raises(ValueError, match="early_stop_patience"):
+        dataclasses.replace(_BASE_CONFIG, early_stop_patience=value)
+
+
+@pytest.mark.parametrize("value", [-0.1, -1.0])
+def test_config_rejects_negative_early_stop_min_delta(value: float) -> None:
+    """early_stop_min_delta must be non-negative (a negative threshold is meaningless).
+
+    Revert-verify: drop the __post_init__ min_delta guard and a negative min_delta
+    constructs without raising.
+    """
+    with pytest.raises(ValueError, match="early_stop_min_delta"):
+        dataclasses.replace(_BASE_CONFIG, early_stop_min_delta=value)
+
+
+def test_config_accepts_valid_warmup_and_early_stop() -> None:
+    """A positive warmup, positive patience, and non-negative min_delta all construct.
+
+    early_stop_patience requires eval_every (early stop acts on periodic-eval metrics), so
+    a valid early-stop config also sets eval_every; value_warmup_iters=2 is well below
+    num_iterations, leaving post-warmup iterations.
+    """
+    config = dataclasses.replace(
+        _BASE_CONFIG,
+        value_warmup_iters=2,
+        eval_every=1,
+        early_stop_patience=3,
+        early_stop_min_delta=0.01,
+    )
+    assert config.value_warmup_iters == 2
+    assert config.early_stop_patience == 3
+    assert config.early_stop_min_delta == 0.01
+
+
+@pytest.mark.parametrize("num_iterations, warmup", [(1, 1), (3, 3), (2, 5)])
+def test_config_rejects_warmup_ge_num_iterations(num_iterations: int, warmup: int) -> None:
+    """value_warmup_iters >= num_iterations never lifts the freeze, so it's rejected.
+
+    The unfreeze is gated on iteration == value_warmup_iters, but the loop's iteration only
+    reaches num_iterations - 1; a warmup spanning the whole run would silently train a
+    frozen trunk + policy for every iteration. __post_init__ requires at least one
+    post-warmup iteration.
+
+    Revert-verify: drop the __post_init__ value_warmup_iters < num_iterations guard and
+    value_warmup_iters == num_iterations constructs without raising, silently training a
+    fully frozen run.
+    """
+    with pytest.raises(ValueError, match="value_warmup_iters"):
+        dataclasses.replace(_BASE_CONFIG, num_iterations=num_iterations, value_warmup_iters=warmup)
+
+
+def test_config_accepts_warmup_one_below_num_iterations() -> None:
+    """value_warmup_iters == num_iterations - 1 (exactly one post-warmup iteration) is the
+    largest valid warmup and must construct."""
+    config = dataclasses.replace(_BASE_CONFIG, num_iterations=4, value_warmup_iters=3)
+    assert config.value_warmup_iters == 3
+
+
+def test_config_rejects_early_stop_patience_without_eval_every() -> None:
+    """early_stop_patience without eval_every is a silent no-op (early stop lives inside the
+    periodic-eval branch), so it's rejected at construction.
+
+    Revert-verify: drop the __post_init__ patience-requires-eval_every guard and setting
+    early_stop_patience with eval_every=None constructs without raising - the early stop
+    would then never run.
+    """
+    # _BASE_CONFIG leaves eval_every None, so a bare patience trips the dependency guard.
+    with pytest.raises(ValueError, match="eval_every"):
+        dataclasses.replace(_BASE_CONFIG, early_stop_patience=3)
