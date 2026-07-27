@@ -92,6 +92,11 @@ DEFAULT_EVAL_EPISODES = 100
 # guaranteed disjoint, so overlap is possible but negligible over a run.
 DEFAULT_SEED = 0
 DEFAULT_EVAL_BASE_SEED = 1_000_000
+# best.pt / TrainHistory.best_eval rank on this EvalReport field instead of the
+# default win_rate: a full-run win_rate is ~0 for a long time (every early eval
+# ties at 0, making best.pt degenerate), whereas the Act 1 clear rate is the
+# informative progress curve this driver trains toward. TrainConfig validates it.
+RUN_BEST_METRIC = "act1_clear_rate"
 
 
 def _validate_num_envs(num_envs: int) -> None:
@@ -368,6 +373,9 @@ def main() -> None:
         eval_episodes=args.eval_episodes,
         eval_seed_base=args.eval_base_seed,
         checkpoint_dir=args.checkpoint_dir,
+        # Rank best.pt / best_eval on the Act 1 clear rate, not the default win_rate
+        # (full-run win_rate is ~0 for a long time; see RUN_BEST_METRIC).
+        best_metric=RUN_BEST_METRIC,
     )
 
     # Train (periodic eval + checkpoints run in-loop when enabled), warm-started
