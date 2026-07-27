@@ -44,11 +44,11 @@ EPISODE_INFO_KEY = "episode"
 EPISODE_RETURN_KEY = "r"
 EPISODE_LENGTH_KEY = "l"
 
-# gc.act is 1-based (Act 1 == 1; the run starts in Act 1, locked by START_ACT in
-# tests/test_run.py). Beating the Act 1 boss advances the run to Act 2 (floor 17),
-# so a terminal act >= ACT2_INDEX means Act 1 was cleared, whether the run then
-# continued, died later, or won the whole run outright. "won" (full-run victory)
-# is a strict subset, so a run-mode clear rate must key on act, not won.
+# gc.act is 1-based (Act 1 == 1) and a full run starts in Act 1. Beating the Act 1
+# boss advances the run to Act 2 (floor 17), so a terminal act >= ACT2_INDEX means
+# Act 1 was cleared, whether the run then continued, died later, or won the whole
+# run outright. "won" (full-run victory) is a strict subset, so a run-mode clear
+# rate must key on act, not won.
 ACT2_INDEX = 2
 
 # Absolute per-episode step ceiling. A well-formed env truncates itself at its

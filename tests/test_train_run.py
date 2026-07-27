@@ -274,7 +274,8 @@ def test_load_warm_start_returns_net_and_trunk_width(tmp_path: Path) -> None:
     payload the driver writes), loads it back through the driver helper, and
     asserts the returned ``hidden_dim`` equals the loaded net's
     ``encoder.output_dim`` and that the net is a real ``ActorCritic`` at that
-    width. Closes the warm-start glue gap without the engine (both
+    width. Covers the checkpoint-to-network load path (load and migrate, then
+    return the net with its derived trunk width) without the engine (both
     ``load_checkpoint`` and ``_save_checkpoint`` are engine-free).
     """
     from sts_rl.agent.train import _save_checkpoint
