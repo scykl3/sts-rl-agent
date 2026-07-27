@@ -89,13 +89,26 @@ def test_final_eval_report_reuses_periodic_eval(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(train_combat, "evaluate", _counting_evaluate)
 
     reused = _make_report(0.5)
-    # Two snapshots so the assertion also pins that the LAST one is taken.
+    # Two snapshots so the assertion also pins that the LAST one is taken. Both
+    # record eval_seed_base=_EVAL_SEED_BASE and (via _make_report) report.n_episodes
+    # =_EVAL_EPISODES, matching the band the call below requests, so the guarded
+    # reuse short-circuit fires.
     history = TrainHistory(
         records=[],
         actor_critic=ActorCritic(),
         eval_reports=[
-            EvalRecord(iteration=0, global_step=128, report=_make_report(0.25)),
-            EvalRecord(iteration=1, global_step=256, report=reused),
+            EvalRecord(
+                iteration=0,
+                global_step=128,
+                eval_seed_base=_EVAL_SEED_BASE,
+                report=_make_report(0.25),
+            ),
+            EvalRecord(
+                iteration=1,
+                global_step=256,
+                eval_seed_base=_EVAL_SEED_BASE,
+                report=reused,
+            ),
         ],
     )
 
@@ -143,6 +156,65 @@ def test_final_eval_report_evaluates_when_no_periodic_eval(
     # and greedily (deterministic=True is passed explicitly, not defaulted).
     assert seen_seeds == make_holdout_seeds(_EVAL_SEED_BASE, _EVAL_EPISODES)
     assert seen_kwargs.get("deterministic") is True
+
+
+@pytest.mark.parametrize(
+    "call_seed_base, call_episodes",
+    [
+        (_EVAL_SEED_BASE + 1, _EVAL_EPISODES),  # seed base differs -> recompute
+        (_EVAL_SEED_BASE, _EVAL_EPISODES + 1),  # episode count differs -> recompute
+    ],
+)
+def test_final_eval_report_recomputes_on_band_mismatch(
+    monkeypatch: pytest.MonkeyPatch, call_seed_base: int, call_episodes: int
+) -> None:
+    """A cached snapshot from a DIFFERENT band is not reused: the helper recomputes.
+
+    The reuse short-circuit fires only when the recorded ``eval_seed_base`` AND the
+    report's ``n_episodes`` both match the requested band; a mismatch on either
+    falls through to a fresh ``evaluate`` over the requested band rather than
+    returning the stale cached report (the contract this guard enforces: a future
+    caller passing a different band gets a fresh recompute rather than the stale
+    holdout number).
+
+    Revert-verify: replace the guarded reuse with an unconditional
+    ``return history.eval_reports[-1].report`` and this fails - the stale cached
+    report is returned and the sentinel ``evaluate`` is called 0 != 1 times.
+    """
+    sentinel = _make_report(0.99)
+    calls = 0
+
+    def _counting_evaluate(*_args: object, **_kwargs: object) -> EvalReport:
+        nonlocal calls
+        calls += 1
+        return sentinel
+
+    monkeypatch.setattr(train_combat, "evaluate", _counting_evaluate)
+
+    # Cached over the KNOWN band (_EVAL_SEED_BASE, and _EVAL_EPISODES via
+    # _make_report); the call below requests a DIFFERENT band, so the guard must
+    # not short-circuit to the cached report.
+    cached = _make_report(0.25)
+    history = TrainHistory(
+        records=[],
+        actor_critic=ActorCritic(),
+        eval_reports=[
+            EvalRecord(
+                iteration=0,
+                global_step=128,
+                eval_seed_base=_EVAL_SEED_BASE,
+                report=cached,
+            )
+        ],
+    )
+
+    result = train_combat._final_eval_report(
+        history, _dummy_eval_env(), call_seed_base, call_episodes
+    )
+
+    assert result is sentinel
+    assert result is not cached
+    assert calls == 1
 
 
 @pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")

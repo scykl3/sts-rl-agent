@@ -260,17 +260,21 @@ def _final_eval_report(
 ) -> EvalReport:
     """Return the final policy's holdout EvalReport for the RESULT line.
 
-    When periodic eval ran, train() already evaluated the final iteration over
-    this same holdout band on this same eval_env, so reuse that record rather
-    than recomputing an identical greedy eval (saves a full holdout pass on the
-    real engine, which for full runs is expensive). Otherwise evaluate the final
-    net here, passing ``deterministic=True`` explicitly so the recompute matches
-    train()'s greedy eval even if evaluate()'s default ever changes. The reused
-    and recomputed bands match because main() passes the same
-    eval_seed_base/eval_episodes into both TrainConfig and this call.
+    When periodic eval ran, train() already evaluated the final iteration over a
+    holdout band on this same eval_env, so reuse that last snapshot rather than
+    recomputing an identical greedy eval (saves a full holdout pass on the real
+    engine, which for full runs is expensive) - but ONLY when it matches the
+    requested band: its recorded ``eval_seed_base`` equals ``eval_seed_base`` and
+    its report's ``n_episodes`` equals ``eval_episodes``. On a mismatch (or when no
+    periodic eval ran), recompute here over
+    ``make_holdout_seeds(eval_seed_base, eval_episodes)``, passing
+    ``deterministic=True`` explicitly so the recompute matches train()'s greedy
+    eval even if evaluate()'s default ever changes.
     """
     if history.eval_reports:
-        return history.eval_reports[-1].report
+        last = history.eval_reports[-1]
+        if last.eval_seed_base == eval_seed_base and last.report.n_episodes == eval_episodes:
+            return last.report
     holdout_seeds = make_holdout_seeds(eval_seed_base, eval_episodes)
     return evaluate(history.actor_critic, eval_env, holdout_seeds, deterministic=True)
 

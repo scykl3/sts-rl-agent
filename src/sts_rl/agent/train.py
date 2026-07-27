@@ -173,7 +173,7 @@ class IterationRecord:
 
 @dataclass(frozen=True)
 class EvalRecord:
-    """One periodic-evaluation snapshot: the step counters plus the full report.
+    """One periodic-evaluation snapshot: the step counters, the seed base, and the report.
 
     Kept out of :class:`IterationRecord` because eval is sparse (every
     ``eval_every`` iterations, not every iteration), so folding the report into
@@ -183,6 +183,10 @@ class EvalRecord:
 
     iteration: int
     global_step: int
+    # The holdout seed base this snapshot was evaluated over. Recorded so a later
+    # consumer can confirm a reused report matches a requested band before trusting
+    # it (report.n_episodes already carries the band's episode count).
+    eval_seed_base: int
     report: EvalReport
 
 
@@ -426,7 +430,12 @@ def train(
                 deterministic=True,
             )
             eval_reports.append(
-                EvalRecord(iteration=iteration, global_step=global_step, report=report)
+                EvalRecord(
+                    iteration=iteration,
+                    global_step=global_step,
+                    eval_seed_base=config.eval_seed_base,
+                    report=report,
+                )
             )
             logger.info(
                 "eval iter=%d global_step=%d win_rate=%.3f",

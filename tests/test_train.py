@@ -506,6 +506,8 @@ def test_periodic_eval_populates_eval_reports(eval_every: int) -> None:
         assert rec.report.n_episodes == EVAL_EPISODES
         # global_step is the single-env running step count at the eval iteration.
         assert rec.global_step == (rec.iteration + 1) * config.n_steps
+        # eval_seed_base is the config's holdout seed base, stamped on each record.
+        assert rec.eval_seed_base == config.eval_seed_base
 
 
 def test_periodic_eval_requires_separate_eval_env() -> None:

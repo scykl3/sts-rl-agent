@@ -16,6 +16,7 @@ Two layers, mirroring ``test_train_combat``:
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 from typing import cast
 
@@ -50,10 +51,17 @@ _EVAL_SEED_BASE = 1_000_000
 _EVAL_EPISODES = 4
 
 
-def _make_report(win_rate: float, act1_clear_rate: float = 0.0) -> EvalReport:
-    """A fully-populated EvalReport with distinguishing win / clear rates."""
+def _make_report(
+    win_rate: float, act1_clear_rate: float = 0.0, n_episodes: int = _EVAL_EPISODES
+) -> EvalReport:
+    """A fully-populated EvalReport with distinguishing win / clear rates.
+
+    ``n_episodes`` defaults to the small ``_EVAL_EPISODES`` band; a caller that must
+    match a driver's default eval band (so the reuse guard short-circuits) passes
+    the driver constant explicitly.
+    """
     return EvalReport(
-        n_episodes=_EVAL_EPISODES,
+        n_episodes=n_episodes,
         win_rate=win_rate,
         avg_floor=1.0,
         avg_hp=10.0,
@@ -69,6 +77,25 @@ def _dummy_eval_env() -> gym.Env:
     return cast(gym.Env, object())
 
 
+class _StubRunEnv:
+    """Engine-free stand-in for ``StsRunEnv``: records its construction kwargs and
+    serves the provenance ``info`` keys ``main()`` reads off the initial reset, so
+    ``main()`` runs the whole warm-start wiring without a native engine build."""
+
+    def __init__(self, *, ascension: int, max_episode_steps: int) -> None:
+        self.ascension = ascension
+        self.max_episode_steps = max_episode_steps
+
+    def reset(
+        self, *, seed: int | None = None, options: object = None
+    ) -> tuple[object, dict[str, object]]:
+        # main() reads engine_commit/interface_version off this initial reset.
+        return None, {"engine_commit": "stub-commit", "interface_version": "stub-iface"}
+
+    def close(self) -> None:
+        pass
+
+
 def test_final_eval_report_reuses_periodic_eval(monkeypatch: pytest.MonkeyPatch) -> None:
     """With periodic eval present, the helper returns the LAST snapshot's report
     and does NOT recompute: the monkeypatched evaluate must be called 0 times."""
@@ -82,12 +109,25 @@ def test_final_eval_report_reuses_periodic_eval(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(train_run, "evaluate", _counting_evaluate)
 
     reused = _make_report(0.5, act1_clear_rate=0.8)
+    # Both records carry eval_seed_base=_EVAL_SEED_BASE and (via _make_report)
+    # report.n_episodes=_EVAL_EPISODES, matching the band the call below requests,
+    # so the guarded reuse short-circuit fires and no recompute happens.
     history = TrainHistory(
         records=[],
         actor_critic=ActorCritic(),
         eval_reports=[
-            EvalRecord(iteration=0, global_step=128, report=_make_report(0.25)),
-            EvalRecord(iteration=1, global_step=256, report=reused),
+            EvalRecord(
+                iteration=0,
+                global_step=128,
+                eval_seed_base=_EVAL_SEED_BASE,
+                report=_make_report(0.25),
+            ),
+            EvalRecord(
+                iteration=1,
+                global_step=256,
+                eval_seed_base=_EVAL_SEED_BASE,
+                report=reused,
+            ),
         ],
     )
 
@@ -130,6 +170,63 @@ def test_final_eval_report_evaluates_when_no_periodic_eval(
     assert calls == 1
     assert seen_seeds == make_holdout_seeds(_EVAL_SEED_BASE, _EVAL_EPISODES)
     assert seen_kwargs.get("deterministic") is True
+
+
+@pytest.mark.parametrize(
+    "call_seed_base, call_episodes",
+    [
+        (_EVAL_SEED_BASE + 1, _EVAL_EPISODES),  # seed base differs -> recompute
+        (_EVAL_SEED_BASE, _EVAL_EPISODES + 1),  # episode count differs -> recompute
+    ],
+)
+def test_final_eval_report_recomputes_on_band_mismatch(
+    monkeypatch: pytest.MonkeyPatch, call_seed_base: int, call_episodes: int
+) -> None:
+    """A cached snapshot from a DIFFERENT band is not reused: the helper recomputes.
+
+    The reuse short-circuit fires only when the recorded ``eval_seed_base`` AND the
+    report's ``n_episodes`` both match the requested band; a mismatch on either
+    falls through to a fresh ``evaluate`` over the requested band rather than
+    returning the stale cached report (the contract this guard enforces: a future
+    caller passing a different band gets a fresh recompute rather than the stale
+    holdout number).
+
+    Revert-verify: replace the guarded reuse with an unconditional
+    ``return history.eval_reports[-1].report`` and this fails - the stale cached
+    report is returned and the sentinel ``evaluate`` is called 0 != 1 times.
+    """
+    sentinel = _make_report(0.99, act1_clear_rate=0.99)
+    calls = 0
+
+    def _counting_evaluate(*_args: object, **_kwargs: object) -> EvalReport:
+        nonlocal calls
+        calls += 1
+        return sentinel
+
+    monkeypatch.setattr(train_run, "evaluate", _counting_evaluate)
+
+    # Cached over the KNOWN band (_EVAL_SEED_BASE, and _EVAL_EPISODES via
+    # _make_report); the call below requests a DIFFERENT band, so the guard must
+    # not short-circuit to the cached report.
+    cached = _make_report(0.25, act1_clear_rate=0.1)
+    history = TrainHistory(
+        records=[],
+        actor_critic=ActorCritic(),
+        eval_reports=[
+            EvalRecord(
+                iteration=0,
+                global_step=128,
+                eval_seed_base=_EVAL_SEED_BASE,
+                report=cached,
+            )
+        ],
+    )
+
+    result = train_run._final_eval_report(history, _dummy_eval_env(), call_seed_base, call_episodes)
+
+    assert result is sentinel
+    assert result is not cached
+    assert calls == 1
 
 
 def test_validate_num_envs_accepts_single_env() -> None:
@@ -197,6 +294,79 @@ def test_load_warm_start_returns_net_and_trunk_width(tmp_path: Path) -> None:
     loaded, hidden_dim = train_run._load_warm_start(str(tmp_path / "warm.pt"))
     assert isinstance(loaded, ActorCritic)
     assert hidden_dim == loaded.encoder.output_dim == hidden
+
+
+def test_main_wires_warm_start_net_and_derived_width_into_train(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """main() hands the loaded warm-start net AND its derived width to train().
+
+    Engine-free integration test of the wiring the helper-level tests do not
+    cover: main() must pass the SAME ActorCritic that _load_warm_start produced to
+    train() as init_actor_critic, and the trunk width it derives from that
+    checkpoint (net.encoder.output_dim, which overrides --hidden-dim) must reach
+    train() as config.hidden_dim. StsRunEnv (the engine env), load_checkpoint, and
+    train are all stubbed, so it runs without a native build.
+    """
+    # Warm-start net at a NON-DEFAULT trunk width, so asserting the DERIVED width
+    # (not the --hidden-dim default of HIDDEN_DIM) reaches train() is sharp.
+    warm_width = 32
+    assert warm_width != train_run.HIDDEN_DIM  # else the width-override path is untested
+    warm_net = ActorCritic(hidden_dim=warm_width)
+    # Grab the trunk width now: the identity assert below (`is warm_net`) narrows
+    # warm_net's static type, so read encoder.output_dim before it.
+    warm_trunk_width = warm_net.encoder.output_dim
+
+    # Stub load_checkpoint to hand back our net; the REAL _load_warm_start then
+    # derives the width from net.encoder.output_dim, so main()'s actual
+    # width-derivation path is exercised, not a stubbed shortcut.
+    monkeypatch.setattr(train_run, "load_checkpoint", lambda _path: warm_net)
+
+    captured: dict[str, object] = {}
+
+    def _fake_train(
+        _env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        captured["config"] = config
+        captured["init_actor_critic"] = init_actor_critic
+        # A last eval snapshot recorded over the driver's DEFAULT band (base seed +
+        # episode count, which main() passes _final_eval_report when only
+        # --warm-start is given) keeps it on the reuse path, so the final eval needs
+        # neither the engine nor a stubbed evaluate.
+        return TrainHistory(
+            records=[],
+            actor_critic=init_actor_critic if init_actor_critic is not None else ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+
+    # Bind main()'s deferred `from sts_rl.env.run_adapter import StsRunEnv` to the
+    # engine-free stub by injecting a fake module, so no native engine is imported.
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _StubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+
+    monkeypatch.setattr(sys, "argv", ["train_run", "--warm-start", "/tmp/warm.pt"])
+
+    train_run.main()
+
+    # (a) the loaded net is handed to train() unchanged (SAME object), and (b) the
+    # width derived from that checkpoint reaches train() as config.hidden_dim.
+    assert captured["init_actor_critic"] is warm_net
+    config = cast(TrainConfig, captured["config"])
+    assert config.hidden_dim == warm_trunk_width == warm_width
 
 
 def test_arg_parser_has_no_encounters_knob() -> None:
