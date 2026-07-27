@@ -25,12 +25,12 @@ from sts_rl.agent.checkpoint_migration import (
     POLICY_LOGITS_BIAS_KEY,
     POLICY_LOGITS_WEIGHT_KEY,
     TRUNK_INPUT_WEIGHT_KEY,
+    _KNOWN_PRIOR_FEATURE_DIMS,
     _version_tuple,
     load_checkpoint,
     migrate_encoder_trunk_width,
     migrate_policy_head,
 )
-from sts_rl.agent.encoder import CARD_EMBED_DIM
 from sts_rl.agent.train import (
     CHECKPOINT_HIDDEN_DIM_KEY,
     CHECKPOINT_INTERFACE_VERSION_KEY,
@@ -40,7 +40,6 @@ from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     ACTION_DIM,
     INTERFACE_VERSION,
-    MAX_REWARD_CARD_SLOTS,
     InterfaceError,
 )
 
@@ -61,9 +60,14 @@ _BLOCK_CODE_STRIDE = 1000
 # CARD_REWARD_SELECT is a different block (name, width, semantics), not its source.
 NEW_ONLY_BLOCKS = ("REWARD_SELECT", "TREASURE_SELECT")
 
-# Width of the encoder's appended card-vision block, derived symbolically so the
-# trunk-width round-trip tracks the interface rather than a hardcoded literal.
-REWARD_BLOCK_WIDTH = MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
+# The recorded prior trunk widths the widen guard accepts (the narrower is the
+# pre-reward-vision combat width; the wider is the card-vision width). The widen
+# tests below pin old_feat to one of these so they track _KNOWN_PRIOR_FEATURE_DIMS
+# rather than a synthetic ``target - <block widths>`` width, which each later block
+# append pushes out of the guard's accepted set (the offered-relic/potion append and
+# then the card-select append both did that to the old ``target - <block>`` forms).
+PRE_REWARD_FEATURE_DIM = min(_KNOWN_PRIOR_FEATURE_DIMS)  # combat / pre-reward-vision
+CARD_VISION_FEATURE_DIM = max(_KNOWN_PRIOR_FEATURE_DIMS)  # after the reward-card block
 
 
 def _seed_old_head(hidden: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -493,7 +497,7 @@ def test_trunk_width_migration_preserves_prefix_and_zeros_suffix() -> None:
     zero - the append-at-end coupling with the encoder.
     """
     target = _current_feature_dim()
-    old_feat = target - REWARD_BLOCK_WIDTH  # the pre-card-vision input width
+    old_feat = PRE_REWARD_FEATURE_DIM  # a recorded prior width the widen guard accepts
     assert old_feat < target  # guard the premise: the encoder actually widened
 
     state = _build_current_state_dict()
@@ -522,6 +526,16 @@ def test_migrate_trunk_equal_width_is_noop() -> None:
     assert migrated[TRUNK_INPUT_WEIGHT_KEY] is state[TRUNK_INPUT_WEIGHT_KEY]
 
 
+def test_current_feature_dim_not_recorded_as_prior_width() -> None:
+    """The live feature dim must NOT be in _KNOWN_PRIOR_FEATURE_DIMS.
+
+    Recorded priors are strictly PRE-APPEND widths; the current width is reached via
+    the equal-width no-op path above, never the widen path. Listing it would let a
+    genuinely-current checkpoint be mistaken for a prior to widen from.
+    """
+    assert _current_feature_dim() not in _KNOWN_PRIOR_FEATURE_DIMS
+
+
 def test_migrate_trunk_output_is_isolated_copy() -> None:
     """After a widen, mutating a carried-through tensor leaves the input unchanged.
 
@@ -531,7 +545,7 @@ def test_migrate_trunk_output_is_isolated_copy() -> None:
     head migration's isolation test.
     """
     target = _current_feature_dim()
-    old_feat = target - REWARD_BLOCK_WIDTH
+    old_feat = PRE_REWARD_FEATURE_DIM  # a recorded prior width the widen guard accepts
     state = _build_current_state_dict()
     narrow = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
     state[TRUNK_INPUT_WEIGHT_KEY] = narrow
@@ -574,16 +588,62 @@ def test_migrate_trunk_rejects_shrink() -> None:
         migrate_encoder_trunk_width(state, target)
 
 
+def test_migrate_trunk_rejects_unknown_prior_width() -> None:
+    """A narrower width not in the recorded prior history is rejected as a mismap.
+
+    The widen path treats the trained columns as a clean leading prefix, which is
+    correct ONLY for a real prior layout (new features appended at the END). A
+    width from no recorded layout - e.g. a block widened or inserted BEFORE the
+    reward block - would mismap columns, so the guard raises rather than silently
+    corrupting the warm-started weights, mirroring the policy head's
+    _OLD_ACTION_DIM check. This is the revert guard: dropping the width check lets
+    this widen succeed silently.
+    """
+    target = _current_feature_dim()
+    # One wider than the narrowest recorded prior: guaranteed to match no recorded
+    # layout, yet narrower than the target, so it reaches the widen path.
+    bad_feat = min(_KNOWN_PRIOR_FEATURE_DIMS) + 1
+    assert bad_feat < target  # narrower than target: reaches the widen path
+    assert bad_feat not in _KNOWN_PRIOR_FEATURE_DIMS  # but not a recorded prior
+    state = _build_current_state_dict()
+    state[TRUNK_INPUT_WEIGHT_KEY] = torch.zeros(HIDDEN, bad_feat)
+    with pytest.raises(InterfaceError, match="not a known prior width"):
+        migrate_encoder_trunk_width(state, target)
+
+
+@pytest.mark.parametrize("known_feat", _KNOWN_PRIOR_FEATURE_DIMS)
+def test_migrate_trunk_accepts_known_prior_widths(known_feat: int) -> None:
+    """Every recorded prior width still widens cleanly: prefix preserved, suffix zero.
+
+    The guard rejects only UNRECORDED narrower widths; each width in
+    _KNOWN_PRIOR_FEATURE_DIMS is a real prior layout and must migrate exactly as
+    before, loading strict into a fresh net.
+    """
+    target = _current_feature_dim()
+    assert known_feat < target  # each recorded prior is narrower than the current
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * known_feat, dtype=torch.float32).reshape(HIDDEN, known_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+    migrated = migrate_encoder_trunk_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :known_feat], old_weight)  # prefix preserved
+    assert torch.count_nonzero(new_weight[:, known_feat:]) == 0  # suffix zeroed
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
 def test_load_checkpoint_widens_narrow_trunk(tmp_path) -> None:
-    """A warm-start checkpoint with the pre-card-vision (narrower) trunk widens on load.
+    """A warm-start checkpoint with the pre-reward-vision (narrower) trunk widens on load.
 
     The end-to-end deliverable: an existing current-layout checkpoint whose
-    encoder predates the reward block loads into the now-wider trunk via
-    load_checkpoint, its trained columns preserved and the appended card-vision
+    encoder predates every reward block loads into the now-wider trunk via
+    load_checkpoint, its trained columns preserved and the appended reward-vision
     columns zero-initialized (so combat competence starts unperturbed).
     """
     target = _current_feature_dim()
-    old_feat = target - REWARD_BLOCK_WIDTH
+    old_feat = PRE_REWARD_FEATURE_DIM  # a recorded prior width the widen guard accepts
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
     state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
@@ -597,20 +657,47 @@ def test_load_checkpoint_widens_narrow_trunk(tmp_path) -> None:
     assert torch.count_nonzero(loaded[:, old_feat:]) == 0
 
 
+def test_load_checkpoint_widens_trunk_from_card_vision_prior(tmp_path) -> None:
+    """A card-vision (recorded-prior) checkpoint widens its trunk on load.
+
+    A current-layout checkpoint whose encoder is at the card-vision width (has the
+    reward-card block but none of the later appended blocks) loads into the
+    now-wider trunk: its trained columns are preserved as the leading prefix and
+    every appended column (offered relic, offered potion, and card-select) is
+    zero-initialized. Pinned to a recorded prior so the widen guard accepts it.
+    """
+    target = _current_feature_dim()
+    old_feat = CARD_VISION_FEATURE_DIM  # a recorded prior width the widen guard accepts
+    assert old_feat < target  # guard the premise: the encoder actually widened
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+    path = tmp_path / "warm_card_vision.pt"
+    _write_checkpoint(path, state, INTERFACE_VERSION, HIDDEN)
+
+    model = load_checkpoint(path)
+    loaded = model.encoder.trunk[0].weight.detach()
+    assert loaded.shape == (HIDDEN, target)
+    assert torch.equal(loaded[:, :old_feat], old_weight)
+    assert torch.count_nonzero(loaded[:, old_feat:]) == 0
+
+
 def test_load_checkpoint_composes_head_remap_and_trunk_widen(tmp_path) -> None:
     """One checkpoint needing BOTH migrations: old-layout head AND a narrow trunk.
 
     The real warm-start scenario - a 0.3.0-layout checkpoint whose encoder also
-    predates the reward block. load_checkpoint must compose the name-aware head
-    remap with the trunk widening on the single payload: CONFIRM_SELECT lands at
-    its live offset, and the trunk widens with its sentinel prefix preserved and
-    the appended suffix zero.
+    predates every appended reward block (cards, relics, potions, and card-select).
+    load_checkpoint must compose the name-aware head remap with the trunk widening
+    on the single payload: CONFIRM_SELECT lands at its live offset, and the trunk
+    widens with its sentinel prefix preserved and the appended suffix zero.
     """
     old_state = _build_old_state_dict()
     old_head_weight = old_state[POLICY_LOGITS_WEIGHT_KEY]
 
     target = _current_feature_dim()
-    old_feat = target - REWARD_BLOCK_WIDTH  # pre-card-vision input width
+    # A 0.3.0-era encoder predates ALL appended vision, so its trunk is the
+    # combat-only recorded prior (before cards, relics, potions, and card-select).
+    old_feat = PRE_REWARD_FEATURE_DIM
     assert old_feat < target  # guard the premise: the encoder actually widened
     old_trunk = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
     old_state[TRUNK_INPUT_WEIGHT_KEY] = old_trunk

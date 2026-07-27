@@ -33,6 +33,7 @@ import numpy as np
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
+    CHOICE_MAX,
     HAND_MAX,
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
@@ -83,10 +84,28 @@ _CARD_TYPE_POWER = int(sts.CardType.POWER)
 _POTION_EMPTY = sts.Potion.EMPTY_POTION_SLOT
 _POTION_INVALID = sts.Potion.INVALID
 
+# Empty-slot marker for reward_relic_ids. Unlike cards / potions, RelicId 0 (AKABEKO)
+# is a real relic, so PAD 0 cannot mark "empty" here; the relic INVALID id does. It
+# equals N_RELIC_IDS (one past the last real relic) -- the field's id_high and the
+# column the encoder drops -- so assert that coupling holds (raise, not bare assert, so
+# it survives -O), mirroring the map_context layout guard below.
+_RELIC_INVALID = int(sts.RelicId.INVALID)
+if _RELIC_INVALID != N_RELIC_IDS:
+    raise AssertionError(
+        f"relic empty-slot sentinel RelicId.INVALID ({_RELIC_INVALID}) must equal "
+        f"N_RELIC_IDS ({N_RELIC_IDS}); reward_relic_ids id_high and the encoder's "
+        "dropped INVALID column both depend on it"
+    )
+
 # The combat/elite/chest REWARDS screen: the only screen whose rewardsContainer
 # holds the live offered rewards (openCombatRewardScreen sets both together). The
 # separate BOSS_RELIC_REWARDS screen is covered by its own action block, not here.
 _SCREEN_REWARDS = int(sts.ScreenState.REWARDS)
+
+# The deck-wide / pile card-select screen (event removes and transforms, large pile
+# searches). Its screen_state_info.to_select_cards holds the offered candidates,
+# order-aligned with the CARD_SELECT action block; PAD on every other screen.
+_SCREEN_CARD_SELECT = int(sts.ScreenState.CARD_SELECT)
 
 # --- map_context layout (run mode) -----------------------------------------
 # The act map is a grid MAP_COLS wide and MAP_ROWS tall (verified against the
@@ -127,8 +146,18 @@ _COMBAT_ROOMS = (_ROOM_MONSTER, _ROOM_ELITE, _ROOM_BOSS)
 
 
 def _empty_obs() -> Obs:
-    """Zero-filled observation with every field's interface dtype and shape."""
-    return {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
+    """Empty observation with every field's interface dtype and shape.
+
+    Fields are zero-filled (PAD_ID 0 for id fields, 0.0 for real / unit), EXCEPT
+    reward_relic_ids, which is seeded with the relic INVALID sentinel: RelicId 0
+    (AKABEKO) is a real relic, so an all-zero relic-offer field would read as "AKABEKO
+    offered in every slot". INVALID marks "no relic here" -- an empty offer, and every
+    non-reward / combat state where the field is left untouched -- which the encoder
+    maps to a zero contribution.
+    """
+    obs: Obs = {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
+    obs["reward_relic_ids"].fill(_RELIC_INVALID)
+    return obs
 
 
 def _read_status(player: Any, status: Any) -> float:
@@ -161,6 +190,7 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
         _fill_run_scalars(obs, gc)
         _fill_map_context(obs, gc)
         _fill_reward_ids(obs, gc)
+        _fill_card_select_ids(obs, gc)
         return obs
 
     player = bc.player
@@ -385,9 +415,12 @@ def _fill_reward_ids(obs: Obs, gc: Any) -> None:
         for j in range(min(len(group), MAX_REWARD_CARDS_PER_GROUP)):
             card_ids[base + j] = int(group[j].id)
 
-    # Relics: guard the INVALID sentinel (RelicId.INVALID == N_RELIC_IDS, one past
-    # the relic table) out of range so an empty slot never overflows the id field;
-    # write per-index so a guarded slot stays PAD without shifting the rest.
+    # Relics: RelicId 0 (AKABEKO) is a REAL relic, so an empty slot is the relic INVALID
+    # sentinel (RelicId.INVALID == N_RELIC_IDS, a legal value of this field per its
+    # id_high), NOT PAD 0 the way cards / potions mark empty. _empty_obs seeded every
+    # slot with that sentinel, so write only real offered relics (0..N_RELIC_IDS-1,
+    # AKABEKO included) as their id; an unoffered or out-of-range slot stays INVALID
+    # (empty), which the encoder drops so it contributes nothing.
     relic_ids = obs["reward_relic_ids"]
     relics = rewards.relics
     for i in range(min(len(relics), MAX_REWARD_RELICS)):
@@ -404,6 +437,34 @@ def _fill_reward_ids(obs: Obs, gc: Any) -> None:
         if potion == _POTION_EMPTY or potion == _POTION_INVALID:
             continue
         potion_ids[i] = int(potion)
+
+
+def _fill_card_select_ids(obs: Obs, gc: Any) -> None:
+    """Fill ``card_select_ids`` from the live CARD_SELECT screen, slot-aligned with
+    the ``CARD_SELECT`` action block.
+
+    Only the deck-wide / pile card-select screen (event removes and transforms,
+    large pile searches) carries a live ``to_select_cards`` candidate list; on every
+    other screen this field stays PAD (0), so the guard makes it meaningful exactly
+    when the ``CARD_SELECT`` block is legal. The binding preserves candidate order,
+    so ``to_select_cards[i]`` is the card the overworld ``CARD_SELECT`` action at
+    index ``i`` picks (see :mod:`sts_rl.env.run_actions`); candidates past
+    ``CHOICE_MAX`` are truncated to the field width.
+
+    This is the overworld (``GameContext``) card-select path: a combat
+    (``BattleContext``) card-select exposes only its selected bitmask, not its
+    candidate list, so a combat card-select leaves this field PAD.
+
+    Candidate ids are written directly (like ``hand_ids`` / ``reward_card_ids``):
+    they are real deck cards, and startup enum validation guarantees each fits its
+    embedding table.
+    """
+    if int(gc.screen_state) != _SCREEN_CARD_SELECT:
+        return
+    card_select_ids = obs["card_select_ids"]
+    candidates = gc.screen_state_info.to_select_cards
+    for i in range(min(len(candidates), CHOICE_MAX)):
+        card_select_ids[i] = int(candidates[i].id)
 
 
 def _fill_pile_ids(out: np.ndarray, pile: Any) -> None:

@@ -69,6 +69,21 @@ POLICY_LOGITS_BIAS_KEY: str = "policy.logits.bias"
 # migration rebuilds; every other key is copied through unchanged.
 TRUNK_INPUT_WEIGHT_KEY: str = "encoder.trunk.0.weight"
 
+# Known prior trunk input widths (the ``feature_dim`` of ``encoder.trunk.0.weight``)
+# of checkpoints that predate later-appended observation blocks. Like the policy
+# head's ``_OLD_ACTION_DIM``, this is FIXED HISTORY - a checkpoint does not record
+# its own encoder input width, so the widen migration validates the checkpoint's
+# width against this recorded set before treating its columns as a clean leading
+# prefix:
+#   1349 - combat / pre-reward-vision width (before any offered-item reward block)
+#   1605 - card-vision width (after the reward_card block; 1349 -> 1605, before the
+#          offered-relic and offered-potion blocks)
+# When a new feature block is appended at the END of the concat, add the PRE-APPEND
+# width here deliberately (the current width, just before the append) so an older
+# checkpoint of that width still migrates and any other narrower width is rejected
+# as a column mismap.
+_KNOWN_PRIOR_FEATURE_DIMS: tuple[int, ...] = (1349, 1605)
+
 # Historical action-block layouts, as ordered ``(name, count)`` specs copied
 # verbatim from each version's ``interface.py`` in git. Counts (not offsets) are
 # recorded; the contiguous ``{name: (start, count)}`` table is derived below with
@@ -284,9 +299,11 @@ def migrate_encoder_trunk_width(
     (shared storage), so an already-current checkpoint loads verbatim.
 
     Raises :class:`~sts_rl.interface.InterfaceError` if the trunk weight is absent
-    (not an ``ActorCritic`` checkpoint), if it is not 2-D, or if its width exceeds
+    (not an ``ActorCritic`` checkpoint), if it is not 2-D, if its width exceeds
     ``target_feature_dim`` (shrinking the trunk input is unsupported - it would
-    drop trained columns).
+    drop trained columns), or if a narrower width is not one of
+    :data:`_KNOWN_PRIOR_FEATURE_DIMS` (an unrecorded layout whose columns would
+    mismap under the append-at-end prefix-copy).
     """
     if TRUNK_INPUT_WEIGHT_KEY not in state_dict:
         raise InterfaceError(
@@ -314,8 +331,22 @@ def migrate_encoder_trunk_width(
             f"{target_feature_dim}; cannot shrink the trunk input"
         )
 
-    # old_feat < target: widen. Copy trained columns to the leading prefix and
-    # leave the appended suffix zero. new_zeros preserves dtype and device.
+    # old_feat < target: widen. The prefix-copy is a valid remap ONLY when the
+    # checkpoint's width is a real prior layout whose new features were all
+    # appended at the END of the concat; a width from any other layout (a block
+    # widened or inserted BEFORE the reward block) would mismap columns. Mirroring
+    # the policy head's _OLD_ACTION_DIM guard, reject a width not in the recorded
+    # history rather than silently corrupting the warm-started combat weights.
+    if old_feat not in _KNOWN_PRIOR_FEATURE_DIMS:
+        raise InterfaceError(
+            f"checkpoint encoder feature width {old_feat} is not a known prior "
+            f"width {_KNOWN_PRIOR_FEATURE_DIMS}; a narrower width from an unrecorded "
+            f"layout would mismap trunk columns (the prefix-copy widen is safe only "
+            f"when new features were appended at the END of the concat)"
+        )
+
+    # Copy trained columns to the leading prefix and leave the appended suffix
+    # zero. new_zeros preserves dtype and device.
     logger.info(
         "encoder trunk-width migration widens first-trunk input %d -> %d, "
         "zero-initializing %d appended suffix column(s)",
@@ -323,8 +354,10 @@ def migrate_encoder_trunk_width(
         target_feature_dim,
         target_feature_dim - old_feat,
     )
-    # CAUTION: prefix-copy correctness assumes the encoder appends new features at
-    # the END of the concat; a mid-concat insertion would silently mismap columns.
+    # CAUTION: the prefix-copy is correct only because the encoder appends new
+    # features at the END of the concat; a mid-concat change would mismap columns.
+    # This invariant is now ENFORCED by the _KNOWN_PRIOR_FEATURE_DIMS guard above
+    # (an unrecorded width raises), not merely documented here.
     new_weight = old_weight.new_zeros((hidden, target_feature_dim))
     new_weight[:, :old_feat] = old_weight
 

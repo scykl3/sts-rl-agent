@@ -22,6 +22,13 @@ to the hand/enemy slot order, so do NOT reorder):
                  + screen_onehot + map_context
     reward block MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM   (offered card-reward
                  slots; slot order fixed - REWARD_SELECT action layout maps to it)
+    reward relic N_RELIC_IDS   (offered relics as an order-agnostic multihot,
+                 mirroring the owned-relic multihot; no relic embedding table)
+    reward potion MAX_REWARD_POTIONS * POTION_EMBED_DIM   (offered potions,
+                 embedded per slot; reuses potion_embed)
+    card select  CHOICE_MAX * CARD_EMBED_DIM   (candidate cards on the current
+                 card-select screen, embedded per slot; slot order fixed - the
+                 CARD_SELECT action layout maps to it; reuses card_embed)
 """
 
 from __future__ import annotations
@@ -30,12 +37,14 @@ import torch
 from torch import Tensor, nn
 
 from sts_rl.interface import (
+    CHOICE_MAX,
     ENEMY_SCALAR_DIM,
     HAND_FEAT_DIM,
     HAND_MAX,
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
     MAX_REWARD_CARD_SLOTS,
+    MAX_REWARD_POTIONS,
     N_CARD_IDS,
     N_MONSTER_IDS,
     N_MONSTER_MOVE_IDS,
@@ -121,7 +130,24 @@ class ObsFeatureEncoder(nn.Module):
         )
         # Offered reward-screen cards, embedded per slot (reuses card_embed).
         reward = MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
-        return hand + enemy + piles + potion + passthrough + reward
+        # Offered relics as a multihot over the relic id space (no relic embedding
+        # table); offered potions embedded per slot (reuses potion_embed).
+        reward_relic = N_RELIC_IDS
+        reward_potion = MAX_REWARD_POTIONS * POTION_EMBED_DIM
+        # Candidate cards on the current card-select screen, embedded per slot
+        # (reuses card_embed); appended LAST, after the reward blocks.
+        card_select = CHOICE_MAX * CARD_EMBED_DIM
+        return (
+            hand
+            + enemy
+            + piles
+            + potion
+            + passthrough
+            + reward
+            + reward_relic
+            + reward_potion
+            + card_select
+        )
 
     def _pool_pile(self, pile_ids: Tensor) -> Tensor:
         """Mean+max pool a pile's card embeddings over the pile (slot) dim.
@@ -202,14 +228,62 @@ class ObsFeatureEncoder(nn.Module):
             dim=1,
         )
 
-        # REWARD: per-slot offered-card embedding, flattened. Slot order is fixed
-        # (the REWARD_SELECT action layout maps to it, like hand); reuses
-        # card_embed, so PAD_ID slots contribute a zero vector. Appended LAST so
-        # the checkpoint migration widens the trunk by a clean zero-init suffix.
+        # REWARD CARDS: per-slot offered-card embedding, flattened. Slot order is
+        # fixed (the REWARD_SELECT action layout maps to it, like hand); reuses
+        # card_embed, so PAD_ID slots contribute a zero vector.
         reward_emb = self.card_embed(obs["reward_card_ids"].long())  # (B, SLOTS, C)
         reward = reward_emb.reshape(batch, -1)
 
-        return torch.cat([hand, enemy, piles, potion, passthrough, reward], dim=1)
+        # REWARD RELICS: scatter the offered relic ids into an (N_RELIC_IDS + 1)-wide
+        # 0/1 multihot, then OUTPUT only columns [0:N_RELIC_IDS], dropping the final
+        # INVALID/empty column. A multihot (not an embedding) because there is no relic
+        # embedding table, offered relics are an order-agnostic set, and this mirrors how
+        # owned relics are already encoded; it also keeps the checkpoint migration a pure
+        # trunk-widen (a fixed-width N_RELIC_IDS input block, no new parameters). Empty
+        # slots carry the relic INVALID sentinel (RelicId.INVALID == N_RELIC_IDS), which
+        # scatters into the dropped final column and so contributes nothing. Unlike
+        # cards / potions, RelicId 0 (AKABEKO) is a REAL relic, so its own column 0 is
+        # kept -- the earlier "clear column PAD_ID(0)" approach silently erased an offered
+        # AKABEKO, indistinguishable from an empty slot.
+        reward_relic_ids = obs["reward_relic_ids"].long()  # (B, MAX_REWARD_RELICS)
+        reward_relic_scatter = torch.zeros(
+            batch, N_RELIC_IDS + 1, dtype=torch.float32, device=reward_relic_ids.device
+        )
+        reward_relic_scatter.scatter_(1, reward_relic_ids, 1.0)
+        reward_relic = reward_relic_scatter[:, :N_RELIC_IDS]  # drop the INVALID/empty column
+
+        # REWARD POTIONS: embed each offered-potion slot through potion_embed and
+        # flatten, exactly as reward cards reuse card_embed; padding_idx makes PAD
+        # slots contribute a zero vector.
+        reward_potion_emb = self.potion_embed(obs["reward_potion_ids"].long())  # (B, SLOTS, P)
+        reward_potion = reward_potion_emb.reshape(batch, -1)
+
+        # CARD SELECT: per-slot candidate-card embedding, flattened. Slot order is
+        # fixed (the CARD_SELECT action layout maps to it, like hand and reward
+        # cards); reuses card_embed, so PAD_ID slots contribute a zero vector.
+        card_select_emb = self.card_embed(obs["card_select_ids"].long())  # (B, CHOICE_MAX, C)
+        card_select = card_select_emb.reshape(batch, -1)
+
+        # CAUTION: the reward and card-select blocks are appended LAST, in this
+        # fixed order (cards, then relics, then potions, then card_select), so an
+        # old checkpoint's trained input columns stay the leading prefix and
+        # migrate_encoder_trunk_width widens the trunk by a clean zero-init suffix.
+        # Do NOT insert a block ahead of these or reorder them, or the migration
+        # would silently mismap columns.
+        return torch.cat(
+            [
+                hand,
+                enemy,
+                piles,
+                potion,
+                passthrough,
+                reward,
+                reward_relic,
+                reward_potion,
+                card_select,
+            ],
+            dim=1,
+        )
 
     def forward(self, obs: dict[str, Tensor]) -> Tensor:
         """Return the shared trunk features of shape ``(B, output_dim)``."""
