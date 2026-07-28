@@ -34,11 +34,17 @@ to the hand/enemy slot order, so do NOT reorder):
                  per-slot flattened - the deck maps to no action slot)
     keys/act     KEYS_ACT_DIM   ([act, ruby, emerald, sapphire]; a raw passthrough
                  float block like player_scalars, not embedded)
-    shop block   SHOP_CARD_SLOTS * CARD_EMBED_DIM (offered cards per slot)
-                 + N_RELIC_IDS (offered relics multihot)
-                 + SHOP_POTION_SLOTS * POTION_EMBED_DIM (offered potions per slot)
-                 + SHOP_PRICE_SLOTS + 1 (item prices + card-removal cost passthrough)
-    boss relic   N_RELIC_IDS   (offered boss relics multihot, like reward relics)
+    shop cards   MAX_SHOP_CARDS * CARD_EMBED_DIM   (offered shop cards embedded per
+                 slot; slot order fixed - the SHOP_SELECT card sub-block maps to it;
+                 reuses card_embed) then MAX_SHOP_CARDS raw price columns
+    shop relics  N_RELIC_IDS   (offered shop relics as an order-agnostic multihot,
+                 like the reward relics; no relic embedding table) then MAX_SHOP_RELICS
+                 raw price columns
+    shop potions MAX_SHOP_POTIONS * POTION_EMBED_DIM   (offered shop potions embedded
+                 per slot; reuses potion_embed) then MAX_SHOP_POTIONS raw price columns
+    shop remove  1   (the card-removal service cost, a single raw price column)
+    boss relics  N_RELIC_IDS   (offered act-boss relics as an order-agnostic multihot,
+                 like the reward / shop relics; no relic embedding table)
     event/neow   N_EVENT_IDS (which-event one-hot)
                  + NEOW_OPTION_SLOTS * (N_NEOW_BONUS + N_NEOW_DRAWBACK) (per-option
                  Neow bonus / drawback one-hots, flattened)
@@ -59,6 +65,9 @@ from sts_rl.interface import (
     MAX_ENEMIES,
     MAX_REWARD_CARD_SLOTS,
     MAX_REWARD_POTIONS,
+    MAX_SHOP_CARDS,
+    MAX_SHOP_POTIONS,
+    MAX_SHOP_RELICS,
     N_CARD_IDS,
     N_EVENT_IDS,
     N_MONSTER_IDS,
@@ -75,9 +84,6 @@ from sts_rl.interface import (
     PAD_ID,
     PLAYER_SCALAR_DIM,
     POTION_SLOTS,
-    SHOP_CARD_SLOTS,
-    SHOP_POTION_SLOTS,
-    SHOP_PRICE_SLOTS,
 )
 
 # --- Embedding widths ------------------------------------------------------
@@ -159,23 +165,27 @@ class ObsFeatureEncoder(nn.Module):
         # (reuses card_embed).
         card_select = CHOICE_MAX * CARD_EMBED_DIM
         # Overworld deck pooled mean+max through card_embed (order-agnostic set,
-        # like a pile), then the [act, ruby, emerald, sapphire] passthrough.
+        # like a pile), then the [act, ruby, emerald, sapphire] passthrough. Both
+        # appended LAST, after card_select, so the prior layout stays a clean prefix.
         deck = _PILE_POOLS * CARD_EMBED_DIM
         keys_act = KEYS_ACT_DIM
-        # Shop: offered cards embedded per slot (reuses card_embed), relics as a multihot
-        # (reuses _relic_multihot, no relic table), potions embedded per slot (reuses
-        # potion_embed), and prices + remove-cost as raw passthrough scalars.
-        shop_card = SHOP_CARD_SLOTS * CARD_EMBED_DIM
-        shop_relic = N_RELIC_IDS
-        shop_potion = SHOP_POTION_SLOTS * POTION_EMBED_DIM
-        shop_price = SHOP_PRICE_SLOTS + 1  # 13 item prices + the card-removal cost
-        # Boss relics as a multihot (like the reward / shop relics).
-        boss_relic = N_RELIC_IDS
-        # Event identity one-hot, plus per-option Neow bonus / drawback one-hots flattened.
+        # Shop screen (SHOP_ROOM): cards / potions embedded per slot (reusing
+        # card_embed / potion_embed), relics an order-agnostic multihot (no relic
+        # table), each id block followed by its raw per-slot price columns, plus the
+        # single card-removal cost. Then the act-boss relic multihot. All appended
+        # LAST so the prior layout stays a clean prefix for warm-start migration.
+        shop_cards = MAX_SHOP_CARDS * CARD_EMBED_DIM
+        shop_card_prices = MAX_SHOP_CARDS
+        shop_relics = N_RELIC_IDS
+        shop_relic_prices = MAX_SHOP_RELICS
+        shop_potions = MAX_SHOP_POTIONS * POTION_EMBED_DIM
+        shop_potion_prices = MAX_SHOP_POTIONS
+        shop_remove_cost = 1
+        boss_relics = N_RELIC_IDS
+        # Event identity one-hot, plus per-option Neow bonus / drawback one-hots
+        # flattened. Appended after the shop / boss blocks, still a clean suffix.
         event = N_EVENT_IDS
         neow = NEOW_OPTION_SLOTS * (N_NEOW_BONUS + N_NEOW_DRAWBACK)
-        # deck, keys_act, and the shop / boss / event-neow blocks are appended LAST,
-        # after card_select, so the prior layout stays a clean prefix for migration.
         return (
             hand
             + enemy
@@ -188,11 +198,14 @@ class ObsFeatureEncoder(nn.Module):
             + card_select
             + deck
             + keys_act
-            + shop_card
-            + shop_relic
-            + shop_potion
-            + shop_price
-            + boss_relic
+            + shop_cards
+            + shop_card_prices
+            + shop_relics
+            + shop_relic_prices
+            + shop_potions
+            + shop_potion_prices
+            + shop_remove_cost
+            + boss_relics
             + event
             + neow
         )
@@ -212,26 +225,6 @@ class ObsFeatureEncoder(nn.Module):
         mean = emb.mean(dim=1)
         mx = emb.max(dim=1).values
         return torch.cat([mean, mx], dim=1)  # (B, 2*CARD_EMBED_DIM)
-
-    @staticmethod
-    def _relic_multihot(relic_ids: Tensor) -> Tensor:
-        """Scatter offered relic ids into a fixed-width 0/1 multihot, dropping INVALID.
-
-        The offered-relic fields (reward / shop / boss) share this encoding: a multihot
-        over the relic id space (there is no relic embedding table), mirroring the
-        owned-relic multihot and keeping the checkpoint migration a pure trunk widen (a
-        fixed ``N_RELIC_IDS``-wide block, no new parameters). Empty slots carry the relic
-        INVALID sentinel (``RelicId.INVALID == N_RELIC_IDS``), which scatters into the
-        extra final column that is then dropped, so an empty slot contributes nothing.
-        RelicId 0 (AKABEKO) is a REAL relic, so its own column 0 is kept -- clearing the
-        PAD column 0 would silently erase an offered Akabeko.
-
-        ``relic_ids`` is ``(B, K)`` long; returns ``(B, N_RELIC_IDS)`` float32.
-        """
-        batch = relic_ids.shape[0]
-        scatter = torch.zeros(batch, N_RELIC_IDS + 1, dtype=torch.float32, device=relic_ids.device)
-        scatter.scatter_(1, relic_ids, 1.0)
-        return scatter[:, :N_RELIC_IDS]  # drop the INVALID/empty column
 
     @staticmethod
     def _coerce_dtypes(obs: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -302,9 +295,23 @@ class ObsFeatureEncoder(nn.Module):
         reward_emb = self.card_embed(obs["reward_card_ids"].long())  # (B, SLOTS, C)
         reward = reward_emb.reshape(batch, -1)
 
-        # REWARD RELICS: offered relics as an order-agnostic, dropped-INVALID multihot
-        # (see _relic_multihot; shared with the shop / boss-relic offers below).
-        reward_relic = self._relic_multihot(obs["reward_relic_ids"].long())
+        # REWARD RELICS: scatter the offered relic ids into an (N_RELIC_IDS + 1)-wide
+        # 0/1 multihot, then OUTPUT only columns [0:N_RELIC_IDS], dropping the final
+        # INVALID/empty column. A multihot (not an embedding) because there is no relic
+        # embedding table, offered relics are an order-agnostic set, and this mirrors how
+        # owned relics are already encoded; it also keeps the checkpoint migration a pure
+        # trunk-widen (a fixed-width N_RELIC_IDS input block, no new parameters). Empty
+        # slots carry the relic INVALID sentinel (RelicId.INVALID == N_RELIC_IDS), which
+        # scatters into the dropped final column and so contributes nothing. Unlike
+        # cards / potions, RelicId 0 (AKABEKO) is a REAL relic, so its own column 0 is
+        # kept -- the earlier "clear column PAD_ID(0)" approach silently erased an offered
+        # AKABEKO, indistinguishable from an empty slot.
+        reward_relic_ids = obs["reward_relic_ids"].long()  # (B, MAX_REWARD_RELICS)
+        reward_relic_scatter = torch.zeros(
+            batch, N_RELIC_IDS + 1, dtype=torch.float32, device=reward_relic_ids.device
+        )
+        reward_relic_scatter.scatter_(1, reward_relic_ids, 1.0)
+        reward_relic = reward_relic_scatter[:, :N_RELIC_IDS]  # drop the INVALID/empty column
 
         # REWARD POTIONS: embed each offered-potion slot through potion_embed and
         # flatten, exactly as reward cards reuse card_embed; padding_idx makes PAD
@@ -328,16 +335,44 @@ class ObsFeatureEncoder(nn.Module):
         # (already coerced to float32 above), like player_scalars -- not embedded.
         keys_act = obs["keys_act"]
 
-        # SHOP: offered cards embedded per slot (reuses card_embed; PAD -> zero), relics
-        # as a dropped-INVALID multihot, potions embedded per slot (reuses potion_embed),
-        # and the raw price vector plus the card-removal cost as a passthrough scalar.
-        shop_card = self.card_embed(obs["shop_card_ids"].long()).reshape(batch, -1)
-        shop_relic = self._relic_multihot(obs["shop_relic_ids"].long())
-        shop_potion = self.potion_embed(obs["shop_potion_ids"].long()).reshape(batch, -1)
-        shop_price = torch.cat([obs["shop_prices"], obs["shop_remove_cost"]], dim=1)
+        # SHOP CARDS: per-slot offered-card embedding, flattened (slot order fixed --
+        # the SHOP_SELECT card sub-block maps to it, like reward cards); reuses
+        # card_embed, so PAD_ID slots contribute a zero vector. Followed by the raw
+        # per-slot price columns (already coerced to float32 above).
+        shop_card_emb = self.card_embed(obs["shop_card_ids"].long())  # (B, MAX_SHOP_CARDS, C)
+        shop_cards = shop_card_emb.reshape(batch, -1)
+        shop_card_prices = obs["shop_card_prices"]
 
-        # BOSS RELICS: offered boss relics as a dropped-INVALID multihot (like reward relics).
-        boss_relic = self._relic_multihot(obs["boss_relic_ids"].long())
+        # SHOP RELICS: scatter the offered relic ids into an (N_RELIC_IDS + 1)-wide 0/1
+        # multihot and output only columns [0:N_RELIC_IDS], dropping the INVALID/empty
+        # column -- identical to the reward-relic encoding (order-agnostic set, no relic
+        # embedding table, keeps AKABEKO's real column 0). Then the raw price columns.
+        shop_relic_ids = obs["shop_relic_ids"].long()  # (B, MAX_SHOP_RELICS)
+        shop_relic_scatter = torch.zeros(
+            batch, N_RELIC_IDS + 1, dtype=torch.float32, device=shop_relic_ids.device
+        )
+        shop_relic_scatter.scatter_(1, shop_relic_ids, 1.0)
+        shop_relics = shop_relic_scatter[:, :N_RELIC_IDS]  # drop the INVALID/empty column
+        shop_relic_prices = obs["shop_relic_prices"]
+
+        # SHOP POTIONS: per-slot offered-potion embedding through potion_embed,
+        # flattened (PAD slots zero). Then the raw per-slot price columns.
+        shop_potion_emb = self.potion_embed(obs["shop_potion_ids"].long())  # (B, SLOTS, P)
+        shop_potions = shop_potion_emb.reshape(batch, -1)
+        shop_potion_prices = obs["shop_potion_prices"]
+
+        # SHOP REMOVE COST: the single card-removal price, a raw passthrough column.
+        shop_remove_cost = obs["shop_remove_cost"]
+
+        # BOSS RELICS: the three offered act-boss relics, scattered into the same
+        # INVALID-dropping multihot as the reward / shop relics (order-agnostic set, no
+        # relic embedding table). Free, so no price columns.
+        boss_relic_ids = obs["boss_relic_ids"].long()  # (B, MAX_BOSS_RELICS)
+        boss_relic_scatter = torch.zeros(
+            batch, N_RELIC_IDS + 1, dtype=torch.float32, device=boss_relic_ids.device
+        )
+        boss_relic_scatter.scatter_(1, boss_relic_ids, 1.0)
+        boss_relics = boss_relic_scatter[:, :N_RELIC_IDS]  # drop the INVALID/empty column
 
         # EVENT / NEOW: which-event one-hot passthrough, plus the per-option Neow bonus /
         # drawback one-hots flattened (already float32, passthrough like screen_onehot).
@@ -350,11 +385,15 @@ class ObsFeatureEncoder(nn.Module):
             dim=1,
         )
 
-        # CAUTION: the reward, card-select, deck, keys/act, and shop / boss / event-neow
-        # blocks are appended LAST, in this fixed order, so an old checkpoint's trained
-        # input columns stay the leading prefix and migrate_encoder_trunk_input_width
-        # widens the trunk by a clean zero-init suffix. Do NOT insert a block ahead of
-        # these or reorder them, or the migration would silently mismap columns.
+        # CAUTION: the reward, card-select, deck, keys/act, shop / boss-relic, and
+        # event / Neow blocks are appended LAST, in this fixed order (reward cards,
+        # relics, potions, then card_select, the pooled deck, keys/act, then shop cards
+        # + prices, shop relics + prices, shop potions + prices, shop remove cost, the
+        # boss-relic multihot, and finally the event one-hot and Neow bonus / drawback),
+        # so an old checkpoint's trained input columns stay the leading prefix and
+        # migrate_encoder_trunk_input_width widens the trunk by a clean zero-init suffix.
+        # Do NOT insert a block ahead of these or reorder them, or the migration would
+        # silently mismap columns.
         return torch.cat(
             [
                 hand,
@@ -368,11 +407,14 @@ class ObsFeatureEncoder(nn.Module):
                 card_select,
                 deck,
                 keys_act,
-                shop_card,
-                shop_relic,
-                shop_potion,
-                shop_price,
-                boss_relic,
+                shop_cards,
+                shop_card_prices,
+                shop_relics,
+                shop_relic_prices,
+                shop_potions,
+                shop_potion_prices,
+                shop_remove_cost,
+                boss_relics,
                 event,
                 neow,
             ],
