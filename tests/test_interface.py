@@ -13,7 +13,7 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.5.0"
+    assert interface.INTERFACE_VERSION == "0.6.0"
 
 
 def test_action_dim_is_257():
@@ -178,7 +178,9 @@ def test_id_fields_have_id_high():
         "enemy_ids": interface.N_MONSTER_IDS - 1,
         "enemy_move_ids": interface.N_MONSTER_MOVE_IDS - 1,
         "reward_card_ids": interface.N_CARD_IDS - 1,
-        "reward_relic_ids": interface.N_RELIC_IDS - 1,
+        # Relics uniquely allow the INVALID sentinel (== N_RELIC_IDS) as a legal empty
+        # marker, since RelicId 0 (AKABEKO) is a real relic; hence N_RELIC_IDS, not - 1.
+        "reward_relic_ids": interface.N_RELIC_IDS,
         "reward_potion_ids": interface.N_POTION_IDS - 1,
         "card_select_ids": interface.N_CARD_IDS - 1,
     }

@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.5.0.
+INTERFACE_VERSION 0.6.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.5.0"
+INTERFACE_VERSION: str = "0.6.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -246,7 +246,12 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     # takeable slot holds; the positional index alone is meaningless. Zero (PAD)
     # outside a reward screen.
     ObsField("reward_card_ids", np.int32, (MAX_REWARD_CARD_SLOTS,), "id", id_high=N_CARD_IDS - 1),
-    ObsField("reward_relic_ids", np.int32, (MAX_REWARD_RELICS,), "id", id_high=N_RELIC_IDS - 1),
+    # Relics uniquely allow the INVALID sentinel (RelicId.INVALID == N_RELIC_IDS) as a
+    # legal value marking an empty slot, so id_high is N_RELIC_IDS (not N_RELIC_IDS - 1).
+    # RelicId 0 (AKABEKO) is a REAL relic, so PAD 0 cannot double as "empty" here the way
+    # it does for cards / potions (whose id 0 is INVALID); the empty marker must be a
+    # value outside 0..N_RELIC_IDS-1, i.e. the relic INVALID id.
+    ObsField("reward_relic_ids", np.int32, (MAX_REWARD_RELICS,), "id", id_high=N_RELIC_IDS),
     ObsField("reward_potion_ids", np.int32, (MAX_REWARD_POTIONS,), "id", id_high=N_POTION_IDS - 1),
     # Candidate cards on the current card-select screen (combat pile searches like
     # Headbutt / Exhume, deck-wide event removes / transforms), slot-aligned with

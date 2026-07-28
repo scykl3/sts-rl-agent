@@ -26,6 +26,7 @@ from sts_rl.env.observation import (
     _MAP_CUR_ROOM_ONEHOT,
     _MAP_PER_COL_FEATS,
     _empty_obs,
+    _fill_card_select_ids,
     _fill_map_context,
     _fill_reward_ids,
     encode_observation,
@@ -33,6 +34,7 @@ from sts_rl.env.observation import (
 from sts_rl.env.run import execute_overworld_action, overworld_actions, start_run
 from sts_rl.env.spaces import build_observation_space
 from sts_rl.interface import (
+    CHOICE_MAX,
     MAX_REWARD_CARD_GROUPS,
     MAX_REWARD_CARDS_PER_GROUP,
     MAX_REWARD_POTIONS,
@@ -43,7 +45,9 @@ from sts_rl.interface import (
     OBS_FIELD_BY_NAME,
 )
 
-# reward_* fields: populated only on the REWARDS screen, PAD everywhere else.
+# reward_* id fields: populated only on the REWARDS screen. Off it, cards / potions rest
+# at PAD 0 and reward_relic_ids at its INVALID empty marker (RelicId 0, AKABEKO, is a
+# real relic, so PAD 0 cannot mark an empty relic slot).
 _REWARD_ID_FIELDS = ("reward_card_ids", "reward_relic_ids", "reward_potion_ids")
 
 REGRESSION_SEED = 42
@@ -428,13 +432,16 @@ def _reward_gc(screen, cards=(), relics=(), potions=()):
 
 
 def test_reward_fields_pad_off_reward_screen() -> None:
-    # reward_* are reward-screen-only: PAD in combat (bc set) and on the map screen.
+    # reward_* carry no offer off the REWARDS screen (combat with bc set, and the map
+    # screen): cards / potions rest at PAD 0, reward_relic_ids at the relic INVALID
+    # sentinel (its empty marker, since RelicId 0 (AKABEKO) is a real relic).
     gc, bc = _combat()
     combat_obs = encode_observation(gc, bc)
     map_obs = encode_observation(_drive_to_first_map_screen(), None)
     for name in _REWARD_ID_FIELDS:
-        assert not np.any(combat_obs[name]), name
-        assert not np.any(map_obs[name]), name
+        empty = N_RELIC_IDS if name == "reward_relic_ids" else 0
+        assert np.all(combat_obs[name] == empty), name
+        assert np.all(map_obs[name] == empty), name
 
 
 def test_reward_ids_populated_from_live_container() -> None:
@@ -466,7 +473,8 @@ def test_reward_ids_populated_from_live_container() -> None:
     assert np.all(card_ids[MAX_REWARD_CARDS_PER_GROUP + len(group1) :] == 0)
 
     assert obs["reward_relic_ids"][0] == int(sts.RelicId.ART_OF_WAR)
-    assert np.all(obs["reward_relic_ids"][1:] == 0)
+    # Unused relic slots rest at the INVALID empty marker (N_RELIC_IDS), not PAD 0.
+    assert np.all(obs["reward_relic_ids"][1:] == N_RELIC_IDS)
     assert obs["reward_potion_ids"][0] == int(sts.Potion.AMBROSIA)
     assert np.all(obs["reward_potion_ids"][1:] == 0)
 
@@ -508,11 +516,12 @@ def test_reward_ids_enforce_caps_and_skip_sentinels() -> None:
     dropped = over_group[MAX_REWARD_CARDS_PER_GROUP:] + extra_group
     assert not np.isin(dropped, card_ids).any()
 
-    # Relic slot 1 (INVALID=180, past N_RELIC_IDS) is guarded to PAD; 0 and 2 kept.
+    # Relic slot 1 (INVALID=180, past N_RELIC_IDS) fails the valid-id guard, so it keeps
+    # the INVALID empty marker (not PAD 0, which would collide with AKABEKO); 0 and 2 kept.
     assert obs["reward_relic_ids"][0] == int(sts.RelicId.ART_OF_WAR)
-    assert obs["reward_relic_ids"][1] == 0
+    assert obs["reward_relic_ids"][1] == N_RELIC_IDS
     assert obs["reward_relic_ids"][2] == int(sts.RelicId.BIRD_FACED_URN)
-    assert int(sts.RelicId.INVALID) >= N_RELIC_IDS  # the guard's precondition
+    assert int(sts.RelicId.INVALID) == N_RELIC_IDS  # empty marker == the field's id_high
 
     # Potion sentinels at slots 0 and 2 are skipped; the real potion at slot 1 kept.
     assert obs["reward_potion_ids"][0] == 0
@@ -535,7 +544,8 @@ def test_reward_ids_truncate_relics_and_potions_to_caps() -> None:
 
 
 def test_fill_reward_ids_noop_off_reward_screen() -> None:
-    # A populated container on a non-REWARDS screen leaves every reward field PAD.
+    # A populated container on a non-REWARDS screen is a noop: every reward field stays
+    # at its _empty_obs default (cards / potions PAD 0, relics the INVALID empty marker).
     gc = _reward_gc(
         sts.ScreenState.MAP_SCREEN,
         cards=[[sts.CardId.ACCURACY]],
@@ -545,4 +555,63 @@ def test_fill_reward_ids_noop_off_reward_screen() -> None:
     obs = _empty_obs()
     _fill_reward_ids(obs, gc)
     for name in _REWARD_ID_FIELDS:
-        assert not np.any(obs[name]), name
+        empty = N_RELIC_IDS if name == "reward_relic_ids" else 0
+        assert np.all(obs[name] == empty), name
+
+
+# --- card_select_ids (CARD_SELECT screen) ----------------------------------
+
+
+def test_card_select_ids_populated_from_live_container() -> None:
+    # Round-trip through a real engine card-select candidate list (proves the
+    # binding shape and Card.id path), gated by a synthetic CARD_SELECT screen. The
+    # candidates land in their aligned slots with order preserved; the tail past the
+    # candidate count stays PAD.
+    info = start_run(seed=REGRESSION_SEED).screen_state_info
+    info.clear_to_select_cards()
+    candidates = [sts.CardId.BASH, sts.CardId.CLEAVE, sts.CardId.ANGER]
+    for cid in candidates:
+        info.add_to_select_card(sts.Card(cid, 0))
+
+    gc = SimpleNamespace(screen_state=sts.ScreenState.CARD_SELECT, screen_state_info=info)
+    obs = _empty_obs()
+    _fill_card_select_ids(obs, gc)
+
+    csi = obs["card_select_ids"]
+    for i, cid in enumerate(candidates):
+        assert csi[i] == int(cid)
+    assert np.all(csi[len(candidates) :] == 0)  # tail past the candidates stays PAD
+    assert build_observation_space().contains(obs)
+
+
+def test_card_select_ids_truncate_to_choice_max() -> None:
+    # More candidates than fit are truncated to CHOICE_MAX (no overflow past the
+    # field width), mirroring the reward-slot truncation.
+    info = start_run(seed=REGRESSION_SEED).screen_state_info
+    info.clear_to_select_cards()
+    for _ in range(CHOICE_MAX + 3):
+        info.add_to_select_card(sts.Card(sts.CardId.ANGER, 0))
+    gc = SimpleNamespace(screen_state=sts.ScreenState.CARD_SELECT, screen_state_info=info)
+    obs = _empty_obs()
+    _fill_card_select_ids(obs, gc)
+    assert obs["card_select_ids"].shape == (CHOICE_MAX,)
+    assert np.all(obs["card_select_ids"] == int(sts.CardId.ANGER))
+    assert build_observation_space().contains(obs)
+
+
+def test_card_select_ids_pad_off_card_select_screen() -> None:
+    # A populated candidate list on a non-CARD_SELECT screen leaves the field PAD;
+    # so do combat (bc set) and the map screen, where the field is meaningless.
+    info = start_run(seed=REGRESSION_SEED).screen_state_info
+    info.clear_to_select_cards()
+    info.add_to_select_card(sts.Card(sts.CardId.BASH, 0))
+    gc = SimpleNamespace(screen_state=sts.ScreenState.MAP_SCREEN, screen_state_info=info)
+    obs = _empty_obs()
+    _fill_card_select_ids(obs, gc)
+    assert not np.any(obs["card_select_ids"])
+
+    # And in real encodes off the card-select screen: combat and the map screen.
+    gc_combat, bc = _combat()
+    assert not np.any(encode_observation(gc_combat, bc)["card_select_ids"])
+    map_obs = encode_observation(_drive_to_first_map_screen(), None)
+    assert not np.any(map_obs["card_select_ids"])
