@@ -154,17 +154,8 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("SHOP_SELECT", 15),
     ("REST_SELECT", 7),  # rest / smith / recall / lift / toke / dig / skip
     ("TREASURE_SELECT", 2),  # open chest / skip
-    # 10 option slots for headroom; the engine's getValidEventSelectBits tops out
-    # at option index 6 (Cursed Tome's final phase returns 0x3 << 5, options 5 and
-    # 6), so slots 7-9 can never be legal. A guard test (tests/test_run_actions.py)
-    # asserts that dead headroom is never masked, so a future engine exposing
-    # higher-index event options fails loudly here instead of silently truncating.
     ("EVENT_SELECT", 10),
     ("BOSS_RELIC_SELECT", 4),
-    # Reserved terminal-advance slot that no screen maps to: neither the combat
-    # decode (env/actions.py) nor the overworld decode (env/run_actions.py) ever
-    # emits it, and no mask sets it. A guard test asserts it is never masked legal,
-    # so a future layout shift cannot make this dead slot silently live-but-wrong.
     ("PROCEED", 1),
 )
 
@@ -237,6 +228,8 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("relics_multihot", np.float32, (N_RELIC_IDS,), "unit"),
     ObsField("player_powers", np.float32, (N_PLAYER_POWER_IDS,), "real"),
     ObsField("potion_ids", np.int32, (POTION_SLOTS,), "id", id_high=N_POTION_IDS - 1),
+    # "Usable this turn" in combat, but only "present" in the overworld (no overworld potion-use
+    # action), so usable-now holds only on combat screens, which screen_onehot distinguishes.
     ObsField("potion_usable", np.float32, (POTION_SLOTS,), "unit"),
     ObsField("hand_ids", np.int32, (HAND_MAX,), "id", id_high=N_CARD_IDS - 1),
     ObsField("hand_feats", np.float32, (HAND_MAX, HAND_FEAT_DIM), "real"),
