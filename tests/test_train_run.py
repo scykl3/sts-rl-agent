@@ -15,7 +15,6 @@ Two layers, mirroring ``test_train_combat``:
 
 from __future__ import annotations
 
-import argparse
 import sys
 import types
 from pathlib import Path
@@ -27,6 +26,7 @@ import pytest
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.train import EvalRecord, TrainConfig, TrainHistory, train
 from sts_rl.env.reward import RewardConfig
+from sts_rl.env.reward_cli import reward_config_from_args
 from sts_rl.eval import EvalReport, make_holdout_seeds
 
 # scripts/ is not an importable package, so put it on sys.path to import the
@@ -520,61 +520,18 @@ def test_arg_parser_has_no_encounters_knob() -> None:
         train_run.build_arg_parser().parse_args(["--encounters", "GREMLIN_NOB"])
 
 
-def _reward_ns(**overrides: float) -> argparse.Namespace:
-    """A Namespace carrying the four reward-shaping flag dests, each defaulting to
-    the matching ``RewardConfig()`` value; overrides replace individual coefficients.
+def test_arg_parser_wires_reward_shaping_flags() -> None:
+    """build_arg_parser wires the shared reward-shaping flags: an empty argv maps to
+    RewardConfig() and --boss-kill-coef overrides only boss_kill.
 
-    Lets ``_reward_config_from_args`` be exercised without the parser, since the
-    helper only reads these four attributes.
-    """
-    base = RewardConfig()
-    values: dict[str, float] = {
-        "enemy_hp_removed_coef": base.enemy_hp_removed,
-        "damage_taken_coef": base.damage_taken,
-        "floor_progress_coef": base.floor_progress,
-        "boss_kill_coef": base.boss_kill,
-    }
-    values.update(overrides)
-    return argparse.Namespace(**values)
-
-
-def test_reward_config_from_args_maps_all_four_coefficients() -> None:
-    """Each shaping flag maps to its RewardConfig field, and the un-exposed anneal
-    schedule (beta_min / t_anneal) keeps the RewardConfig default. Engine-free."""
-    cfg = train_run._reward_config_from_args(
-        _reward_ns(
-            enemy_hp_removed_coef=0.1,
-            damage_taken_coef=-0.3,
-            floor_progress_coef=0.4,
-            boss_kill_coef=1.0,
-        )
-    )
-    assert (cfg.enemy_hp_removed, cfg.damage_taken, cfg.floor_progress, cfg.boss_kill) == (
-        0.1,
-        -0.3,
-        0.4,
-        1.0,
-    )
-    assert cfg.beta_min == RewardConfig().beta_min
-    assert cfg.t_anneal == RewardConfig().t_anneal
-
-
-def test_reward_config_from_args_defaults_reproduce_reward_config() -> None:
-    """With every flag at its default, the helper reproduces RewardConfig() exactly,
-    so an unspecified run keeps the default shaping. Engine-free (plain Namespace)."""
-    assert train_run._reward_config_from_args(_reward_ns()) == RewardConfig()
-
-
-def test_arg_parser_reward_shaping_flags_wire_to_config() -> None:
-    """The parser's reward-shaping flags default to RewardConfig() and --boss-kill-coef
-    overrides only boss_kill.
-
-    Engine-free: train_run.build_arg_parser uses a module constant for the step cap,
-    so it needs no engine (unlike train_combat's).
+    Guards that build_arg_parser calls add_reward_shaping_args (drop the call and
+    --boss-kill-coef becomes unrecognized). Engine-free: train_run.build_arg_parser
+    uses a module constant for the step cap, so it needs no engine (unlike
+    train_combat's). The mapping itself is locked in test_reward_cli.
     """
     parser = train_run.build_arg_parser()
-    assert train_run._reward_config_from_args(parser.parse_args([])) == RewardConfig()
-    overridden = train_run._reward_config_from_args(parser.parse_args(["--boss-kill-coef", "1.0"]))
+    assert reward_config_from_args(parser.parse_args([])) == RewardConfig()
+    overridden = reward_config_from_args(parser.parse_args(["--boss-kill-coef", "1.0"]))
     assert overridden.boss_kill == 1.0
     # Overriding one coefficient leaves the others at their RewardConfig default.
     assert overridden.enemy_hp_removed == RewardConfig().enemy_hp_removed
