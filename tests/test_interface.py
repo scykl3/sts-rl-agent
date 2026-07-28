@@ -13,7 +13,7 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.7.0"
+    assert interface.INTERFACE_VERSION == "0.8.0"
 
 
 def test_action_dim_is_257():
@@ -141,10 +141,59 @@ def test_deck_and_keys_act_obs_fields():
     assert keys_act.bounds == "real"
     assert keys_act.id_high is None
 
-    # Appended last, in order, so the prior 0.6.0 layout stays a clean prefix for
-    # warm-start migration: ..., card_select_ids, deck_ids, keys_act.
+    # Appended last, in order, so the prior layout stays a clean prefix for warm-start
+    # migration: ..., card_select_ids, deck_ids, keys_act, then the shop / boss-relic
+    # screen block. Pinning keys_act's position locks the 0.7.0 prefix boundary.
     names = [f.name for f in interface.OBS_FIELDS]
-    assert names[-3:] == ["card_select_ids", "deck_ids", "keys_act"]
+    assert names[-9:] == [
+        "keys_act",
+        "shop_card_ids",
+        "shop_card_prices",
+        "shop_relic_ids",
+        "shop_relic_prices",
+        "shop_potion_ids",
+        "shop_potion_prices",
+        "shop_remove_cost",
+        "boss_relic_ids",
+    ]
+
+
+def test_shop_and_boss_obs_fields():
+    # The shop id fields are slot-aligned with the SHOP_SELECT sub-blocks (7 cards, 3
+    # relics, 3 potions), each pairing 1:1 with a same-width price field; the remove
+    # cost is a scalar. boss_relic_ids matches the 3 offered act-boss relics.
+    by = interface.OBS_FIELD_BY_NAME
+
+    assert by["shop_card_ids"].shape == (interface.MAX_SHOP_CARDS,)
+    assert by["shop_card_prices"].shape == (interface.MAX_SHOP_CARDS,)
+    assert by["shop_relic_ids"].shape == (interface.MAX_SHOP_RELICS,)
+    assert by["shop_relic_prices"].shape == (interface.MAX_SHOP_RELICS,)
+    assert by["shop_potion_ids"].shape == (interface.MAX_SHOP_POTIONS,)
+    assert by["shop_potion_prices"].shape == (interface.MAX_SHOP_POTIONS,)
+    assert by["shop_remove_cost"].shape == (1,)
+    assert by["boss_relic_ids"].shape == (interface.MAX_BOSS_RELICS,)
+
+    # Price fields and the remove cost are unbounded reals (no id_high); the id fields
+    # keep their integer dtype.
+    for name in (
+        "shop_card_prices",
+        "shop_relic_prices",
+        "shop_potion_prices",
+        "shop_remove_cost",
+    ):
+        assert by[name].bounds == "real"
+        assert by[name].dtype == np.float32
+        assert by[name].id_high is None
+    for name in ("shop_card_ids", "shop_relic_ids", "shop_potion_ids", "boss_relic_ids"):
+        assert by[name].bounds == "id"
+        assert by[name].dtype == np.int32
+
+    # The shop card / relic / potion sub-slot counts match the SHOP_SELECT layout and
+    # the engine Shop arrays; boss relics match bossRelics[3].
+    assert interface.MAX_SHOP_CARDS == 7
+    assert interface.MAX_SHOP_RELICS == 3
+    assert interface.MAX_SHOP_POTIONS == 3
+    assert interface.MAX_BOSS_RELICS == 3
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +203,7 @@ def test_deck_and_keys_act_obs_fields():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 24
+    assert len(fields) == 32
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:
@@ -209,6 +258,12 @@ def test_id_fields_have_id_high():
         "reward_potion_ids": interface.N_POTION_IDS - 1,
         "card_select_ids": interface.N_CARD_IDS - 1,
         "deck_ids": interface.N_CARD_IDS - 1,
+        "shop_card_ids": interface.N_CARD_IDS - 1,
+        # Shop / boss relic offers use the INVALID sentinel (== N_RELIC_IDS) as their
+        # empty marker, like reward_relic_ids; hence N_RELIC_IDS, not - 1.
+        "shop_relic_ids": interface.N_RELIC_IDS,
+        "shop_potion_ids": interface.N_POTION_IDS - 1,
+        "boss_relic_ids": interface.N_RELIC_IDS,
     }
     # Pin the exact set of id fields, so silently switching one to another
     # bounds value (which __post_init__ would happily accept) is caught.

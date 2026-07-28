@@ -22,6 +22,7 @@ from sts_rl.env.engine import start_combat
 from sts_rl.env.observation import (
     MAP_COLS,
     MAP_ROWS,
+    SHOP_PRICE_SCALE,
     _CARD_TYPE_ATTACK,
     _CARD_TYPE_POWER,
     _MAP_CUR_BLOCK,
@@ -29,11 +30,13 @@ from sts_rl.env.observation import (
     _MAP_CUR_ROOM_ONEHOT,
     _MAP_PER_COL_FEATS,
     _empty_obs,
+    _fill_boss_relic_ids,
     _fill_card_select_ids,
     _fill_deck_ids,
     _fill_keys_act,
     _fill_map_context,
     _fill_reward_ids,
+    _fill_shop,
     encode_observation,
 )
 from sts_rl.env.run import execute_overworld_action, overworld_actions, start_run
@@ -42,10 +45,12 @@ from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     CHOICE_MAX,
     DECK_MAX,
+    MAX_BOSS_RELICS,
     MAX_REWARD_CARD_GROUPS,
     MAX_REWARD_CARDS_PER_GROUP,
     MAX_REWARD_POTIONS,
     MAX_REWARD_RELICS,
+    MAX_SHOP_CARDS,
     N_NODE_TYPES,
     N_RELIC_IDS,
     OBS_FIELDS,
@@ -754,3 +759,179 @@ def test_keys_act_maps_keys_to_slots() -> None:
     fake_gc = SimpleNamespace(act=3, red_key=True, green_key=False, blue_key=True)
     _fill_keys_act(obs, fake_gc)
     assert obs["keys_act"].tolist() == [3.0, 1.0, 0.0, 1.0]
+
+
+# --- shop fields (SHOP_ROOM screen) ----------------------------------------
+
+
+def _shop_gc(cards=(), relics=(), potions=(), prices=None, remove_cost=None, screen=None):
+    """A minimal gc whose screen + shop drive ``_fill_shop`` alone.
+
+    ``cards`` is a sequence of card ids (Card objects only need an ``id``). ``relics``
+    / ``potions`` are the per-slot id / Potion sequences (fixed 3 slots each). ``prices``
+    is the engine's 13-entry price array (cards 0..6, relics 7..9, potions 10..12);
+    defaults to all -1 (every slot empty). ``screen`` defaults to SHOP_ROOM.
+    """
+    if prices is None:
+        prices = [-1] * 13
+    shop = SimpleNamespace(
+        cards=[SimpleNamespace(id=cid) for cid in cards],
+        relics=list(relics),
+        potions=list(potions),
+        prices=list(prices),
+        remove_cost=remove_cost,
+    )
+    return SimpleNamespace(
+        screen_state=sts.ScreenState.SHOP_ROOM if screen is None else screen,
+        screen_state_info=SimpleNamespace(shop=shop),
+    )
+
+
+def test_shop_fields_populated_from_live_shop() -> None:
+    # A stocked shop: cards / relics / potions with prices land in their aligned slots
+    # (normalized by SHOP_PRICE_SCALE); a bought slot (price -1) stays empty, and its
+    # neighbors keep their original-slot alignment (the engine does not compact bought
+    # cards, so shop.cards[i] stays slot i).
+    cards = [sts.CardId.STRIKE_RED, sts.CardId.BASH, sts.CardId.CLEAVE]
+    # Slot 0 = AKABEKO (RelicId 0, a real relic, offered as id 0), slot 1 a real relic
+    # but bought (price -1), slot 2 an INVALID id (must stay the empty marker).
+    relics = [0, int(sts.RelicId.ART_OF_WAR), int(sts.RelicId.INVALID)]
+    potions = [sts.Potion.FIRE_POTION, sts.Potion.EMPTY_POTION_SLOT, sts.Potion.AMBROSIA]
+    prices = [-1] * 13
+    prices[0], prices[1], prices[2] = 50, -1, 75  # card slot 1 bought
+    prices[7], prices[8], prices[9] = 150, -1, 200  # relic slot 1 bought
+    prices[10], prices[11], prices[12] = 60, -1, 40  # potion slot 1 empty
+    gc = _shop_gc(cards=cards, relics=relics, potions=potions, prices=prices, remove_cost=90)
+    obs = _empty_obs()
+    _fill_shop(obs, gc)
+
+    # Cards: slots 0 and 2 populated; slot 1 (price -1) stays PAD with 0.0 price, while
+    # slot 2 (CLEAVE) keeps its original-slot alignment past the bought slot.
+    assert obs["shop_card_ids"][0] == int(sts.CardId.STRIKE_RED)
+    assert obs["shop_card_ids"][1] == 0
+    assert obs["shop_card_ids"][2] == int(sts.CardId.CLEAVE)
+    assert obs["shop_card_prices"][0] == 50 / SHOP_PRICE_SCALE
+    assert obs["shop_card_prices"][1] == 0.0
+    assert obs["shop_card_prices"][2] == 75 / SHOP_PRICE_SCALE
+
+    # Relics: AKABEKO (id 0) kept and distinguishable from empty; the bought slot
+    # (price -1) and the INVALID id both stay the INVALID empty marker with 0.0 price.
+    assert obs["shop_relic_ids"][0] == 0  # AKABEKO, not the empty marker
+    assert obs["shop_relic_ids"][1] == N_RELIC_IDS  # bought -> empty
+    assert obs["shop_relic_ids"][2] == N_RELIC_IDS  # INVALID id -> empty
+    assert obs["shop_relic_prices"][0] == 150 / SHOP_PRICE_SCALE
+    assert obs["shop_relic_prices"][1] == 0.0
+    assert obs["shop_relic_prices"][2] == 0.0
+
+    # Potions: slots 0 and 2 populated; the EMPTY sentinel slot 1 stays PAD.
+    assert obs["shop_potion_ids"][0] == int(sts.Potion.FIRE_POTION)
+    assert obs["shop_potion_ids"][1] == 0
+    assert obs["shop_potion_ids"][2] == int(sts.Potion.AMBROSIA)
+    assert obs["shop_potion_prices"][0] == 60 / SHOP_PRICE_SCALE
+    assert obs["shop_potion_prices"][2] == 40 / SHOP_PRICE_SCALE
+
+    # Remove cost normalized into the single scalar slot.
+    assert obs["shop_remove_cost"][0] == 90 / SHOP_PRICE_SCALE
+    assert build_observation_space().contains(obs)
+
+
+def test_shop_remove_cost_none_encodes_zero() -> None:
+    # remove_cost None (engine -1, already used this visit) leaves the field 0.0.
+    gc = _shop_gc(remove_cost=None)
+    obs = _empty_obs()
+    _fill_shop(obs, gc)
+    assert obs["shop_remove_cost"][0] == 0.0
+
+
+def test_shop_cards_truncate_to_cap() -> None:
+    # More card slots than fit are truncated to MAX_SHOP_CARDS (no overflow).
+    cards = [sts.CardId.STRIKE_RED] * (MAX_SHOP_CARDS + 3)
+    prices = [100] * 13
+    gc = _shop_gc(cards=cards, prices=prices)
+    obs = _empty_obs()
+    _fill_shop(obs, gc)
+    assert obs["shop_card_ids"].shape == (MAX_SHOP_CARDS,)
+    assert np.all(obs["shop_card_ids"] == int(sts.CardId.STRIKE_RED))
+
+
+def test_fill_shop_noop_off_shop_screen() -> None:
+    # A populated shop on a non-SHOP_ROOM screen is a noop: card / potion fields PAD,
+    # relic fields the INVALID empty marker, prices 0.0.
+    gc = _shop_gc(
+        cards=[sts.CardId.STRIKE_RED],
+        relics=[int(sts.RelicId.ART_OF_WAR), int(sts.RelicId.INVALID), int(sts.RelicId.INVALID)],
+        potions=[sts.Potion.FIRE_POTION, sts.Potion.AMBROSIA, sts.Potion.EMPTY_POTION_SLOT],
+        prices=[100] * 13,
+        remove_cost=90,
+        screen=sts.ScreenState.MAP_SCREEN,
+    )
+    obs = _empty_obs()
+    _fill_shop(obs, gc)
+    assert np.all(obs["shop_card_ids"] == 0)
+    assert np.all(obs["shop_card_prices"] == 0.0)
+    assert np.all(obs["shop_relic_ids"] == N_RELIC_IDS)
+    assert np.all(obs["shop_relic_prices"] == 0.0)
+    assert np.all(obs["shop_potion_ids"] == 0)
+    assert np.all(obs["shop_potion_prices"] == 0.0)
+    assert obs["shop_remove_cost"][0] == 0.0
+
+
+def test_shop_fields_empty_off_shop_screen_real_encode() -> None:
+    # In real encodes off the shop screen (combat and the map screen), the shop fields
+    # stay empty: cards / potions PAD, relics the INVALID marker, prices 0.0.
+    gc_combat, bc = _combat()
+    combat_obs = encode_observation(gc_combat, bc)
+    map_obs = encode_observation(_drive_to_first_map_screen(), None)
+    for obs in (combat_obs, map_obs):
+        assert np.all(obs["shop_card_ids"] == 0)
+        assert np.all(obs["shop_potion_ids"] == 0)
+        assert np.all(obs["shop_relic_ids"] == N_RELIC_IDS)
+        assert np.all(obs["shop_card_prices"] == 0.0)
+        assert np.all(obs["shop_relic_prices"] == 0.0)
+        assert np.all(obs["shop_potion_prices"] == 0.0)
+        assert obs["shop_remove_cost"][0] == 0.0
+
+
+# --- boss_relic_ids (BOSS_RELIC_REWARDS screen) ----------------------------
+
+
+def _boss_gc(boss_relics=(), screen=None):
+    """A minimal gc whose screen + boss_relics drive ``_fill_boss_relic_ids`` alone."""
+    return SimpleNamespace(
+        screen_state=sts.ScreenState.BOSS_RELIC_REWARDS if screen is None else screen,
+        screen_state_info=SimpleNamespace(boss_relics=list(boss_relics)),
+    )
+
+
+def test_boss_relic_ids_populated_from_live_screen() -> None:
+    # The three offered boss relics land per slot; AKABEKO (id 0) is kept (a real
+    # relic, distinguishable from empty), and an INVALID slot stays the empty marker.
+    boss_relics = [0, int(sts.RelicId.ART_OF_WAR), int(sts.RelicId.INVALID)]
+    gc = _boss_gc(boss_relics=boss_relics)
+    obs = _empty_obs()
+    _fill_boss_relic_ids(obs, gc)
+    assert obs["boss_relic_ids"][0] == 0  # AKABEKO kept, not the empty marker
+    assert obs["boss_relic_ids"][1] == int(sts.RelicId.ART_OF_WAR)
+    assert obs["boss_relic_ids"][2] == N_RELIC_IDS  # INVALID stays the empty marker
+    assert build_observation_space().contains(obs)
+
+
+def test_boss_relic_ids_truncate_to_cap() -> None:
+    # More offered relics than fit are truncated to MAX_BOSS_RELICS (no overflow).
+    gc = _boss_gc(boss_relics=[int(sts.RelicId.ART_OF_WAR)] * (MAX_BOSS_RELICS + 2))
+    obs = _empty_obs()
+    _fill_boss_relic_ids(obs, gc)
+    assert obs["boss_relic_ids"].shape == (MAX_BOSS_RELICS,)
+    assert np.all(obs["boss_relic_ids"] == int(sts.RelicId.ART_OF_WAR))
+
+
+def test_fill_boss_relic_ids_noop_off_boss_screen() -> None:
+    # Populated boss relics on a non-BOSS_RELIC_REWARDS screen is a noop: the field
+    # stays at the INVALID empty marker (a phantom AKABEKO would fail this).
+    gc = _boss_gc(
+        boss_relics=[int(sts.RelicId.ART_OF_WAR)] * MAX_BOSS_RELICS,
+        screen=sts.ScreenState.MAP_SCREEN,
+    )
+    obs = _empty_obs()
+    _fill_boss_relic_ids(obs, gc)
+    assert np.all(obs["boss_relic_ids"] == N_RELIC_IDS)

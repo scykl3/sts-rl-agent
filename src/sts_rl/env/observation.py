@@ -39,11 +39,15 @@ from sts_rl.interface import (
     DECK_MAX,
     HAND_MAX,
     MAP_CONTEXT_DIM,
+    MAX_BOSS_RELICS,
     MAX_ENEMIES,
     MAX_REWARD_CARD_GROUPS,
     MAX_REWARD_CARDS_PER_GROUP,
     MAX_REWARD_POTIONS,
     MAX_REWARD_RELICS,
+    MAX_SHOP_CARDS,
+    MAX_SHOP_POTIONS,
+    MAX_SHOP_RELICS,
     N_MONSTER_MOVE_IDS,
     N_MONSTER_POWER_IDS,
     N_NODE_TYPES,
@@ -100,6 +104,12 @@ if _RELIC_INVALID != N_RELIC_IDS:
         "dropped INVALID column both depend on it"
     )
 
+# Relic-offer id fields, all defaulting to the INVALID empty sentinel (above) rather
+# than PAD 0: RelicId 0 (AKABEKO) is a real relic, so an all-zero relic-offer field
+# would read as "AKABEKO offered in every slot". _empty_obs seeds each; the encoder
+# drops the INVALID column so an empty slot contributes nothing.
+_RELIC_OFFER_FIELDS = ("reward_relic_ids", "shop_relic_ids", "boss_relic_ids")
+
 # The combat/elite/chest REWARDS screen: the only screen whose rewardsContainer
 # holds the live offered rewards (openCombatRewardScreen sets both together). The
 # separate BOSS_RELIC_REWARDS screen is covered by its own action block, not here.
@@ -109,6 +119,30 @@ _SCREEN_REWARDS = int(sts.ScreenState.REWARDS)
 # searches). Its screen_state_info.to_select_cards holds the offered candidates,
 # order-aligned with the CARD_SELECT action block; PAD on every other screen.
 _SCREEN_CARD_SELECT = int(sts.ScreenState.CARD_SELECT)
+
+# The shop screen (SHOP_ROOM) and the act-boss relic reward screen
+# (BOSS_RELIC_REWARDS). screen_state_info exposes the shop grid and the three offered
+# boss relics on these screens; the shop / boss id and price fields stay empty on
+# every other screen, so the screen guards make them meaningful exactly when the
+# SHOP_SELECT / BOSS_RELIC_SELECT blocks are legal.
+_SCREEN_SHOP = int(sts.ScreenState.SHOP_ROOM)
+_SCREEN_BOSS_RELIC = int(sts.ScreenState.BOSS_RELIC_REWARDS)
+
+# Shop.prices layout (engine Shop.h): cards [0..6], relics [7..9], potions [10..12].
+# A slot's price is read from the same index the SHOP_SELECT action buys --
+# isValidShopAction gates a card / relic / potion buy on prices[idx1] /
+# prices[7+idx1] / prices[10+idx1] != -1 -- so the observation slot and the action
+# slot stay aligned.
+_SHOP_PRICE_RELIC_BASE = MAX_SHOP_CARDS
+_SHOP_PRICE_POTION_BASE = MAX_SHOP_CARDS + MAX_SHOP_RELICS
+
+# Gold-price normalization for the shop real fields (item prices and remove cost).
+# Shop prices span roughly 20-300 gold (cards / potions cheaper, relics dearer);
+# dividing by a fixed high-end price keeps the normalized value O(1) without clipping,
+# matching the raw-but-scaled style of the map_context progress features. An absent
+# price (engine -1 / None) encodes as 0.0; the paired id / multihot slot already marks
+# the slot empty (PAD / INVALID), so a 0.0 price is never confused with a free item.
+SHOP_PRICE_SCALE = 300.0
 
 # --- map_context layout (run mode) -----------------------------------------
 # The act map is a grid MAP_COLS wide and MAP_ROWS tall (verified against the
@@ -151,15 +185,16 @@ _COMBAT_ROOMS = (_ROOM_MONSTER, _ROOM_ELITE, _ROOM_BOSS)
 def _empty_obs() -> Obs:
     """Empty observation with every field's interface dtype and shape.
 
-    Fields are zero-filled (PAD_ID 0 for id fields, 0.0 for real / unit), EXCEPT
-    reward_relic_ids, which is seeded with the relic INVALID sentinel: RelicId 0
-    (AKABEKO) is a real relic, so an all-zero relic-offer field would read as "AKABEKO
-    offered in every slot". INVALID marks "no relic here" -- an empty offer, and every
-    non-reward / combat state where the field is left untouched -- which the encoder
-    maps to a zero contribution.
+    Fields are zero-filled (PAD_ID 0 for id fields, 0.0 for real / unit), EXCEPT the
+    relic-offer fields (reward / shop / boss relic ids), which are seeded with the
+    relic INVALID sentinel: RelicId 0 (AKABEKO) is a real relic, so an all-zero
+    relic-offer field would read as "AKABEKO offered in every slot". INVALID marks "no
+    relic here" -- an empty offer, and every non-offer / combat state where the field
+    is left untouched -- which the encoder maps to a zero contribution.
     """
     obs: Obs = {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
-    obs["reward_relic_ids"].fill(_RELIC_INVALID)
+    for name in _RELIC_OFFER_FIELDS:
+        obs[name].fill(_RELIC_INVALID)
     return obs
 
 
@@ -197,6 +232,8 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
         _fill_card_select_ids(obs, gc)
         _fill_deck_ids(obs, gc)
         _fill_overworld_potions(obs, gc)
+        _fill_shop(obs, gc)
+        _fill_boss_relic_ids(obs, gc)
         return obs
 
     player = bc.player
@@ -495,6 +532,99 @@ def _fill_combat_card_select_ids(obs: Obs, bc: Any) -> None:
     for idx, card_id in bc.card_select_candidate_ids():
         if 0 <= idx < CHOICE_MAX:
             card_select_ids[idx] = card_id
+
+
+def _fill_shop(obs: Obs, gc: Any) -> None:
+    """Fill the shop id + price fields from the live SHOP_ROOM screen, slot-aligned
+    with the ``SHOP_SELECT`` action block.
+
+    Only the SHOP_ROOM screen carries a live ``shop``; on every other screen these
+    fields stay empty (PAD id / INVALID relic / 0.0 price), so the guard makes them
+    meaningful exactly when the ``SHOP_SELECT`` block is legal.
+
+    A slot's price is the engine's ``prices`` entry for that slot (cards 0..6, relics
+    7..9, potions 10..12); ``-1`` marks a bought / empty slot, which
+    ``isValidShopAction`` also rejects, so such a slot is left empty here (its paired
+    id stays PAD / INVALID and its price 0.0). Prices present but unaffordable are
+    shown -- the agent should see an item it cannot yet afford -- so the fill gates on
+    presence (``price != -1``), not on gold. Prices normalize by ``SHOP_PRICE_SCALE``.
+
+    Cards: the ``cards`` accessor is INVALID-filtered, but the engine never sets a
+    shop card INVALID on purchase (``buyCard`` only clears the price unless The
+    Courier restocks the slot), so all seven slots stay populated and position-aligned
+    with ``prices[0..6]`` and the ``SHOP_SELECT`` card slots in live play.
+    """
+    if int(gc.screen_state) != _SCREEN_SHOP:
+        return
+    shop = gc.screen_state_info.shop
+    prices = shop.prices
+
+    # Cards: embedded per slot downstream; show only still-purchasable slots
+    # (price != -1), a bought slot stays PAD. Written directly (like reward_card_ids)
+    # -- startup enum validation guarantees each id fits card_embed.
+    shop_card_ids = obs["shop_card_ids"]
+    shop_card_prices = obs["shop_card_prices"]
+    cards = shop.cards
+    for i in range(min(len(cards), MAX_SHOP_CARDS)):
+        price = prices[i]
+        if price < 0:
+            continue
+        shop_card_ids[i] = int(cards[i].id)
+        shop_card_prices[i] = price / SHOP_PRICE_SCALE
+
+    # Relics: a fixed 3 slots, order-agnostic multihot downstream. Empty / bought
+    # slots (price -1) or the INVALID sentinel keep the seeded INVALID empty marker,
+    # which the encoder drops; only a real offered relic (0..N_RELIC_IDS-1, AKABEKO
+    # included) is written, so an empty slot is never a phantom AKABEKO.
+    shop_relic_ids = obs["shop_relic_ids"]
+    shop_relic_prices = obs["shop_relic_prices"]
+    relics = shop.relics
+    for i in range(min(len(relics), MAX_SHOP_RELICS)):
+        price = prices[_SHOP_PRICE_RELIC_BASE + i]
+        rid = int(relics[i])
+        if price < 0 or not (0 <= rid < N_RELIC_IDS):
+            continue
+        shop_relic_ids[i] = rid
+        shop_relic_prices[i] = price / SHOP_PRICE_SCALE
+
+    # Potions: a fixed 3 slots, embedded per slot downstream. Skip the engine's empty
+    # / invalid potion sentinels and bought slots (price -1); a skipped slot stays PAD.
+    shop_potion_ids = obs["shop_potion_ids"]
+    shop_potion_prices = obs["shop_potion_prices"]
+    potions = shop.potions
+    for i in range(min(len(potions), MAX_SHOP_POTIONS)):
+        price = prices[_SHOP_PRICE_POTION_BASE + i]
+        potion = potions[i]
+        if price < 0 or potion == _POTION_EMPTY or potion == _POTION_INVALID:
+            continue
+        shop_potion_ids[i] = int(potion)
+        shop_potion_prices[i] = price / SHOP_PRICE_SCALE
+
+    # Card-removal service cost: Optional[int], None (engine -1) once used this visit;
+    # left 0.0 then. The remove action carries no id slot, so the price alone marks it.
+    remove_cost = shop.remove_cost
+    if remove_cost is not None and remove_cost >= 0:
+        obs["shop_remove_cost"][0] = remove_cost / SHOP_PRICE_SCALE
+
+
+def _fill_boss_relic_ids(obs: Obs, gc: Any) -> None:
+    """Fill ``boss_relic_ids`` from the live BOSS_RELIC_REWARDS screen (the three
+    offered act-boss relics), mirroring the reward-relic offer field.
+
+    Only the BOSS_RELIC_REWARDS screen carries live ``boss_relics``; on every other
+    screen the field stays at the INVALID sentinel (seeded in ``_empty_obs``), which
+    the encoder drops. Written per slot as a real relic id (an order-agnostic multihot
+    downstream); RelicId 0 (AKABEKO) is a real relic, so empty is the INVALID marker,
+    not PAD 0. The three boss relics are free, so there is no paired price field.
+    """
+    if int(gc.screen_state) != _SCREEN_BOSS_RELIC:
+        return
+    relic_ids = obs["boss_relic_ids"]
+    relics = gc.screen_state_info.boss_relics
+    for i in range(min(len(relics), MAX_BOSS_RELICS)):
+        rid = int(relics[i])
+        if 0 <= rid < N_RELIC_IDS:
+            relic_ids[i] = rid
 
 
 def _fill_keys_act(obs: Obs, gc: Any) -> None:
