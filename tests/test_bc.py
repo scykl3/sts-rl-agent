@@ -357,7 +357,7 @@ class TestBCPretrain:
             epochs=50,
             lr=1e-3,
             batch_size=32,
-            val_frac=0.0,  # use all data for training (overfit test)
+            val_frac=0.0,  # minimal holdout: one val sample is always kept, overfit on the rest
             seed=0,
             device="cpu",
             patience=100,  # don't early stop

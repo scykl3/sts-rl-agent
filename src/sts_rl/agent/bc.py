@@ -63,7 +63,7 @@ def _action_to_subslice_idx(action: int) -> int:
         return MAX_REWARD_CARD_SLOTS
     raise ValueError(
         f"action {action} is outside the card-pick+skip sub-slice "
-        f"[{CARD_PICK_START}..{CARD_PICK_END}) ∪ {{{CARD_SKIP_IDX}}}"
+        f"[{CARD_PICK_START}..{CARD_PICK_END}) or {{{CARD_SKIP_IDX}}}"
     )
 
 
@@ -396,7 +396,9 @@ def bc_pretrain(
         epochs: Maximum training epochs.
         lr: Learning rate (modest default to preserve combat features).
         batch_size: Mini-batch size.
-        val_frac: Fraction of data held for validation.
+        val_frac: Fraction of data held for validation. At least one sample is
+            always held out (n_val = max(1, int(n * val_frac))), so val_frac=0.0
+            still reserves a single validation sample rather than training on all data.
         seed: Random seed for reproducibility.
         device: Torch device.
         freeze_encoder: If True, freeze encoder parameters (not recommended).
@@ -418,7 +420,9 @@ def bc_pretrain(
         for param in model.encoder.parameters():
             param.requires_grad = False
 
-    # Train/val split
+    # Train/val split. Always hold out at least one validation sample, so
+    # val_frac=0.0 reserves one rather than training on all data (the guard below
+    # requires n >= 2).
     n = len(dataset)
     n_val = max(1, int(n * val_frac))
     n_train = n - n_val
