@@ -58,6 +58,7 @@ import gymnasium as gym
 
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.checkpoint_migration import load_checkpoint
+from sts_rl.agent.deck_economy_wrapper import DeckEconomyShapingWrapper
 from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
@@ -160,6 +161,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_GAE_LAMBDA,
         help="GAE trace-decay lambda",
+    )
+    parser.add_argument(
+        "--deck-economy-shaping",
+        action="store_true",
+        help="add potential-based deck/economy reward shaping (relics + gold + potions) to "
+        "the TRAINING env only; policy-invariant, un-annealed (see "
+        "sts_rl.agent.deck_economy_wrapper)",
+    )
+    parser.add_argument(
+        "--deck-economy-scale",
+        type=float,
+        default=1.0,
+        help="strength multiplier on the deck/economy potential (only used with "
+        "--deck-economy-shaping)",
     )
     # PPO objective/schedule knobs. Defaults are read from PPOConfig() so they
     # track the canonical source instead of restating its literals here.
@@ -364,6 +379,18 @@ def main() -> None:
     # collector's rollout stream.
     env = StsRunEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
     eval_env = StsRunEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
+
+    # Optional potential-based deck/economy shaping on the TRAINING env ONLY. gamma is
+    # single-sourced from args.gamma (the same discount TrainConfig/GAE use) so the term
+    # telescopes against the return and stays policy-invariant. eval_env is deliberately
+    # left unwrapped: the reported metric is terminal-win based, so eval reward stays clean.
+    if args.deck_economy_shaping:
+        env = DeckEconomyShapingWrapper(env, gamma=args.gamma, scale=args.deck_economy_scale)
+        logger.info(
+            "deck-economy shaping ENABLED on train env (scale=%.3f, gamma=%.3f)",
+            args.deck_economy_scale,
+            args.gamma,
+        )
 
     # Provenance for reproducibility: engine_commit and interface_version are
     # always-present info keys. Read them from an initial reset; train() re-resets
