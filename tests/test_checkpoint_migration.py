@@ -28,7 +28,7 @@ from sts_rl.agent.checkpoint_migration import (
     _KNOWN_PRIOR_FEATURE_DIMS,
     _version_tuple,
     load_checkpoint,
-    migrate_encoder_trunk_width,
+    migrate_encoder_trunk_input_width,
     migrate_policy_head,
 )
 from sts_rl.agent.train import (
@@ -487,7 +487,7 @@ def test_load_checkpoint_rejects_missing_key(tmp_path) -> None:
         load_checkpoint(path)
 
 
-def test_trunk_width_migration_preserves_prefix_and_zeros_suffix() -> None:
+def test_trunk_input_width_migration_preserves_prefix_and_zeros_suffix() -> None:
     """Widening the first-trunk Linear copies old columns and zero-inits the suffix.
 
     Synthesizes a narrower (pre-card-vision) first-trunk weight with an arange
@@ -504,7 +504,7 @@ def test_trunk_width_migration_preserves_prefix_and_zeros_suffix() -> None:
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
     state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
 
-    migrated = migrate_encoder_trunk_width(state, target)
+    migrated = migrate_encoder_trunk_input_width(state, target)
     new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
     assert new_weight.shape == (HIDDEN, target)
     assert torch.equal(new_weight[:, :old_feat], old_weight)  # (b) leading columns preserved
@@ -519,7 +519,7 @@ def test_migrate_trunk_equal_width_is_noop() -> None:
     """An already-current width is a no-op: the input dict is returned unchanged."""
     target = _current_feature_dim()
     state = _build_current_state_dict()  # its first-trunk weight is already at target
-    migrated = migrate_encoder_trunk_width(state, target)
+    migrated = migrate_encoder_trunk_input_width(state, target)
     # Same object (and same tensor) returned, so an already-current checkpoint
     # loads verbatim rather than through a needless rebuild.
     assert migrated is state
@@ -549,7 +549,7 @@ def test_migrate_trunk_output_is_isolated_copy() -> None:
     state = _build_current_state_dict()
     narrow = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
     state[TRUNK_INPUT_WEIGHT_KEY] = narrow
-    migrated = migrate_encoder_trunk_width(state, target)
+    migrated = migrate_encoder_trunk_input_width(state, target)
 
     # A carried-through (non-trunk) float tensor: distinct object, not aliased.
     key = next(
@@ -567,7 +567,7 @@ def test_migrate_trunk_rejects_missing_key() -> None:
     broken = _build_current_state_dict()
     del broken[TRUNK_INPUT_WEIGHT_KEY]
     with pytest.raises(InterfaceError, match="missing the encoder first-trunk weight"):
-        migrate_encoder_trunk_width(broken, _current_feature_dim())
+        migrate_encoder_trunk_input_width(broken, _current_feature_dim())
 
 
 def test_migrate_trunk_rejects_non_2d() -> None:
@@ -575,7 +575,7 @@ def test_migrate_trunk_rejects_non_2d() -> None:
     broken = _build_current_state_dict()
     broken[TRUNK_INPUT_WEIGHT_KEY] = broken[TRUNK_INPUT_WEIGHT_KEY].reshape(-1)
     with pytest.raises(InterfaceError, match="must be 2-D"):
-        migrate_encoder_trunk_width(broken, _current_feature_dim())
+        migrate_encoder_trunk_input_width(broken, _current_feature_dim())
 
 
 def test_migrate_trunk_rejects_shrink() -> None:
@@ -585,7 +585,7 @@ def test_migrate_trunk_rejects_shrink() -> None:
     # Over-wide the trunk so a migration would have to shrink (old_feat > target).
     state[TRUNK_INPUT_WEIGHT_KEY] = torch.zeros(HIDDEN, target + 1)
     with pytest.raises(InterfaceError, match="cannot shrink the trunk input"):
-        migrate_encoder_trunk_width(state, target)
+        migrate_encoder_trunk_input_width(state, target)
 
 
 def test_migrate_trunk_rejects_unknown_prior_width() -> None:
@@ -608,7 +608,7 @@ def test_migrate_trunk_rejects_unknown_prior_width() -> None:
     state = _build_current_state_dict()
     state[TRUNK_INPUT_WEIGHT_KEY] = torch.zeros(HIDDEN, bad_feat)
     with pytest.raises(InterfaceError, match="not a known prior width"):
-        migrate_encoder_trunk_width(state, target)
+        migrate_encoder_trunk_input_width(state, target)
 
 
 @pytest.mark.parametrize("known_feat", _KNOWN_PRIOR_FEATURE_DIMS)
@@ -624,7 +624,7 @@ def test_migrate_trunk_accepts_known_prior_widths(known_feat: int) -> None:
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * known_feat, dtype=torch.float32).reshape(HIDDEN, known_feat)
     state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
-    migrated = migrate_encoder_trunk_width(state, target)
+    migrated = migrate_encoder_trunk_input_width(state, target)
     new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
     assert new_weight.shape == (HIDDEN, target)
     assert torch.equal(new_weight[:, :known_feat], old_weight)  # prefix preserved

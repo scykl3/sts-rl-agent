@@ -267,7 +267,7 @@ class ObsFeatureEncoder(nn.Module):
         # CAUTION: the reward and card-select blocks are appended LAST, in this
         # fixed order (cards, then relics, then potions, then card_select), so an
         # old checkpoint's trained input columns stay the leading prefix and
-        # migrate_encoder_trunk_width widens the trunk by a clean zero-init suffix.
+        # migrate_encoder_trunk_input_width widens the trunk by a clean zero-init suffix.
         # Do NOT insert a block ahead of these or reorder them, or the migration
         # would silently mismap columns.
         return torch.cat(

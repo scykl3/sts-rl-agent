@@ -65,7 +65,7 @@ POLICY_LOGITS_BIAS_KEY: str = "policy.logits.bias"
 # State-dict key of the encoder's first trunk ``Linear`` weight
 # (``ObsFeatureEncoder.trunk[0]``), shape ``(hidden, feature_dim)``. Its
 # ``feature_dim`` columns are the ONLY tensor dimension that changes when the
-# encoder gains input features, so it is the only tensor the trunk-width
+# encoder gains input features, so it is the only tensor the trunk-input-width
 # migration rebuilds; every other key is copied through unchanged.
 TRUNK_INPUT_WEIGHT_KEY: str = "encoder.trunk.0.weight"
 
@@ -278,7 +278,7 @@ def migrate_policy_head(
     return migrated
 
 
-def migrate_encoder_trunk_width(
+def migrate_encoder_trunk_input_width(
     state_dict: dict[str, torch.Tensor], target_feature_dim: int
 ) -> dict[str, torch.Tensor]:
     """Widen the encoder's first trunk ``Linear`` to the current input width.
@@ -348,7 +348,7 @@ def migrate_encoder_trunk_width(
     # Copy trained columns to the leading prefix and leave the appended suffix
     # zero. new_zeros preserves dtype and device.
     logger.info(
-        "encoder trunk-width migration widens first-trunk input %d -> %d, "
+        "encoder trunk-input-width migration widens first-trunk input %d -> %d, "
         "zero-initializing %d appended suffix column(s)",
         old_feat,
         target_feature_dim,
@@ -394,7 +394,7 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     Independently, the encoder's first trunk ``Linear`` is widened when the
     checkpoint's input width is narrower than the current encoder's feature dim
     (the concat gained trailing features); see
-    :func:`migrate_encoder_trunk_width`. Both migrations compose: a checkpoint may
+    :func:`migrate_encoder_trunk_input_width`. Both migrations compose: a checkpoint may
     need the head remap, the trunk widening, both, or neither. Their target widths
     are read from a freshly built ``ActorCritic`` so they track the live
     architecture rather than any recorded constant.
@@ -440,11 +440,11 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
             )
         model_state = migrate_policy_head(model_state, from_version=ckpt_version)
 
-    # Trunk-width migration: independent of the head remap and composes with it.
+    # Trunk-input-width migration: independent of the head remap and composes with it.
     # When the encoder gained input features the old first-trunk Linear is too
     # narrow; widen it and zero-init the appended suffix. A no-op when the widths
     # already match (verbatim load).
-    model_state = migrate_encoder_trunk_width(model_state, target_feature_dim)
+    model_state = migrate_encoder_trunk_input_width(model_state, target_feature_dim)
 
     model.load_state_dict(model_state, strict=True)
     return model
