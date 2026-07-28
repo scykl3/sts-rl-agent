@@ -134,3 +134,57 @@ def test_deterministic_in_eval_mode():
         first = enc(obs)
         second = enc(obs)
     assert torch.equal(first, second)
+
+
+# --- offered-item vision: the encoder must READ the reward / select id fields ---
+# reward_relic_ids, reward_potion_ids, and card_select_ids each carry which relic /
+# potion / card occupies a takeable slot. The encoder omits all three from its
+# feature concat, so the agent picks reward relics, reward potions, and card-select
+# candidates with no card identity, only the slot index. The probe below detects
+# whether a field reaches the features at all; the three tests that use it FAIL
+# today and turn green once the encoder embeds the field, the same way it already
+# embeds hand and pile card ids. Engine-free: obs come from the interface space.
+
+
+def _encoder_reads_field(field: str) -> bool:
+    """True iff the encoder's features depend on ``field`` (i.e. it reads it).
+
+    Compares the pre-trunk features on a base observation (``field`` zeroed)
+    against a variant identical except one slot of ``field`` set to a valid
+    non-PAD id. Identical features mean the field never reaches the encoder.
+    """
+    enc = ObsFeatureEncoder()
+    enc.eval()
+    base = sample_observation_batch(BATCH)
+    base[field] = torch.zeros_like(base[field])
+    variant = {name: t.clone() for name, t in base.items()}
+    # First non-PAD id; in bounds for every id field (id_high >= PAD_ID + 1).
+    variant[field][:, 0] = interface.PAD_ID + 1
+    with torch.no_grad():
+        return not torch.equal(enc.encode_features(base), enc.encode_features(variant))
+
+
+def test_field_read_probe_detects_a_consumed_field():
+    # Positive control: the probe returns True for hand_ids, which the encoder does
+    # embed. Guards the three offer-field tests below from silently always-failing
+    # on a probe bug instead of catching the real blindness.
+    assert _encoder_reads_field("hand_ids")
+
+
+def test_encoder_reads_reward_relic_ids():
+    # Fails until the encoder embeds reward_relic_ids: offered relics are otherwise
+    # chosen with no relic identity, only the slot index.
+    assert _encoder_reads_field("reward_relic_ids")
+
+
+def test_encoder_reads_reward_potion_ids():
+    # Fails until the encoder embeds reward_potion_ids: offered potions are
+    # otherwise chosen with no potion identity, only the slot index.
+    assert _encoder_reads_field("reward_potion_ids")
+
+
+def test_encoder_reads_card_select_ids():
+    # Fails until the encoder embeds card_select_ids: pile-search / deck-removal /
+    # upgrade candidates are otherwise chosen with no card identity, only the slot
+    # index. (This field is also unfilled by the env; this asserts the read half.)
+    assert _encoder_reads_field("card_select_ids")
