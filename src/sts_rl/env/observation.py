@@ -10,8 +10,10 @@ One encoder serves both modes. Pass a live ``BattleContext`` for combat, or
 enemies, powers) then stay zero, while ``map_context`` is filled from the run's
 map, ``deck_ids`` from the run deck, the potion belt from the overworld, and the
 ``reward_*`` fields on a REWARDS screen. ``map_context``, ``deck_ids``, and the
-``reward_*`` fields are left zero during combat; the potion belt and ``keys_act``
-(act plus owned ruby / emerald / sapphire keys) are filled in both modes.
+``reward_*`` fields are left zero during combat; the potion belt, ``keys_act``
+(act plus owned ruby / emerald / sapphire keys), and the Neow-event one-hots
+(``event_onehot`` / ``neow_bonus`` / ``neow_drawback``, populated on the event
+screen) are filled in both modes.
 
 Conventions:
 
@@ -41,6 +43,7 @@ from sts_rl.interface import (
     MAP_CONTEXT_DIM,
     MAX_BOSS_RELICS,
     MAX_ENEMIES,
+    MAX_NEOW_OPTIONS,
     MAX_REWARD_CARD_GROUPS,
     MAX_REWARD_CARDS_PER_GROUP,
     MAX_REWARD_POTIONS,
@@ -48,8 +51,11 @@ from sts_rl.interface import (
     MAX_SHOP_CARDS,
     MAX_SHOP_POTIONS,
     MAX_SHOP_RELICS,
+    N_EVENT_IDS,
     N_MONSTER_MOVE_IDS,
     N_MONSTER_POWER_IDS,
+    N_NEOW_BONUS,
+    N_NEOW_DRAWBACK,
     N_NODE_TYPES,
     N_PLAYER_POWER_IDS,
     N_RELIC_IDS,
@@ -127,6 +133,14 @@ _SCREEN_CARD_SELECT = int(sts.ScreenState.CARD_SELECT)
 # SHOP_SELECT / BOSS_RELIC_SELECT blocks are legal.
 _SCREEN_SHOP = int(sts.ScreenState.SHOP_ROOM)
 _SCREEN_BOSS_RELIC = int(sts.ScreenState.BOSS_RELIC_REWARDS)
+
+# The event screen (EVENT_SCREEN). Its screen_state_info + cur_event describe the
+# current event: event_onehot marks cur_event whenever this screen is up, and on the
+# Neow event (cur_event == NEOW) screen_state_info.neowRewards holds the 4 offered
+# options. Both stay zero on every other screen, so the guard makes them meaningful
+# exactly when an event is on screen.
+_SCREEN_EVENT = int(sts.ScreenState.EVENT_SCREEN)
+_EVENT_NEOW = int(sts.Event.NEOW)
 
 # Shop.prices layout (engine Shop.h): cards [0..6], relics [7..9], potions [10..12].
 # A slot's price is read from the same index the SHOP_SELECT action buys --
@@ -220,10 +234,12 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
     mutation.
     """
     obs = _empty_obs()
-    # relics, the screen one-hot, and keys/act are read from gc in both modes.
+    # relics, the screen one-hot, keys/act, and the Neow-event one-hots are read from
+    # gc in both modes.
     _fill_relics_multihot(obs, gc)
     _fill_screen_onehot(obs, gc)
     _fill_keys_act(obs, gc)
+    _fill_neow_event(obs, gc)
 
     if bc is None:
         _fill_run_scalars(obs, gc)
@@ -352,6 +368,51 @@ def _fill_screen_onehot(obs: Obs, gc: Any) -> None:
     screen_idx = int(gc.screen_state)
     if 0 <= screen_idx < N_SCREENS:
         obs["screen_onehot"][screen_idx] = 1.0
+
+
+def _fill_neow_event(obs: Obs, gc: Any) -> None:
+    """Fill the Neow-event one-hots (``event_onehot`` / ``neow_bonus`` /
+    ``neow_drawback``) from the live EVENT_SCREEN, mirroring ``_fill_screen_onehot``.
+
+    Runs in both modes (the event screen is an overworld state, but the encode
+    dispatch is shared). Off the event screen every block stays all-zero, so the
+    screen guard makes them meaningful exactly when an event is on screen and a stale
+    ``cur_event`` never leaks a phantom bit.
+
+    On any event screen, ``event_onehot`` marks the current event id (``gc.cur_event``);
+    the index is bounds-guarded so an out-of-range id (negative or ``>= N_EVENT_IDS``)
+    is dropped rather than overflowing. ``Event.INVALID`` (id 0) is in range but never
+    the current event on screen, so column 0 stays a dead column. On the Neow event
+    (``cur_event == NEOW``) the engine offers
+    ``MAX_NEOW_OPTIONS`` reward options in ``screen_state_info.neowRewards``; each option
+    pairs a ``NeowBonus`` (``.r``) with a ``NeowDrawback`` (``.d``), written as two
+    per-option one-hot spans, option ``k``'s bonus at ``k * N_NEOW_BONUS + int(opt.r)``
+    and drawback at ``k * N_NEOW_DRAWBACK + int(opt.d)``. Each index is bounds-guarded,
+    and options past the cap are truncated. A non-Neow event leaves both Neow blocks
+    zero -- the per-option identities are Neow-specific.
+
+    An env-written one-hot float block like ``screen_onehot``: the encoder concatenates
+    it as-is (no embedding table, no masking). Empty (all-zero) needs no sentinel, so
+    ``_empty_obs`` zero-fills it automatically.
+    """
+    if int(gc.screen_state) != _SCREEN_EVENT:
+        return
+    event_idx = int(gc.cur_event)
+    if 0 <= event_idx < N_EVENT_IDS:
+        obs["event_onehot"][event_idx] = 1.0
+    if event_idx != _EVENT_NEOW:
+        return
+    neow_bonus = obs["neow_bonus"]
+    neow_drawback = obs["neow_drawback"]
+    options = gc.screen_state_info.neowRewards
+    for k in range(min(len(options), MAX_NEOW_OPTIONS)):
+        option = options[k]
+        bonus = int(option.r)
+        drawback = int(option.d)
+        if 0 <= bonus < N_NEOW_BONUS:
+            neow_bonus[k * N_NEOW_BONUS + bonus] = 1.0
+        if 0 <= drawback < N_NEOW_DRAWBACK:
+            neow_drawback[k * N_NEOW_DRAWBACK + drawback] = 1.0
 
 
 def _fill_run_scalars(obs: Obs, gc: Any) -> None:

@@ -13,7 +13,7 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.8.0"
+    assert interface.INTERFACE_VERSION == "0.9.0"
 
 
 def test_action_dim_is_257():
@@ -143,9 +143,11 @@ def test_deck_and_keys_act_obs_fields():
 
     # Appended last, in order, so the prior layout stays a clean prefix for warm-start
     # migration: ..., card_select_ids, deck_ids, keys_act, then the shop / boss-relic
-    # screen block. Pinning keys_act's position locks the 0.7.0 prefix boundary.
+    # screen block, then the Neow-event one-hots (the current concat tail). Pinning
+    # keys_act's position locks the 0.7.0 prefix boundary; boss_relic_ids locks the
+    # 0.8.0 boundary, ahead of the appended Neow-event block.
     names = [f.name for f in interface.OBS_FIELDS]
-    assert names[-9:] == [
+    assert names[-12:] == [
         "keys_act",
         "shop_card_ids",
         "shop_card_prices",
@@ -155,6 +157,9 @@ def test_deck_and_keys_act_obs_fields():
         "shop_potion_prices",
         "shop_remove_cost",
         "boss_relic_ids",
+        "event_onehot",
+        "neow_bonus",
+        "neow_drawback",
     ]
 
 
@@ -196,6 +201,38 @@ def test_shop_and_boss_obs_fields():
     assert interface.MAX_BOSS_RELICS == 3
 
 
+def test_neow_event_obs_fields():
+    # The Neow-event one-hots: event_onehot spans the Event id space; the two Neow
+    # blocks are MAX_NEOW_OPTIONS contiguous one-hot spans over the NeowBonus /
+    # NeowDrawback id spaces. All are env-written unit float blocks (no id_high),
+    # appended after boss_relic_ids as the concat tail.
+    by = interface.OBS_FIELD_BY_NAME
+    assert by["event_onehot"].shape == (interface.N_EVENT_IDS,)
+    assert by["neow_bonus"].shape == (interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS,)
+    assert by["neow_drawback"].shape == (interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK,)
+    for name in ("event_onehot", "neow_bonus", "neow_drawback"):
+        assert by[name].bounds == "unit"
+        assert by[name].dtype == np.float32
+        assert by[name].id_high is None
+
+    # The generated enum-count constants and the option cap match the engine
+    # cardinalities the smoke check confirmed (Event 57 / max 56, NeowBonus 20,
+    # NeowDrawback 7, 4 offered options).
+    assert interface.N_EVENT_IDS == 57
+    assert interface.N_NEOW_BONUS == 20
+    assert interface.N_NEOW_DRAWBACK == 7
+    assert interface.MAX_NEOW_OPTIONS == 4
+
+
+def test_new_enum_tables_are_engine_validated():
+    # The Neow-event enum tables must be in the startup validation map (like N_SCREENS),
+    # so a future engine enum bump that overflows one is caught rather than silently
+    # reshaping. Each map entry must equal its module constant.
+    for name in ("N_EVENT_IDS", "N_NEOW_BONUS", "N_NEOW_DRAWBACK"):
+        assert name in interface.EXPECTED_TABLE_SIZES
+        assert interface.EXPECTED_TABLE_SIZES[name] == getattr(interface, name)
+
+
 # ---------------------------------------------------------------------------
 # Observation fields
 # ---------------------------------------------------------------------------
@@ -203,7 +240,7 @@ def test_shop_and_boss_obs_fields():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 32
+    assert len(fields) == 35
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:

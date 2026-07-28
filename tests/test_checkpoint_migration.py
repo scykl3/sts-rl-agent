@@ -42,9 +42,13 @@ from sts_rl.interface import (
     ACTION_DIM,
     INTERFACE_VERSION,
     KEYS_ACT_DIM,
+    MAX_NEOW_OPTIONS,
     MAX_SHOP_CARDS,
     MAX_SHOP_POTIONS,
     MAX_SHOP_RELICS,
+    N_EVENT_IDS,
+    N_NEOW_BONUS,
+    N_NEOW_DRAWBACK,
     N_RELIC_IDS,
     InterfaceError,
 )
@@ -648,6 +652,10 @@ SHIPPED_0_6_0_FEATURE_DIM = 4881
 # prior that must widen to the shop / boss-relic layout. Fixed history.
 SHIPPED_0_7_0_FEATURE_DIM = 4949
 
+# The shipped 0.8.0 feature width (0.7.0 + shop + boss-relic blocks), now a recorded
+# prior that must widen to the Neow-event layout. Fixed history.
+SHIPPED_0_8_0_FEATURE_DIM = 5571
+
 
 def _shop_boss_block_width() -> int:
     """Total width appended for the shop + boss-relic screen blocks (the 0.8.0 append).
@@ -666,6 +674,20 @@ def _shop_boss_block_width() -> int:
         + MAX_SHOP_POTIONS  # shop potion prices
         + 1  # shop remove cost
         + N_RELIC_IDS  # boss relic multihot
+    )
+
+
+def _neow_event_block_width() -> int:
+    """Total width appended for the Neow-event one-hot blocks (the 0.9.0 append).
+
+    Derived symbolically from the interface constants, mirroring the encoder's append:
+    event_onehot spans the Event id space, and the two Neow blocks are MAX_NEOW_OPTIONS
+    one-hot spans over the NeowBonus / NeowDrawback id spaces.
+    """
+    return (
+        N_EVENT_IDS  # event_onehot
+        + MAX_NEOW_OPTIONS * N_NEOW_BONUS  # neow bonus one-hots
+        + MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK  # neow drawback one-hots
     )
 
 
@@ -710,17 +732,51 @@ def test_shipped_4949_prior_widens_to_shop_boss_layout() -> None:
 
     A warm-start checkpoint trained at the shipped 4949-wide encoder (deck + keys/act,
     before the shop / boss-relic screen blocks) must widen to the current layout: its
-    trained columns preserved as the leading prefix, the appended shop cards + prices,
-    shop relics + prices, shop potions + prices, remove cost, and boss-relic columns
-    zero-initialized. The target width is checked symbolically against the interface /
-    encoder constants, never a hardcoded literal.
+    trained columns preserved as the leading prefix, every later-appended column (the
+    shop cards + prices, shop relics + prices, shop potions + prices, remove cost, and
+    boss-relic block that made the 0.8.0 width, then the Neow-event blocks)
+    zero-initialized. The intermediate 0.8.0 relationship is checked symbolically
+    against the interface / encoder constants, never a hardcoded literal.
     """
     assert SHIPPED_0_7_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
     target = _current_feature_dim()
-    # New width = 4949 + the appended shop / boss-relic screen blocks, symbolic.
-    assert target == SHIPPED_0_7_0_FEATURE_DIM + _shop_boss_block_width()
+    # 4949 + the shop / boss-relic blocks was the 0.8.0 width (5571), itself now a
+    # recorded prior; the Neow-event blocks were appended after it. Derived
+    # symbolically, never a hardcoded literal.
+    assert SHIPPED_0_7_0_FEATURE_DIM + _shop_boss_block_width() == SHIPPED_0_8_0_FEATURE_DIM
+    assert SHIPPED_0_8_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
 
     old_feat = SHIPPED_0_7_0_FEATURE_DIM
+    assert old_feat < target
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+
+    migrated = migrate_encoder_trunk_input_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :old_feat], old_weight)  # prefix preserved
+    assert torch.count_nonzero(new_weight[:, old_feat:]) == 0  # appended suffix zero
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
+def test_shipped_5571_prior_widens_to_neow_event_layout() -> None:
+    """The 0.8.0 width (5571) is a recorded prior and widens cleanly to the current dim.
+
+    A warm-start checkpoint trained at the shipped 5571-wide encoder (shop + boss-relic
+    blocks, before the Neow-event screen blocks) must widen to the current layout: its
+    trained columns preserved as the leading prefix, the appended event / Neow-bonus /
+    Neow-drawback one-hot columns zero-initialized. The target width is checked
+    symbolically against the interface / encoder constants, never a hardcoded literal.
+    """
+    assert SHIPPED_0_8_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
+    target = _current_feature_dim()
+    # New width = 5571 + the appended Neow-event one-hot blocks, symbolic.
+    assert target == SHIPPED_0_8_0_FEATURE_DIM + _neow_event_block_width()
+
+    old_feat = SHIPPED_0_8_0_FEATURE_DIM
     assert old_feat < target
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
