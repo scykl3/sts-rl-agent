@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.6.0.
+INTERFACE_VERSION 0.7.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.6.0"
+INTERFACE_VERSION: str = "0.7.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -90,6 +90,7 @@ PLAYER_SCALAR_DIM = 8  # hp_cur, hp_max, block, energy, gold, floor, ascension, 
 HAND_FEAT_DIM = 6  # upgraded, cost, is_attack, is_skill, is_power, ethereal
 ENEMY_SCALAR_DIM = 5  # hp_cur, hp_max, block, intent_val, intent_hits
 MAP_CONTEXT_DIM = 40  # current + available next node types/positions (run mode)
+KEYS_ACT_DIM = 4  # act + owned keys: ruby (red), emerald (green), sapphire (blue)
 
 # --- Type aliases ----------------------------------------------------------
 Obs = dict[str, np.ndarray]
@@ -153,8 +154,17 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("SHOP_SELECT", 15),
     ("REST_SELECT", 7),  # rest / smith / recall / lift / toke / dig / skip
     ("TREASURE_SELECT", 2),  # open chest / skip
+    # 10 option slots for headroom; the engine's getValidEventSelectBits tops out
+    # at option index 6 (Cursed Tome's final phase returns 0x3 << 5, options 5 and
+    # 6), so slots 7-9 can never be legal. A guard test (tests/test_run_actions.py)
+    # asserts that dead headroom is never masked, so a future engine exposing
+    # higher-index event options fails loudly here instead of silently truncating.
     ("EVENT_SELECT", 10),
     ("BOSS_RELIC_SELECT", 4),
+    # Reserved terminal-advance slot that no screen maps to: neither the combat
+    # decode (env/actions.py) nor the overworld decode (env/run_actions.py) ever
+    # emits it, and no mask sets it. A guard test asserts it is never masked legal,
+    # so a future layout shift cannot make this dead slot silently live-but-wrong.
     ("PROCEED", 1),
 )
 
@@ -259,6 +269,19 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     # holds; the positional index alone is meaningless. Zero (PAD) outside a
     # card-select screen and for slots past the candidate count.
     ObsField("card_select_ids", np.int32, (CHOICE_MAX,), "id", id_high=N_CARD_IDS - 1),
+    # The full overworld deck as an order-agnostic id set (the agent's own cards),
+    # PAD-padded to DECK_MAX. Populated only in the overworld (bc is None); in combat
+    # the draw / discard / hand / exhaust piles already cover every card, so it stays
+    # PAD there. CardId 0 is INVALID, so PAD 0 is a safe empty marker (no AKABEKO-style
+    # collision). Pooled -- not per-slot flattened -- by the encoder, since the deck
+    # maps to no action slot.
+    ObsField("deck_ids", np.int32, (DECK_MAX,), "id", id_high=N_CARD_IDS - 1),
+    # Small passthrough float block: [act, ruby, emerald, sapphire]. act complements
+    # player_scalars (which carries floor but not act); the three owned-key flags are
+    # Act-3 boss-door progress. Known in both overworld and combat. A passthrough real
+    # block (like player_scalars), NOT embedded. Appended last so the prior layout
+    # stays a clean prefix for warm-start migration.
+    ObsField("keys_act", np.float32, (KEYS_ACT_DIM,), "real"),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}

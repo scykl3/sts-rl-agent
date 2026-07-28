@@ -27,6 +27,8 @@ from sts_rl.env.observation import (
     _MAP_PER_COL_FEATS,
     _empty_obs,
     _fill_card_select_ids,
+    _fill_deck_ids,
+    _fill_keys_act,
     _fill_map_context,
     _fill_reward_ids,
     encode_observation,
@@ -35,6 +37,7 @@ from sts_rl.env.run import execute_overworld_action, overworld_actions, start_ru
 from sts_rl.env.spaces import build_observation_space
 from sts_rl.interface import (
     CHOICE_MAX,
+    DECK_MAX,
     MAX_REWARD_CARD_GROUPS,
     MAX_REWARD_CARDS_PER_GROUP,
     MAX_REWARD_POTIONS,
@@ -57,10 +60,10 @@ _MAP_SCREEN = "MAP_SCREEN"
 _MAX_DRIVE = 50
 
 # Fields populated only in combat; every one must stay zero in an overworld obs.
+# potion_ids / potion_usable are intentionally NOT here: the belt is now filled in
+# both modes. deck_ids and keys_act are also excluded (overworld / both).
 _COMBAT_ONLY_FIELDS = (
     "player_powers",
-    "potion_ids",
-    "potion_usable",
     "hand_ids",
     "hand_feats",
     "draw_ids",
@@ -615,3 +618,83 @@ def test_card_select_ids_pad_off_card_select_screen() -> None:
     assert not np.any(encode_observation(gc_combat, bc)["card_select_ids"])
     map_obs = encode_observation(_drive_to_first_map_screen(), None)
     assert not np.any(map_obs["card_select_ids"])
+
+
+# --- deck_ids (overworld deck) ---------------------------------------------
+
+
+def test_deck_ids_populated_from_live_deck_overworld() -> None:
+    # deck_ids mirrors the live gc.deck (order preserved up to DECK_MAX), with the
+    # tail past the deck size left PAD. Proves the gc.deck -> Card.id binding path.
+    gc = _drive_to_first_map_screen()
+    deck_ids = [int(card.id) for card in gc.deck]
+    assert deck_ids  # a real run always carries a starting deck
+    obs = encode_observation(gc, None)
+
+    assert obs["deck_ids"][: len(deck_ids)].tolist() == deck_ids
+    assert np.all(obs["deck_ids"][len(deck_ids) :] == 0)  # PAD tail
+    # Deck ids stay within the card embedding table.
+    assert obs["deck_ids"].max() <= OBS_FIELD_BY_NAME["deck_ids"].id_high
+    assert build_observation_space().contains(obs)
+
+
+def test_deck_ids_pad_in_combat() -> None:
+    # In combat the draw / discard / hand / exhaust piles cover the deck, so
+    # deck_ids stays PAD (the field is overworld-only).
+    gc, bc = _combat()
+    assert not np.any(encode_observation(gc, bc)["deck_ids"])
+
+
+def test_deck_ids_truncate_to_deck_max() -> None:
+    # A deck larger than DECK_MAX is truncated to the fixed width (no overflow),
+    # mirroring the pile / card-select truncation.
+    over = [SimpleNamespace(id=int(sts.CardId.STRIKE_RED)) for _ in range(DECK_MAX + 5)]
+    gc = SimpleNamespace(deck=over)
+    obs = _empty_obs()
+    _fill_deck_ids(obs, gc)
+    assert obs["deck_ids"].shape == (DECK_MAX,)
+    assert np.all(obs["deck_ids"] == int(sts.CardId.STRIKE_RED))
+
+
+# --- overworld potions (belt visible off-combat) ---------------------------
+
+
+def test_overworld_potions_visible() -> None:
+    # Regression for I4: a held potion must be visible OUT of combat (previously the
+    # belt was filled only in the combat branch, so overworld potions read all-PAD).
+    gc = _drive_to_first_map_screen()
+    gc.obtain_potion(sts.Potion.FIRE_POTION)
+    obs = encode_observation(gc, None)
+
+    ids = obs["potion_ids"].tolist()
+    assert int(sts.Potion.FIRE_POTION) in ids
+    slot = ids.index(int(sts.Potion.FIRE_POTION))
+    assert obs["potion_usable"][slot] == 1.0
+    assert build_observation_space().contains(obs)
+
+
+# --- keys_act (act + owned keys, both modes) -------------------------------
+
+
+def test_keys_act_populated_overworld_and_combat() -> None:
+    # keys_act = [act, ruby, emerald, sapphire] is filled in both modes (act is
+    # known in both; player_scalars carries floor but not act).
+    gc = _drive_to_first_map_screen()
+    obs = encode_observation(gc, None)
+    assert obs["keys_act"][0] == gc.act
+    assert obs["keys_act"][1] == float(gc.red_key)
+    assert obs["keys_act"][2] == float(gc.green_key)
+    assert obs["keys_act"][3] == float(gc.blue_key)
+
+    gc_combat, bc = _combat()
+    combat_obs = encode_observation(gc_combat, bc)
+    assert combat_obs["keys_act"][0] == gc_combat.act
+
+
+def test_keys_act_maps_keys_to_slots() -> None:
+    # The key -> slot mapping is ruby == red, emerald == green, sapphire == blue,
+    # with act in slot 0. A fake gc pins the mapping without engine key mutation.
+    obs = _empty_obs()
+    fake_gc = SimpleNamespace(act=3, red_key=True, green_key=False, blue_key=True)
+    _fill_keys_act(obs, fake_gc)
+    assert obs["keys_act"].tolist() == [3.0, 1.0, 0.0, 1.0]

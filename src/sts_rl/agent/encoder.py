@@ -29,6 +29,11 @@ to the hand/enemy slot order, so do NOT reorder):
     card select  CHOICE_MAX * CARD_EMBED_DIM   (candidate cards on the current
                  card-select screen, embedded per slot; slot order fixed - the
                  CARD_SELECT action layout maps to it; reuses card_embed)
+    deck block   _PILE_POOLS * CARD_EMBED_DIM   (the overworld deck pooled mean+max
+                 through card_embed; order-agnostic set, so pooled like a pile, not
+                 per-slot flattened - the deck maps to no action slot)
+    keys/act     KEYS_ACT_DIM   ([act, ruby, emerald, sapphire]; a raw passthrough
+                 float block like player_scalars, not embedded)
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from sts_rl.interface import (
     ENEMY_SCALAR_DIM,
     HAND_FEAT_DIM,
     HAND_MAX,
+    KEYS_ACT_DIM,
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
     MAX_REWARD_CARD_SLOTS,
@@ -135,8 +141,13 @@ class ObsFeatureEncoder(nn.Module):
         reward_relic = N_RELIC_IDS
         reward_potion = MAX_REWARD_POTIONS * POTION_EMBED_DIM
         # Candidate cards on the current card-select screen, embedded per slot
-        # (reuses card_embed); appended LAST, after the reward blocks.
+        # (reuses card_embed).
         card_select = CHOICE_MAX * CARD_EMBED_DIM
+        # Overworld deck pooled mean+max through card_embed (order-agnostic set,
+        # like a pile), then the [act, ruby, emerald, sapphire] passthrough. Both
+        # appended LAST, after card_select, so the prior layout stays a clean prefix.
+        deck = _PILE_POOLS * CARD_EMBED_DIM
+        keys_act = KEYS_ACT_DIM
         return (
             hand
             + enemy
@@ -147,6 +158,8 @@ class ObsFeatureEncoder(nn.Module):
             + reward_relic
             + reward_potion
             + card_select
+            + deck
+            + keys_act
         )
 
     def _pool_pile(self, pile_ids: Tensor) -> Tensor:
@@ -264,12 +277,22 @@ class ObsFeatureEncoder(nn.Module):
         card_select_emb = self.card_embed(obs["card_select_ids"].long())  # (B, CHOICE_MAX, C)
         card_select = card_select_emb.reshape(batch, -1)
 
-        # CAUTION: the reward and card-select blocks are appended LAST, in this
-        # fixed order (cards, then relics, then potions, then card_select), so an
-        # old checkpoint's trained input columns stay the leading prefix and
-        # migrate_encoder_trunk_input_width widens the trunk by a clean zero-init suffix.
-        # Do NOT insert a block ahead of these or reorder them, or the migration
-        # would silently mismap columns.
+        # DECK: the full overworld deck pooled mean+max through card_embed, exactly
+        # like the draw / discard / exhaust piles (order-agnostic set, so pooled not
+        # per-slot flattened -- the deck maps to no action slot). PAD slots pool to
+        # the padding_idx zero vector, so an empty deck contributes a zero block.
+        deck = self._pool_pile(obs["deck_ids"].long())  # (B, 2*CARD_EMBED_DIM)
+
+        # KEYS/ACT: [act, ruby, emerald, sapphire], a raw passthrough float block
+        # (already coerced to float32 above), like player_scalars -- not embedded.
+        keys_act = obs["keys_act"]
+
+        # CAUTION: the reward, card-select, deck, and keys/act blocks are appended
+        # LAST, in this fixed order (reward cards, relics, potions, then card_select,
+        # then the pooled deck, then keys/act), so an old checkpoint's trained input
+        # columns stay the leading prefix and migrate_encoder_trunk_input_width widens
+        # the trunk by a clean zero-init suffix. Do NOT insert a block ahead of these
+        # or reorder them, or the migration would silently mismap columns.
         return torch.cat(
             [
                 hand,
@@ -281,6 +304,8 @@ class ObsFeatureEncoder(nn.Module):
                 reward_relic,
                 reward_potion,
                 card_select,
+                deck,
+                keys_act,
             ],
             dim=1,
         )

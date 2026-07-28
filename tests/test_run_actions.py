@@ -20,6 +20,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
     pytest.skip(f"engine not built ({exc})", allow_module_level=True)
 
 from sts_rl.env._engine import slaythespire as sts
+from sts_rl.env.actions import auto_resolve, build_mask, decode_action
+from sts_rl.env.engine import start_combat
 from sts_rl.env.run import describe_action, is_run_over, overworld_actions, start_run
 from sts_rl.env.run_actions import (
     _RT_CARD,
@@ -57,6 +59,16 @@ BATTLE_SIM_COUNT = 40
 MAX_RUN_STEPS = 4000
 
 _EVENT = ACTION_BLOCK_BY_NAME["EVENT_SELECT"]
+_PROCEED = ACTION_BLOCK_BY_NAME["PROCEED"]
+# Engine GameAction::getValidEventSelectBits enumerates an event's options as a
+# bitmask; the highest bit any event sets is option index 6 (Cursed Tome's final
+# phase returns 0x3 << 5, options 5 and 6). EVENT_SELECT slots at or beyond index 7
+# are therefore dead headroom the engine can never make legal.
+_ENGINE_MAX_EVENT_OPTION_IDX = 6
+# Modest combat fuzz for the dead-slot guard: combat build_mask only sets combat
+# blocks, so a small random-legal sweep suffices to catch a relayout collision.
+DEAD_SLOT_COMBAT_SEEDS = range(30)
+MAX_STEPS_PER_COMBAT = 500
 
 
 def _battle_agent() -> object:
@@ -192,3 +204,122 @@ def test_run_navigation_no_false_positives() -> None:
     # post-combat reward screen, so requiring REWARDS also guarantees the
     # reward-placement parity check above actually ran.
     assert {"EVENT_SCREEN", "MAP_SCREEN", "REWARDS"} <= seen_screens
+
+
+def _dead_action_indices() -> set[int]:
+    """Action indices no screen can ever legally map to, derived from the live layout.
+
+    PROCEED maps to no screen at all; EVENT_SELECT is sized past the engine's max
+    event option index, leaving trailing headroom slots. Both ranges come from
+    ACTION_BLOCK_BY_NAME, so a relayout moves them automatically (no literals).
+    """
+    dead = set(range(_PROCEED.start, _PROCEED.stop))
+    dead |= set(range(_EVENT.start + _ENGINE_MAX_EVENT_OPTION_IDX + 1, _EVENT.stop))
+    return dead
+
+
+def test_dead_action_slots_never_masked_overworld() -> None:
+    """PROCEED and the EVENT_SELECT dead headroom are never set legal in overworld masks.
+
+    PROCEED is a reserved slot no screen maps to, and EVENT_SELECT is sized past the
+    engine's max event option index, so both are dead today. This guards them: if a
+    future layout shift made a dead index overlap a live action, the navigation fuzz
+    below (map / event / reward / shop / rest / treasure / boss screens) would set it
+    and this fails. Every index is derived from the interface, so the guard tracks a
+    relayout rather than pinning current literals.
+    """
+    dead = _dead_action_indices()
+    assert dead  # sanity: the layout has a PROCEED slot and EVENT_SELECT headroom
+    agent = _battle_agent()
+    seen_event_option = False
+    for seed in RUN_SEEDS:
+        gc = start_run(seed=seed)
+        rng = np.random.default_rng(seed)
+        for _ in range(MAX_RUN_STEPS):
+            if is_run_over(gc):
+                break
+            if gc.screen_state == sts.ScreenState.BATTLE:
+                agent.playout_battle(gc)
+                continue
+            auto_resolve_overworld(gc)
+            if is_run_over(gc) or gc.screen_state == sts.ScreenState.BATTLE:
+                continue
+            legal = np.flatnonzero(build_overworld_mask(gc))
+            assert legal.size > 0, f"empty overworld mask on {gc.screen_state} (seed {seed})"
+            for index in legal:
+                assert (
+                    int(index) not in dead
+                ), f"dead slot {int(index)} masked legal on {gc.screen_state} (seed {seed})"
+                if _EVENT.start <= int(index) < _EVENT.stop:
+                    seen_event_option = True
+            decode_overworld_action(int(rng.choice(legal)), gc).execute(gc)
+    # Neow (the opening screen) is an event, so EVENT_SELECT is always exercised; this
+    # keeps the headroom half of the guard from passing vacuously.
+    assert seen_event_option
+
+
+def test_dead_action_slots_never_masked_combat() -> None:
+    """The overworld-only dead slots are never set in combat masks either.
+
+    Combat build_mask sets only combat blocks, so PROCEED and the EVENT_SELECT
+    headroom must stay unset throughout a combat. Fuzzing random-legal combats guards
+    against a future relayout that let a combat index collide with one of them.
+    """
+    dead = _dead_action_indices()
+    states_checked = 0
+    for seed in DEAD_SLOT_COMBAT_SEEDS:
+        rng = np.random.default_rng(seed)
+        _, bc = start_combat(seed=seed)
+        for _ in range(MAX_STEPS_PER_COMBAT):
+            auto_resolve(bc)
+            if bc.outcome != sts.BattleOutcome.UNDECIDED:
+                break
+            legal = np.flatnonzero(build_mask(bc))
+            assert legal.size > 0, f"empty combat mask on non-terminal state (seed {seed})"
+            for index in legal:
+                assert (
+                    int(index) not in dead
+                ), f"dead slot {int(index)} masked legal in combat (seed {seed})"
+            states_checked += 1
+            decode_action(int(rng.choice(legal)), bc).execute(bc)
+    assert states_checked > 0
+
+
+def test_overworld_mask_rechecks_isvalidaction(monkeypatch) -> None:
+    """build_overworld_mask gates each enumerated action on isValidAction (combat parity).
+
+    getAllActionsInState already returns only legal moves, so the recheck is
+    defense-in-depth, matching the combat build_mask contract. A stubbed action whose
+    isValidAction is False must be dropped from the mask even though it was
+    enumerated, proving the per-bit gate is actually applied (not just trusted).
+    """
+    from sts_rl.env import run_actions
+
+    map_start = ACTION_BLOCK_BY_NAME["MAP_SELECT"].start
+
+    class _FakeAction:
+        """Minimal stand-in exposing the fields _gameaction_to_index / the recheck read."""
+
+        def __init__(self, valid: bool) -> None:
+            self.bits = 0  # not a potion action; reward-type bits unused on MAP_SCREEN
+            self.idx1 = 0  # maps to MAP_SELECT slot 0
+            self.idx2 = 0
+            self._valid = valid
+
+        def isValidAction(self, gc: object) -> bool:  # noqa: N802 - mirrors the engine API
+            return self._valid
+
+    class _FakeGC:
+        screen_state = sts.ScreenState.MAP_SCREEN
+        outcome = sts.GameOutcome.UNDECIDED  # is_run_over -> False
+
+    # A valid enumerated action on the map screen maps to MAP_SELECT slot 0 and is set.
+    monkeypatch.setattr(run_actions, "overworld_actions", lambda gc: (_FakeAction(True),))
+    mask_valid = build_overworld_mask(_FakeGC())
+    assert mask_valid[map_start]
+    assert mask_valid.sum() == 1
+
+    # The same enumerated action, now isValidAction False, is dropped by the recheck.
+    monkeypatch.setattr(run_actions, "overworld_actions", lambda gc: (_FakeAction(False),))
+    mask_invalid = build_overworld_mask(_FakeGC())
+    assert not mask_invalid.any()

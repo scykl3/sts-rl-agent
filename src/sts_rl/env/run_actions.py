@@ -225,7 +225,12 @@ def build_overworld_mask(gc: Any) -> Mask:
     screen = gc.screen_state
     for action in overworld_actions(gc):
         index = _gameaction_to_index(action, screen)
-        if index is not None:
+        # Gate each bit on isValidAction, mirroring combat build_mask.
+        # getAllActionsInState already enumerates only legal moves, so this recheck
+        # is defense-in-depth parity, not a behavior change: it preserves the
+        # invariant that a set bit is always an engine-confirmed-legal move even if
+        # the enumerator ever regressed.
+        if index is not None and action.isValidAction(gc):
             mask[index] = True
     return mask
 
