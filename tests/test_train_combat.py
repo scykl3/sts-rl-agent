@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import types
 from pathlib import Path
 from typing import cast
 
@@ -25,6 +26,8 @@ import pytest
 
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.train import EvalRecord, TrainHistory
+from sts_rl.env.reward import RewardConfig
+from sts_rl.env.reward_cli import reward_config_from_args
 from sts_rl.eval import EvalReport, make_holdout_seeds
 
 # scripts/ is not an importable package, so put it on sys.path to import the
@@ -215,6 +218,100 @@ def test_final_eval_report_recomputes_on_band_mismatch(
     assert result is sentinel
     assert result is not cached
     assert calls == 1
+
+
+def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() builds a RewardConfig from the shaping flags and passes it to BOTH the
+    training and eval envs, so a shaping flag reaches the live reward on the combat
+    side too (parity with test_train_run's same-named test).
+
+    Engine-free: the adapter module (StsEnv + DEFAULT_MAX_EPISODE_STEPS, both pulled
+    via deferred imports), the encounter pool, and train are all stubbed, so main()
+    runs its whole env-construction path without a native build. The stub StsEnv
+    records its reward_config kwarg.
+
+    Revert-verify: drop reward_config=reward_config from either StsEnv build in
+    main() and that env captures the RewardConfig() default (boss_kill 0.20 != 1.0),
+    failing the assertion.
+    """
+    captured_reward_configs: list[RewardConfig | None] = []
+
+    class _StubEnv:
+        def __init__(
+            self,
+            *,
+            ascension: int,
+            max_episode_steps: int,
+            encounters: object,
+            reward_config: RewardConfig | None = None,
+        ) -> None:
+            captured_reward_configs.append(reward_config)
+
+        def reset(
+            self, *, seed: int | None = None, options: object = None
+        ) -> tuple[object, dict[str, object]]:
+            return None, {"engine_commit": "stub-commit", "interface_version": "stub-iface"}
+
+        def close(self) -> None:
+            pass
+
+    # Bind both deferred `from sts_rl.env.adapter import ...` sites (build_arg_parser's
+    # DEFAULT_MAX_EPISODE_STEPS and main's StsEnv) to an engine-free fake module.
+    fake_adapter = types.ModuleType("sts_rl.env.adapter")
+    fake_adapter.DEFAULT_MAX_EPISODE_STEPS = 500  # type: ignore[attr-defined]
+    fake_adapter.StsEnv = _StubEnv  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sts_rl.env.adapter", fake_adapter)
+
+    # act1_encounter_pool() builds from engine enums; stub it so the default (unset
+    # --encounters) path needs no engine.
+    monkeypatch.setattr(train_combat, "act1_encounter_pool", lambda: ())
+
+    def _fake_train(_env: object, config: object, *, eval_env: object = None) -> TrainHistory:
+        # A last eval snapshot over the driver's DEFAULT band (base seed + the
+        # --eval-episodes passed on argv below) keeps _final_eval_report on the reuse
+        # path, so the final eval needs neither the engine nor a stubbed evaluate.
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_combat.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_combat, "train", _fake_train)
+    # --eval-episodes 4 matches _make_report's n_episodes so the reuse guard fires.
+    monkeypatch.setattr(
+        sys, "argv", ["train_combat", "--boss-kill-coef", "1.0", "--eval-episodes", "4"]
+    )
+
+    train_combat.main()
+
+    # Both the training env and the eval env received the overridden shaping config.
+    assert len(captured_reward_configs) == 2
+    assert all(rc is not None and rc.boss_kill == 1.0 for rc in captured_reward_configs)
+
+
+@pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")
+def test_arg_parser_wires_reward_shaping_flags() -> None:
+    """build_arg_parser wires the shared reward-shaping flags: an empty argv maps to
+    RewardConfig() and --boss-kill-coef overrides only boss_kill.
+
+    Guards that build_arg_parser calls add_reward_shaping_args (drop the call and
+    --boss-kill-coef becomes unrecognized). Engine-gated: build_arg_parser imports
+    the adapter (for DEFAULT_MAX_EPISODE_STEPS), which pulls the native engine. The
+    mapping itself is locked engine-free in test_reward_cli.
+    """
+    parser = train_combat.build_arg_parser()
+    assert reward_config_from_args(parser.parse_args([])) == RewardConfig()
+    overridden = reward_config_from_args(parser.parse_args(["--boss-kill-coef", "1.0"]))
+    assert overridden.boss_kill == 1.0
+    # Overriding one coefficient leaves the others at their RewardConfig default.
+    assert overridden.enemy_hp_removed == RewardConfig().enemy_hp_removed
 
 
 @pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")

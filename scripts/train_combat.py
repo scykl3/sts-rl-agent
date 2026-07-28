@@ -42,6 +42,7 @@ from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
 from sts_rl.env.encounters import act1_encounter_pool, resolve_encounter_names
+from sts_rl.env.reward_cli import add_reward_shaping_args, reward_config_from_args
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 from sts_rl.interface import InterfaceError
 
@@ -174,6 +175,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ppo_defaults.target_kl,
         help="approximate-KL early-stop threshold (unset disables the early stop)",
     )
+    # Reward-shaping coefficients (shared with train_run). floor_progress and
+    # boss_kill are run-mode signals and stay 0.0 in single-combat, exposed here
+    # only for parity with train_run.
+    add_reward_shaping_args(parser)
     parser.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM, help="encoder trunk width")
     parser.add_argument("--ascension", type=int, default=DEFAULT_ASCENSION, help="ascension level")
     parser.add_argument(
@@ -263,6 +268,10 @@ def main() -> None:
     # full enum tuple) and the pool is built once, at the point of use.
     encounters = args.encounters if args.encounters is not None else act1_encounter_pool()
 
+    # Same shaping config for both envs so training and holdout eval score the same
+    # reward; unset flags reproduce the RewardConfig() default.
+    reward_config = reward_config_from_args(args)
+
     # Two env instances: `env` is the training env (its reset stream is seeded via
     # TrainConfig.seed through the collector), and `eval_env` is a SEPARATE
     # instance for greedy holdout eval - both the in-loop periodic eval and the
@@ -272,11 +281,13 @@ def main() -> None:
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
         encounters=encounters,
+        reward_config=reward_config,
     )
     eval_env = StsEnv(
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
         encounters=encounters,
+        reward_config=reward_config,
     )
 
     # Provenance for reproducibility: engine_commit and interface_version are
