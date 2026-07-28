@@ -10,7 +10,7 @@
 [engine]
 repo = "https://github.com/maxy1991991/sts_lightspeed"
 branch = "master"
-commit = "c1a777f3c60badf86b94469045075f021cc86e85"
+commit = "969364852182c0f2b56827d2f0108d3a53d75eae"
 module = "slaythespire"
 upstream = "https://github.com/daniel-ziegler/sts_lightspeed"
 
