@@ -1015,3 +1015,39 @@ def test_neow_event_fields_empty_off_event_screen_real_encode() -> None:
         assert not np.any(obs["event_onehot"])
         assert not np.any(obs["neow_bonus"])
         assert not np.any(obs["neow_drawback"])
+
+
+def test_fill_neow_event_drops_out_of_range_event_id() -> None:
+    # A cur_event id past the table (>= N_EVENT_IDS) or negative is dropped by the bounds
+    # guard: no event_onehot bit is set and nothing overflows. Unreachable from the live
+    # engine (max id is exactly N_EVENT_IDS - 1), so this guards the invariant directly.
+    for bad_event in (N_EVENT_IDS, N_EVENT_IDS + 5, -1):
+        gc = _neow_gc([], cur_event=bad_event)
+        obs = _empty_obs()
+        _fill_neow_event(obs, gc)  # must not raise
+        assert not np.any(obs["event_onehot"]), bad_event
+        assert not np.any(obs["neow_bonus"])
+        assert not np.any(obs["neow_drawback"])
+
+
+def test_fill_neow_event_drops_out_of_range_option_ids() -> None:
+    # On the Neow screen, an option whose NeowBonus / NeowDrawback id is out of range is
+    # dropped, not written. Placed last so that without the per-index guard the write
+    # (k * N_NEOW_BONUS + N_NEOW_BONUS) would land one past the option's span / the array
+    # end; the guard keeps every write inside its own per-option one-hot span.
+    valid = (int(sts.NeowBonus.TWO_FIFTY_GOLD), int(sts.NeowDrawback.NONE))
+    options = [valid, valid, valid, (N_NEOW_BONUS, N_NEOW_DRAWBACK)]  # last is out of range
+    assert len(options) == MAX_NEOW_OPTIONS
+    gc = _neow_gc(options)
+    obs = _empty_obs()
+    _fill_neow_event(obs, gc)  # must not raise / overflow
+
+    # event_onehot still marks NEOW; only the three in-range options set a bit.
+    assert obs["event_onehot"][int(sts.Event.NEOW)] == 1.0
+    assert obs["event_onehot"].sum() == 1.0
+    assert obs["neow_bonus"].sum() == MAX_NEOW_OPTIONS - 1
+    assert obs["neow_drawback"].sum() == MAX_NEOW_OPTIONS - 1
+    # The dropped option's own span is entirely zero (no overflow into it).
+    last = MAX_NEOW_OPTIONS - 1
+    assert not np.any(obs["neow_bonus"][last * N_NEOW_BONUS : (last + 1) * N_NEOW_BONUS])
+    assert not np.any(obs["neow_drawback"][last * N_NEOW_DRAWBACK : (last + 1) * N_NEOW_DRAWBACK])

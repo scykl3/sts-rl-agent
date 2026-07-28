@@ -376,8 +376,10 @@ def _fill_neow_event(obs: Obs, gc: Any) -> None:
     ``cur_event`` never leaks a phantom bit.
 
     On any event screen, ``event_onehot`` marks the current event id (``gc.cur_event``);
-    the index is bounds-guarded so a stray / INVALID id past the table is dropped rather
-    than overflowing. On the Neow event (``cur_event == NEOW``) the engine offers
+    the index is bounds-guarded so an out-of-range id (negative or ``>= N_EVENT_IDS``)
+    is dropped rather than overflowing. ``Event.INVALID`` (id 0) is in range but never
+    the current event on screen, so column 0 stays a dead column. On the Neow event
+    (``cur_event == NEOW``) the engine offers
     ``MAX_NEOW_OPTIONS`` reward options in ``screen_state_info.neowRewards``; each option
     pairs a ``NeowBonus`` (``.r``) with a ``NeowDrawback`` (``.d``), written as two
     per-option one-hot spans, option ``k``'s bonus at ``k * N_NEOW_BONUS + int(opt.r)``
