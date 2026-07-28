@@ -22,6 +22,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.run import describe_action, is_run_over, overworld_actions, start_run
 from sts_rl.env.run_actions import (
+    _PROCEED,
     _RT_CARD,
     _RT_CARD_REMOVE,
     _RT_GOLD,
@@ -29,6 +30,7 @@ from sts_rl.env.run_actions import (
     _RT_POTION,
     _RT_RELIC,
     _RT_SKIP,
+    _gameaction_to_index,
     auto_resolve_overworld,
     build_overworld_mask,
     decode_overworld_action,
@@ -192,3 +194,85 @@ def test_run_navigation_no_false_positives() -> None:
     # post-combat reward screen, so requiring REWARDS also guarantees the
     # reward-placement parity check above actually ran.
     assert {"EVENT_SCREEN", "MAP_SCREEN", "REWARDS"} <= seen_screens
+
+
+class _StubGameAction:
+    """Minimal stand-in for an engine ``GameAction`` for mask-logic unit tests.
+
+    Carries only the fields the decode/mask logic reads (``bits``/``idx1``/``idx2``
+    and ``isValidAction``), so a bit can be enumerated without reaching the state
+    where the engine would naturally offer it.
+    """
+
+    def __init__(self, idx1: int = 0, idx2: int = 0, bits: int = 0, valid: bool = True) -> None:
+        self.idx1 = idx1
+        self.idx2 = idx2
+        self.bits = bits
+        self._valid = valid
+
+    def isValidAction(self, gc: object) -> bool:  # noqa: N802 - matches engine method name
+        return self._valid
+
+
+class _StubGC:
+    def __init__(self, screen: object) -> None:
+        self.screen_state = screen
+
+
+def test_overworld_mask_gates_on_isvalidaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mapped action that fails ``isValidAction`` is not set legal.
+
+    ``getAllActionsInState`` already pre-filters by legality, so the per-bit
+    re-check is defense-in-depth (matching combat ``build_mask`` and the gate in
+    ``execute_overworld_action``); this pins that the mask builder itself drops a
+    bit whose action reports invalid.
+    """
+    from sts_rl.env import run_actions as ra
+
+    map_start = ACTION_BLOCK_BY_NAME["MAP_SELECT"].start
+    gc = _StubGC(sts.ScreenState.MAP_SCREEN)
+    monkeypatch.setattr(ra, "is_run_over", lambda _gc: False)
+
+    monkeypatch.setattr(ra, "overworld_actions", lambda _gc: (_StubGameAction(idx1=0, valid=True),))
+    assert build_overworld_mask(gc)[map_start]
+
+    monkeypatch.setattr(
+        ra, "overworld_actions", lambda _gc: (_StubGameAction(idx1=0, valid=False),)
+    )
+    assert not build_overworld_mask(gc).any()
+
+
+def test_event_option_slots_all_representable() -> None:
+    """Event options across the whole EVENT_SELECT block map to distinct slots.
+
+    The stub-driven check confirms the slot->index mapping is one-to-one over options
+    0..count-1 (each maps to start + idx1), an out-of-range option (idx1 >= count) maps to
+    None, and a two-card MATCH_AND_KEEP pick (idx2 != 0) maps to None. It exercises the
+    mapping arithmetic only; engine legality of the higher option indices is covered by the
+    run-navigation fuzz test (test_run_navigation_no_false_positives), not this mapping test.
+    """
+    screen = sts.ScreenState.EVENT_SCREEN
+    for idx1 in range(_EVENT.count):
+        assert _gameaction_to_index(_StubGameAction(idx1=idx1), screen) == _EVENT.start + idx1
+    # An option index at/beyond the block count is unrepresentable (returns None).
+    assert _gameaction_to_index(_StubGameAction(idx1=_EVENT.count), screen) is None
+    # A two-card MATCH_AND_KEEP pick (idx2 != 0) has no single-index form.
+    assert _gameaction_to_index(_StubGameAction(idx1=0, idx2=1), screen) is None
+
+
+def test_proceed_slot_guard_fires(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``build_overworld_mask`` asserts the reserved PROCEED slot is never set.
+
+    No ``_gameaction_to_index`` branch emits PROCEED, so it can never be legal; the
+    assertion makes a future mapping regression that emitted it fail here instead of
+    handing the policy an index that decodes to nothing. Simulate that regression by
+    forcing the mapper onto the PROCEED slot and confirm the guard trips.
+    """
+    from sts_rl.env import run_actions as ra
+
+    gc = _StubGC(sts.ScreenState.MAP_SCREEN)
+    monkeypatch.setattr(ra, "is_run_over", lambda _gc: False)
+    monkeypatch.setattr(ra, "overworld_actions", lambda _gc: (_StubGameAction(),))
+    monkeypatch.setattr(ra, "_gameaction_to_index", lambda _action, _screen: _PROCEED.start)
+    with pytest.raises(AssertionError):
+        build_overworld_mask(gc)

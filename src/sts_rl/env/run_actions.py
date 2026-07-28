@@ -103,6 +103,10 @@ _EVENT = ACTION_BLOCK_BY_NAME["EVENT_SELECT"]
 _BOSS = ACTION_BLOCK_BY_NAME["BOSS_RELIC_SELECT"]
 _REWARD = ACTION_BLOCK_BY_NAME["REWARD_SELECT"]
 _CARD_SELECT = ACTION_BLOCK_BY_NAME["CARD_SELECT"]
+# PROCEED is a reserved tail slot with no GameAction mapping (see _gameaction_to_index
+# and build_overworld_mask): no branch ever emits its index, so it is never masked or
+# decoded. Kept for the assertion that guards that invariant.
+_PROCEED = ACTION_BLOCK_BY_NAME["PROCEED"]
 
 
 def _reward_type(bits: int) -> int:
@@ -172,6 +176,9 @@ def _gameaction_to_index(action: Any, screen: Any) -> int | None:
         # card pair, which has no single-index representation.
         if idx2 != 0:
             return None
+        # Engine event options run 0..6 (the highest, CURSED_TOME, uses index 6);
+        # the block is sized to _EVENT.count == 10, so slots 7..9 are unused
+        # headroom that no event fills, not never-legal-by-mapping.
         return _EVENT.start + idx1 if idx1 < _EVENT.count else None
     if screen == screen_state.CARD_SELECT:
         return _CARD_SELECT.start + idx1 if idx1 < CHOICE_MAX else None
@@ -213,11 +220,12 @@ def build_overworld_mask(gc: Any) -> Mask:
     """Return the ``(ACTION_DIM,)`` bool mask of representable legal overworld moves.
 
     A bit is set only for an engine-enumerated legal ``GameAction`` that maps to
-    an interface index, so decoding and executing any set index is safe. May be
-    all-False on a non-terminal screen whose only legal moves are unrepresentable
-    (match-and-keep, a card-select beyond ``CHOICE_MAX``); callers advance past
-    such states with :func:`auto_resolve_overworld` before handing the mask to an
-    agent. Does not mutate ``gc`` or assert the mask is non-empty.
+    an interface index and still passes ``isValidAction``, so decoding and
+    executing any set index is safe. May be all-False on a non-terminal screen
+    whose only legal moves are unrepresentable (match-and-keep, a card-select
+    beyond ``CHOICE_MAX``); callers advance past such states with
+    :func:`auto_resolve_overworld` before handing the mask to an agent. Does not
+    mutate ``gc`` or assert the mask is non-empty.
     """
     mask = np.zeros(ACTION_DIM, dtype=np.bool_)
     if is_run_over(gc):
@@ -225,8 +233,17 @@ def build_overworld_mask(gc: Any) -> Mask:
     screen = gc.screen_state
     for action in overworld_actions(gc):
         index = _gameaction_to_index(action, screen)
-        if index is not None:
+        # Re-check isValidAction per bit, mirroring combat build_mask and the gate
+        # in execute_overworld_action. getAllActionsInState already pre-filters by
+        # legality, so this is defense-in-depth: it keeps "every set bit is a
+        # currently-legal move" enforced in the mask builder itself, not inferred
+        # from the enumerator's contract.
+        if index is not None and action.isValidAction(gc):
             mask[index] = True
+    # PROCEED has no _gameaction_to_index branch, so no legal move can map to it;
+    # assert it stays unset so a future layout or mapping change that made it live
+    # fails a test here instead of feeding the policy an undecodable index.
+    assert not mask[_PROCEED.start], "PROCEED slot must never be legal"
     return mask
 
 

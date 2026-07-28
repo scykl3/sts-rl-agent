@@ -154,8 +154,13 @@ _ACTION_BLOCK_SPECS: tuple[tuple[str, int], ...] = (
     ("SHOP_SELECT", 15),
     ("REST_SELECT", 7),  # rest / smith / recall / lift / toke / dig / skip
     ("TREASURE_SELECT", 2),  # open chest / skip
+    # Events expose option slots from 0; the highest index any event uses is 6
+    # (CURSED_TOME), so the count carries headroom and slots 7..9 stay unused.
     ("EVENT_SELECT", 10),
     ("BOSS_RELIC_SELECT", 4),
+    # Reserved tail slot: no engine move maps to it, so it is never set legal in a
+    # mask nor decoded (build_overworld_mask asserts this). Also used by tests as a
+    # stable always-illegal index.
     ("PROCEED", 1),
 )
 
