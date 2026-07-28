@@ -73,6 +73,8 @@ def _expected_feature_dim() -> int:
     event_onehot = interface.N_EVENT_IDS
     neow_bonus = interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS
     neow_drawback = interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK
+    # Multi-stage event phase one-hot, appended last (after the Neow-event blocks).
+    event_phase = interface.EVENT_PHASE_DIM
     return (
         hand
         + enemy
@@ -96,6 +98,7 @@ def _expected_feature_dim() -> int:
         + event_onehot
         + neow_bonus
         + neow_drawback
+        + event_phase
     )
 
 
@@ -121,15 +124,24 @@ def _shop_boss_tail_width() -> int:
 def _neow_event_tail_width() -> int:
     """Total width of the Neow-event one-hot blocks appended after the boss-relic block.
 
-    These are now the concat tail, so every end-relative slice below steps back past
-    BOTH this and the shop / boss-relic suffix to reach the earlier blocks. Derived
-    from the interface constants, mirroring the encoder's append.
+    The event-phase one-hot is appended after these, so it (not this) is the concat tail;
+    every end-relative slice below steps back past the event-phase block, these Neow
+    blocks, and the shop / boss-relic suffix to reach the earlier blocks. Derived from the
+    interface constants, mirroring the encoder's append.
     """
     return (
         interface.N_EVENT_IDS  # event_onehot
         + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS  # neow bonus one-hots
         + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK  # neow drawback one-hots
     )
+
+
+def _event_phase_tail_width() -> int:
+    """Width of the event-phase one-hot block, the current concat tail (appended after the
+    Neow-event blocks). A single interface constant, kept as a helper so the end-relative
+    slices below read uniformly alongside the other tail-width helpers.
+    """
+    return interface.EVENT_PHASE_DIM
 
 
 def _relic_block_start(enc: ObsFeatureEncoder) -> int:
@@ -145,6 +157,7 @@ def _relic_block_start(enc: ObsFeatureEncoder) -> int:
     keys_act_width = interface.KEYS_ACT_DIM
     return (
         enc.feature_dim
+        - _event_phase_tail_width()
         - _neow_event_tail_width()
         - _shop_boss_tail_width()
         - keys_act_width
@@ -164,7 +177,8 @@ def _shop_relic_block_start(enc: ObsFeatureEncoder) -> int:
     """
     return (
         enc.feature_dim
-        - _neow_event_tail_width()  # the Neow-event blocks (the current concat tail)
+        - _event_phase_tail_width()  # the event-phase block (the current concat tail)
+        - _neow_event_tail_width()  # the Neow-event blocks
         - interface.N_RELIC_IDS  # boss_relic block
         - 1  # shop_remove_cost
         - interface.MAX_SHOP_POTIONS  # shop_potion_prices
@@ -175,8 +189,14 @@ def _shop_relic_block_start(enc: ObsFeatureEncoder) -> int:
 
 
 def _boss_relic_block_start(enc: ObsFeatureEncoder) -> int:
-    """Start column of the boss-relic multihot block (now followed by the Neow-event tail)."""
-    return enc.feature_dim - _neow_event_tail_width() - interface.N_RELIC_IDS
+    """Start column of the boss-relic multihot block (followed by the Neow-event tail and
+    then the event-phase block)."""
+    return (
+        enc.feature_dim
+        - _event_phase_tail_width()
+        - _neow_event_tail_width()
+        - interface.N_RELIC_IDS
+    )
 
 
 def test_forward_output_shape():
@@ -265,6 +285,7 @@ def test_reward_block_is_zero_when_all_pad():
     # keys/act, and shop / boss-relic blocks.
     card_start = (
         enc.feature_dim
+        - _event_phase_tail_width()
         - _neow_event_tail_width()
         - _shop_boss_tail_width()
         - keys_act_width
@@ -301,7 +322,8 @@ def test_reward_relic_and_potion_blocks_zero_when_empty():
     # Appended after the potion block, in order: card_select, deck, keys/act, then the
     # shop / boss-relic blocks (the current concat tail).
     tail = (
-        _neow_event_tail_width()
+        _event_phase_tail_width()
+        + _neow_event_tail_width()
         + _shop_boss_tail_width()
         + card_select_width
         + deck_width
@@ -327,7 +349,13 @@ def test_card_select_block_is_zero_when_all_pad():
     card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
     deck_width = _PILE_POOLS * CARD_EMBED_DIM
     keys_act_width = interface.KEYS_ACT_DIM
-    tail = _neow_event_tail_width() + _shop_boss_tail_width() + deck_width + keys_act_width
+    tail = (
+        _event_phase_tail_width()
+        + _neow_event_tail_width()
+        + _shop_boss_tail_width()
+        + deck_width
+        + keys_act_width
+    )
     card_select_block = feats[:, -(tail + card_select_width) : -tail]
     assert torch.equal(card_select_block, torch.zeros(BATCH, card_select_width))
 
@@ -345,7 +373,12 @@ def test_deck_block_is_zero_when_all_pad():
     feats = enc.encode_features(obs)
     keys_act_width = interface.KEYS_ACT_DIM
     deck_width = _PILE_POOLS * CARD_EMBED_DIM
-    tail = _neow_event_tail_width() + _shop_boss_tail_width() + keys_act_width
+    tail = (
+        _event_phase_tail_width()
+        + _neow_event_tail_width()
+        + _shop_boss_tail_width()
+        + keys_act_width
+    )
     deck_block = feats[:, -(tail + deck_width) : -tail]
     assert torch.equal(deck_block, torch.zeros(BATCH, deck_width))
 
@@ -364,7 +397,7 @@ def test_keys_act_is_passthrough_block():
     )
     obs["keys_act"] = known
     feats = enc.encode_features(obs)
-    tail = _neow_event_tail_width() + _shop_boss_tail_width()
+    tail = _event_phase_tail_width() + _neow_event_tail_width() + _shop_boss_tail_width()
     assert torch.equal(feats[:, -(tail + interface.KEYS_ACT_DIM) : -tail], known)
 
 
@@ -414,8 +447,43 @@ def test_keys_act_influences_trunk():
     enc(obs).sum().backward()
     grad = enc.trunk[0].weight.grad
     assert grad is not None
-    tail = _neow_event_tail_width() + _shop_boss_tail_width()
+    tail = _event_phase_tail_width() + _neow_event_tail_width() + _shop_boss_tail_width()
     assert torch.count_nonzero(grad[:, -(tail + interface.KEYS_ACT_DIM) : -tail]) > 0
+
+
+def test_event_phase_is_passthrough_block():
+    """event_phase_onehot is a raw passthrough occupying the final EVENT_PHASE_DIM columns.
+
+    Not embedded: the encoder concatenates the coerced event-phase one-hot as-is as the
+    concat tail (appended after the Neow-event blocks), so the trailing
+    _event_phase_tail_width() columns equal the input event_phase_onehot exactly.
+    """
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    known = torch.arange(BATCH * interface.EVENT_PHASE_DIM, dtype=torch.float32).reshape(
+        BATCH, interface.EVENT_PHASE_DIM
+    )
+    obs["event_phase_onehot"] = known
+    feats = enc.encode_features(obs)
+    assert torch.equal(feats[:, -_event_phase_tail_width() :], known)
+
+
+def test_event_phase_influences_trunk():
+    """The event-phase columns feed the first trunk Linear (nonzero -> gradient there).
+
+    event_phase_onehot has no embedding table, so its learning signal shows up as gradient
+    on the first trunk Linear's event-phase input columns (the concat tail); a nonzero
+    event-phase input drives gradient into exactly those columns. The seed keeps the
+    sparse-input ReLU liveness deterministic.
+    """
+    torch.manual_seed(0)
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    obs["event_phase_onehot"] = torch.ones_like(obs["event_phase_onehot"])
+    enc(obs).sum().backward()
+    grad = enc.trunk[0].weight.grad
+    assert grad is not None
+    assert torch.count_nonzero(grad[:, -_event_phase_tail_width() :]) > 0
 
 
 def test_gradient_flows_to_embeddings():
