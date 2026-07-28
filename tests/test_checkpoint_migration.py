@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
-from sts_rl.agent.encoder import CARD_EMBED_DIM, _PILE_POOLS
+from sts_rl.agent.encoder import CARD_EMBED_DIM, POTION_EMBED_DIM, _PILE_POOLS
 from sts_rl.agent.checkpoint_migration import (
     OLD_ACTION_LAYOUTS,
     POLICY_LOGITS_BIAS_KEY,
@@ -42,6 +42,10 @@ from sts_rl.interface import (
     ACTION_DIM,
     INTERFACE_VERSION,
     KEYS_ACT_DIM,
+    MAX_SHOP_CARDS,
+    MAX_SHOP_POTIONS,
+    MAX_SHOP_RELICS,
+    N_RELIC_IDS,
     InterfaceError,
 )
 
@@ -63,13 +67,13 @@ _BLOCK_CODE_STRIDE = 1000
 NEW_ONLY_BLOCKS = ("REWARD_SELECT", "TREASURE_SELECT")
 
 # The recorded prior trunk widths the widen guard accepts (the narrower is the
-# pre-reward-vision combat width; the wider is the card-vision width). The widen
+# pre-reward-vision combat width; the wider is the widest recorded prior). The widen
 # tests below pin old_feat to one of these so they track _KNOWN_PRIOR_FEATURE_DIMS
 # rather than a synthetic ``target - <block widths>`` width, which each later block
-# append pushes out of the guard's accepted set (the offered-relic/potion append and
-# then the card-select append both did that to the old ``target - <block>`` forms).
+# append pushes out of the guard's accepted set (the offered-relic/potion, card-select,
+# and shop/boss appends all did that to the old ``target - <block>`` forms).
 PRE_REWARD_FEATURE_DIM = min(_KNOWN_PRIOR_FEATURE_DIMS)  # combat / pre-reward-vision
-CARD_VISION_FEATURE_DIM = max(_KNOWN_PRIOR_FEATURE_DIMS)  # after the reward-card block
+WIDEST_PRIOR_FEATURE_DIM = max(_KNOWN_PRIOR_FEATURE_DIMS)  # the widest recorded prior
 
 
 def _seed_old_head(hidden: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -636,26 +640,87 @@ def test_migrate_trunk_accepts_known_prior_widths(known_feat: int) -> None:
     assert torch.equal(model.encoder.trunk[0].weight, new_weight)
 
 
-# The shipped 0.6.0 feature width, now a recorded prior that must widen to the
-# deck + keys/act layout. Fixed history, like the widths in _KNOWN_PRIOR_FEATURE_DIMS.
+# The shipped 0.6.0 feature width, now a recorded prior. Fixed history, like the
+# widths in _KNOWN_PRIOR_FEATURE_DIMS.
 SHIPPED_0_6_0_FEATURE_DIM = 4881
 
+# The shipped 0.7.0 feature width (0.6.0 + pooled deck + keys/act), now a recorded
+# prior that must widen to the shop / boss-relic layout. Fixed history.
+SHIPPED_0_7_0_FEATURE_DIM = 4949
 
-def test_shipped_4881_prior_widens_to_deck_keys_act_layout() -> None:
-    """The 0.6.0 width (4881) is a recorded prior and widens cleanly to the new dim.
 
-    A warm-start checkpoint trained at the shipped 4881-wide encoder must widen to
-    the deck + keys/act layout: its trained columns preserved as the leading prefix,
-    the appended pooled-deck (mean+max) and keys/act columns zero-initialized. The
-    target width is checked symbolically against the interface / encoder constants,
-    never a hardcoded literal.
+def _shop_boss_block_width() -> int:
+    """Total width appended for the shop + boss-relic screen blocks (the 0.8.0 append).
+
+    Derived symbolically from the interface / encoder constants, mirroring the
+    encoder's own append: shop cards / potions embedded per slot, shop relics and boss
+    relics as N_RELIC_IDS-wide multihots, each shop id block followed by its raw price
+    columns, plus the scalar remove cost.
+    """
+    return (
+        MAX_SHOP_CARDS * CARD_EMBED_DIM  # shop cards embedded
+        + MAX_SHOP_CARDS  # shop card prices
+        + N_RELIC_IDS  # shop relic multihot
+        + MAX_SHOP_RELICS  # shop relic prices
+        + MAX_SHOP_POTIONS * POTION_EMBED_DIM  # shop potions embedded
+        + MAX_SHOP_POTIONS  # shop potion prices
+        + 1  # shop remove cost
+        + N_RELIC_IDS  # boss relic multihot
+    )
+
+
+def test_shipped_4881_prior_widens_to_current_layout() -> None:
+    """The 0.6.0 width (4881) is a recorded prior and widens cleanly to the current dim.
+
+    A warm-start checkpoint trained at the shipped 4881-wide encoder must widen to the
+    current layout: its trained columns preserved as the leading prefix, every appended
+    column (the pooled deck + keys/act that made the 0.7.0 width, then the shop /
+    boss-relic blocks) zero-initialized. The intermediate 0.7.0 relationship is checked
+    symbolically against the interface / encoder constants, never a hardcoded literal.
     """
     assert SHIPPED_0_6_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
     target = _current_feature_dim()
-    # New width = 4881 + pooled deck (mean+max) + keys/act, derived symbolically.
-    assert target == SHIPPED_0_6_0_FEATURE_DIM + _PILE_POOLS * CARD_EMBED_DIM + KEYS_ACT_DIM
+    # 4881 + pooled deck (mean+max) + keys/act was the 0.7.0 width (4949), itself now a
+    # recorded prior; the shop / boss blocks were appended after it. Derived
+    # symbolically, never a hardcoded literal.
+    assert (
+        SHIPPED_0_6_0_FEATURE_DIM + _PILE_POOLS * CARD_EMBED_DIM + KEYS_ACT_DIM
+        == SHIPPED_0_7_0_FEATURE_DIM
+    )
+    assert SHIPPED_0_7_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
 
     old_feat = SHIPPED_0_6_0_FEATURE_DIM
+    assert old_feat < target
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+
+    migrated = migrate_encoder_trunk_input_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :old_feat], old_weight)  # prefix preserved
+    assert torch.count_nonzero(new_weight[:, old_feat:]) == 0  # appended suffix zero
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
+def test_shipped_4949_prior_widens_to_shop_boss_layout() -> None:
+    """The 0.7.0 width (4949) is a recorded prior and widens cleanly to the current dim.
+
+    A warm-start checkpoint trained at the shipped 4949-wide encoder (deck + keys/act,
+    before the shop / boss-relic screen blocks) must widen to the current layout: its
+    trained columns preserved as the leading prefix, the appended shop cards + prices,
+    shop relics + prices, shop potions + prices, remove cost, and boss-relic columns
+    zero-initialized. The target width is checked symbolically against the interface /
+    encoder constants, never a hardcoded literal.
+    """
+    assert SHIPPED_0_7_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
+    target = _current_feature_dim()
+    # New width = 4949 + the appended shop / boss-relic screen blocks, symbolic.
+    assert target == SHIPPED_0_7_0_FEATURE_DIM + _shop_boss_block_width()
+
+    old_feat = SHIPPED_0_7_0_FEATURE_DIM
     assert old_feat < target
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
@@ -694,17 +759,17 @@ def test_load_checkpoint_widens_narrow_trunk(tmp_path) -> None:
     assert torch.count_nonzero(loaded[:, old_feat:]) == 0
 
 
-def test_load_checkpoint_widens_trunk_from_card_vision_prior(tmp_path) -> None:
-    """A card-vision (recorded-prior) checkpoint widens its trunk on load.
+def test_load_checkpoint_widens_trunk_from_widest_prior(tmp_path) -> None:
+    """A checkpoint at the widest recorded prior widens its trunk on load.
 
-    A current-layout checkpoint whose encoder is at the card-vision width (has the
-    reward-card block but none of the later appended blocks) loads into the
-    now-wider trunk: its trained columns are preserved as the leading prefix and
-    every appended column (offered relic, offered potion, and card-select) is
-    zero-initialized. Pinned to a recorded prior so the widen guard accepts it.
+    A current-layout checkpoint whose encoder is at the widest recorded prior width
+    (every appended block up to that prior, but none appended after it) loads into the
+    now-wider trunk: its trained columns are preserved as the leading prefix and every
+    later-appended column is zero-initialized. Pinned to a recorded prior so the widen
+    guard accepts it.
     """
     target = _current_feature_dim()
-    old_feat = CARD_VISION_FEATURE_DIM  # a recorded prior width the widen guard accepts
+    old_feat = WIDEST_PRIOR_FEATURE_DIM  # a recorded prior width the widen guard accepts
     assert old_feat < target  # guard the premise: the encoder actually widened
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)

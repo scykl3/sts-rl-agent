@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.7.0.
+INTERFACE_VERSION 0.8.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.7.0"
+INTERFACE_VERSION: str = "0.8.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -62,6 +62,22 @@ MAX_REWARD_KEY = 1  # at most one key (Sapphire or Emerald) offered at once
 MAX_REWARD_CARD_GROUPS = 2  # card-choice groups (a second appears with Prayer Wheel)
 MAX_REWARD_CARDS_PER_GROUP = 4  # cards per group == CardReward fixed_list<Card,4>
 MAX_REWARD_CARD_SLOTS = MAX_REWARD_CARD_GROUPS * MAX_REWARD_CARDS_PER_GROUP  # 8
+
+# --- Shop-screen selection caps (SHOP_ROOM screen) --------------------------
+# The shop offers a fixed grid the agent buys from one item at a time: up to 7
+# cards, 3 relics, and 3 potions, plus a card-removal service. Each id-bearing
+# category has a matching observation field slot-aligned with the SHOP_SELECT
+# action block's card / relic / potion sub-slots, so the slot an action buys and
+# the slot the observation describes line up (the caps match the engine Shop
+# arrays: cards[7], relics[3], potions[3]).
+MAX_SHOP_CARDS = 7
+MAX_SHOP_RELICS = 3
+MAX_SHOP_POTIONS = 3
+
+# --- Boss-relic reward cap (BOSS_RELIC_REWARDS screen) ----------------------
+# The act-boss reward offers 3 relics to choose one from (engine bossRelics[3]),
+# matching the BOSS_RELIC_SELECT action block's 3 relic sub-slots.
+MAX_BOSS_RELICS = 3
 
 # --- Enum cardinalities (confirm against engine enums at startup) ----------
 N_CARD_IDS = 380  # CardId; engine max id 370
@@ -280,6 +296,32 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     # block (like player_scalars), NOT embedded. Appended last so the prior layout
     # stays a clean prefix for warm-start migration.
     ObsField("keys_act", np.float32, (KEYS_ACT_DIM,), "real"),
+    # Shop-screen contents (SHOP_ROOM); the card / potion slots and price columns
+    # are slot-aligned with the SHOP_SELECT action block, but relic identity is not
+    # -- only its per-slot price columns align to the relic-choice action.
+    # Cards and potions are embedded per slot (reusing card_embed /
+    # potion_embed); relics are an order-agnostic multihot like the owned / reward
+    # relics (no relic embedding table). Each id field pairs 1:1 with a price field
+    # carrying the gold cost of that slot (normalized by the encoder; 0.0 marks an
+    # empty / bought / absent slot, which the paired id field also marks via PAD /
+    # INVALID, so a 0.0 price is never read as "free"). Populated only on the shop
+    # screen: PAD (cards / potions) or the relic INVALID sentinel (relics) elsewhere.
+    # Appended after keys_act so the prior layout stays a clean prefix for warm-start
+    # migration.
+    ObsField("shop_card_ids", np.int32, (MAX_SHOP_CARDS,), "id", id_high=N_CARD_IDS - 1),
+    ObsField("shop_card_prices", np.float32, (MAX_SHOP_CARDS,), "real"),
+    # Offered shop relics: an order-agnostic multihot over the relic id space, so
+    # id_high is N_RELIC_IDS (the INVALID empty marker is a legal value), exactly like
+    # reward_relic_ids -- RelicId 0 (AKABEKO) is a real relic, so PAD 0 cannot mark empty.
+    ObsField("shop_relic_ids", np.int32, (MAX_SHOP_RELICS,), "id", id_high=N_RELIC_IDS),
+    ObsField("shop_relic_prices", np.float32, (MAX_SHOP_RELICS,), "real"),
+    ObsField("shop_potion_ids", np.int32, (MAX_SHOP_POTIONS,), "id", id_high=N_POTION_IDS - 1),
+    ObsField("shop_potion_prices", np.float32, (MAX_SHOP_POTIONS,), "real"),
+    # Card-removal service cost at the shop (a single scalar); 0.0 once used this visit.
+    ObsField("shop_remove_cost", np.float32, (1,), "real"),
+    # Offered act-boss relics (BOSS_RELIC_REWARDS): a multihot mirroring reward_relic_ids
+    # (id_high N_RELIC_IDS, INVALID empty marker); no price -- the boss relic is free.
+    ObsField("boss_relic_ids", np.int32, (MAX_BOSS_RELICS,), "id", id_high=N_RELIC_IDS),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}
