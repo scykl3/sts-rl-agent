@@ -78,11 +78,14 @@ TRUNK_INPUT_WEIGHT_KEY: str = "encoder.trunk.0.weight"
 #   1349 - combat / pre-reward-vision width (before any offered-item reward block)
 #   1605 - card-vision width (after the reward_card block; 1349 -> 1605, before the
 #          offered-relic and offered-potion blocks)
+#   4881 - pre-deck width (after the offered-relic / offered-potion and card-select
+#          blocks, the shipped 0.6.0 width; before the pooled deck and keys/act
+#          blocks were appended)
 # When a new feature block is appended at the END of the concat, add the PRE-APPEND
 # width here deliberately (the current width, just before the append) so an older
 # checkpoint of that width still migrates and any other narrower width is rejected
 # as a column mismap.
-_KNOWN_PRIOR_FEATURE_DIMS: tuple[int, ...] = (1349, 1605)
+_KNOWN_PRIOR_FEATURE_DIMS: tuple[int, ...] = (1349, 1605, 4881)
 
 # Historical action-block layouts, as ordered ``(name, count)`` specs copied
 # verbatim from each version's ``interface.py`` in git. Counts (not offsets) are

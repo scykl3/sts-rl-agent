@@ -54,6 +54,8 @@ def _expected_feature_dim() -> int:
     reward_relic = interface.N_RELIC_IDS
     reward_potion = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
     card_select = interface.CHOICE_MAX * CARD_EMBED_DIM
+    deck = _PILE_POOLS * CARD_EMBED_DIM  # pooled mean+max, like one pile
+    keys_act = interface.KEYS_ACT_DIM
     return (
         hand
         + enemy
@@ -64,19 +66,30 @@ def _expected_feature_dim() -> int:
         + reward_relic
         + reward_potion
         + card_select
+        + deck
+        + keys_act
     )
 
 
 def _relic_block_start(enc: ObsFeatureEncoder) -> int:
     """Start column of the reward-relic block in the pre-trunk concat.
 
-    The relic block follows the reward-card block and precedes the reward-potion and
-    card-select blocks; derived from the interface widths (no literal), mirroring the
-    encoder's own append order.
+    The relic block precedes the reward-potion, card-select, deck, and keys/act
+    blocks; derived from the interface widths (no literal), mirroring the encoder's
+    own append order.
     """
     card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
     potion_width = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
-    return enc.feature_dim - card_select_width - potion_width - interface.N_RELIC_IDS
+    deck_width = _PILE_POOLS * CARD_EMBED_DIM
+    keys_act_width = interface.KEYS_ACT_DIM
+    return (
+        enc.feature_dim
+        - keys_act_width
+        - deck_width
+        - card_select_width
+        - potion_width
+        - interface.N_RELIC_IDS
+    )
 
 
 def test_forward_output_shape():
@@ -159,8 +172,19 @@ def test_reward_block_is_zero_when_all_pad():
     relic_width = interface.N_RELIC_IDS
     potion_width = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
     card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
-    # The card block sits before the appended relic, potion, and card-select blocks.
-    card_start = enc.feature_dim - card_select_width - potion_width - relic_width - reward_width
+    deck_width = _PILE_POOLS * CARD_EMBED_DIM
+    keys_act_width = interface.KEYS_ACT_DIM
+    # The card block sits before the appended relic, potion, card-select, deck, and
+    # keys/act blocks.
+    card_start = (
+        enc.feature_dim
+        - keys_act_width
+        - deck_width
+        - card_select_width
+        - potion_width
+        - relic_width
+        - reward_width
+    )
     card_block = feats[:, card_start : card_start + reward_width]
     assert torch.equal(card_block, torch.zeros(BATCH, reward_width))
 
@@ -183,31 +207,116 @@ def test_reward_relic_and_potion_blocks_zero_when_empty():
     relic_width = interface.N_RELIC_IDS
     potion_width = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
     card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
-    # card_select is the final block; the potion block sits immediately before it,
-    # and the relic block immediately before the potion block.
-    potion_block = feats[:, -(card_select_width + potion_width) : -card_select_width]
+    deck_width = _PILE_POOLS * CARD_EMBED_DIM
+    keys_act_width = interface.KEYS_ACT_DIM
+    # Appended after the potion block, in order: card_select, then deck, then keys/act.
+    tail = card_select_width + deck_width + keys_act_width
+    potion_block = feats[:, -(tail + potion_width) : -tail]
     assert torch.equal(potion_block, torch.zeros(BATCH, potion_width))
-    relic_block = feats[
-        :,
-        -(card_select_width + potion_width + relic_width) : -(card_select_width + potion_width),
-    ]
+    relic_block = feats[:, -(tail + potion_width + relic_width) : -(tail + potion_width)]
     assert torch.equal(relic_block, torch.zeros(BATCH, relic_width))
 
 
 def test_card_select_block_is_zero_when_all_pad():
-    """All-PAD card_select_ids -> the final card-select block is exactly zero.
+    """All-PAD card_select_ids -> the card-select block is exactly zero.
 
     Relies on card_embed's padding_idx row (no masking): empty card-select slots
-    contribute a zero vector, so the appended card-select columns vanish. Slicing
-    the final block also locks its append-after-potions placement.
+    contribute a zero vector, so the card-select columns vanish. The block sits
+    before the appended deck and keys/act blocks.
     """
     enc = ObsFeatureEncoder()
     obs = sample_observation_batch(BATCH)
     obs["card_select_ids"] = torch.full_like(obs["card_select_ids"], interface.PAD_ID)
     feats = enc.encode_features(obs)
     card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
-    # card_select is the final block, so it is the trailing slice of the concat.
-    assert torch.equal(feats[:, -card_select_width:], torch.zeros(BATCH, card_select_width))
+    deck_width = _PILE_POOLS * CARD_EMBED_DIM
+    keys_act_width = interface.KEYS_ACT_DIM
+    tail = deck_width + keys_act_width
+    card_select_block = feats[:, -(tail + card_select_width) : -tail]
+    assert torch.equal(card_select_block, torch.zeros(BATCH, card_select_width))
+
+
+def test_deck_block_is_zero_when_all_pad():
+    """All-PAD deck_ids -> the pooled deck block is exactly zero (empty-deck safe).
+
+    The deck is pooled mean+max through card_embed's padding_idx row, so an all-PAD
+    (empty) deck contributes a zero block. The deck block sits immediately before
+    the final keys/act block.
+    """
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    obs["deck_ids"] = torch.full_like(obs["deck_ids"], interface.PAD_ID)
+    feats = enc.encode_features(obs)
+    keys_act_width = interface.KEYS_ACT_DIM
+    deck_width = _PILE_POOLS * CARD_EMBED_DIM
+    deck_block = feats[:, -(keys_act_width + deck_width) : -keys_act_width]
+    assert torch.equal(deck_block, torch.zeros(BATCH, deck_width))
+
+
+def test_keys_act_is_passthrough_final_block():
+    """keys_act is a raw passthrough occupying the final KEYS_ACT_DIM columns.
+
+    Not embedded: the encoder concatenates the coerced keys_act vector as-is, so the
+    trailing slice of the concat equals the input keys_act exactly (also locking its
+    append-last placement).
+    """
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    known = torch.arange(BATCH * interface.KEYS_ACT_DIM, dtype=torch.float32).reshape(
+        BATCH, interface.KEYS_ACT_DIM
+    )
+    obs["keys_act"] = known
+    feats = enc.encode_features(obs)
+    assert torch.equal(feats[:, -interface.KEYS_ACT_DIM :], known)
+
+
+def test_gradient_flows_through_deck_path():
+    """A real card in deck_ids (all other card fields PAD) reaches card_embed.
+
+    Isolates the deck path: every other card-id field is PAD (padding_idx row 0
+    receives no gradient), so a nonzero card_embed gradient can only come from the
+    pooled deck block, proving encode_features wires deck_ids into the shared table.
+    The seed keeps the sparse-input ReLU liveness deterministic.
+    """
+    torch.manual_seed(0)
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    for name in (
+        "hand_ids",
+        "draw_ids",
+        "discard_ids",
+        "exhaust_ids",
+        "reward_card_ids",
+        "card_select_ids",
+        "deck_ids",
+    ):
+        obs[name] = torch.full_like(obs[name], interface.PAD_ID)
+    real_id = interface.PAD_ID + 1  # any non-PAD card id
+    obs["deck_ids"][:, 0] = real_id
+    enc(obs).sum().backward()
+    grad = enc.card_embed.weight.grad
+    assert grad is not None
+    # Only the deck slot's id can carry gradient; the PAD row must stay zero.
+    assert torch.count_nonzero(grad[real_id]) > 0
+    assert torch.equal(grad[interface.PAD_ID], torch.zeros(CARD_EMBED_DIM))
+
+
+def test_keys_act_influences_trunk():
+    """The keys/act columns feed the first trunk Linear (nonzero -> gradient there).
+
+    keys_act has no embedding table, so its learning signal shows up as gradient on
+    the first trunk Linear's final KEYS_ACT_DIM input columns; a nonzero keys_act
+    input drives gradient into exactly those columns. The seed keeps the
+    sparse-input ReLU liveness deterministic.
+    """
+    torch.manual_seed(0)
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    obs["keys_act"] = torch.ones_like(obs["keys_act"])
+    enc(obs).sum().backward()
+    grad = enc.trunk[0].weight.grad
+    assert grad is not None
+    assert torch.count_nonzero(grad[:, -interface.KEYS_ACT_DIM :]) > 0
 
 
 def test_gradient_flows_to_embeddings():
@@ -379,3 +488,68 @@ def test_deterministic_in_eval_mode():
         first = enc(obs)
         second = enc(obs)
     assert torch.equal(first, second)
+
+
+def _canonical_baseline_obs(batch: int) -> dict[str, torch.Tensor]:
+    """Zero/PAD baseline: every id field all-PAD, every float field all-zero.
+
+    A controlled constant baseline (not a random sample) so that a single-field
+    perturbation is the ONLY thing that can move the encoder output, isolating each
+    field's influence.
+    """
+    obs: dict[str, torch.Tensor] = {}
+    for f in interface.OBS_FIELDS:
+        if f.bounds == "id":
+            obs[f.name] = torch.full((batch, *f.shape), interface.PAD_ID, dtype=torch.long)
+        else:
+            obs[f.name] = torch.zeros((batch, *f.shape), dtype=torch.float32)
+    return obs
+
+
+def _perturb_field(field: interface.ObsField, batch: int) -> torch.Tensor:
+    """One field changed away from the baseline, staying in the field's declared bounds.
+
+    id fields flip PAD -> a distinct in-range non-PAD id; float fields take a nonzero
+    in-bounds constant (interior of the unit range for "unit", 1.0 for "real").
+    """
+    if field.bounds == "id":
+        return torch.full((batch, *field.shape), interface.PAD_ID + 1, dtype=torch.long)
+    value = 0.5 if field.bounds == "unit" else 1.0
+    return torch.full((batch, *field.shape), value, dtype=torch.float32)
+
+
+def test_every_obs_field_influences_encoder_output():
+    """Every declared OBS_FIELD must move the encoder output when perturbed alone.
+
+    The durable guard for the whole class of bug this observation-coverage work
+    addressed: a field the environment declares and populates but the encoder silently
+    ignores would leave the output unchanged here and fail CI. Sweeps the live
+    OBS_FIELDS registry (no hardcoded field list), perturbing exactly one field against
+    a zero/PAD baseline and asserting both the pre-trunk concat and the eval-mode trunk
+    output change. Skips nothing: a field that cannot influence the output is surfaced
+    as a failure, not skipped.
+    """
+    torch.manual_seed(0)
+    enc = ObsFeatureEncoder()
+    enc.eval()
+    baseline = _canonical_baseline_obs(BATCH)
+    with torch.no_grad():
+        base_feats = enc.encode_features(baseline)
+        base_out = enc(baseline)
+
+    ignored: list[str] = []
+    for field in interface.OBS_FIELDS:
+        obs = {name: t.clone() for name, t in baseline.items()}
+        obs[field.name] = _perturb_field(field, BATCH)
+        with torch.no_grad():
+            feats = enc.encode_features(obs)
+            out = enc(obs)
+        # encode_features changing proves the field enters the concat (the encoder
+        # consumes it); the trunk output changing confirms it reaches the actual output.
+        if torch.equal(feats, base_feats) or torch.equal(out, base_out):
+            ignored.append(field.name)
+
+    assert not ignored, (
+        "OBS_FIELDS declared/populated by the env but ignored by the encoder "
+        f"(no output change when perturbed alone): {ignored}"
+    )

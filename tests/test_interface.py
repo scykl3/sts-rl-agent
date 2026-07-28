@@ -13,7 +13,7 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.6.0"
+    assert interface.INTERFACE_VERSION == "0.7.0"
 
 
 def test_action_dim_is_257():
@@ -122,6 +122,31 @@ def test_card_select_obs_field_aligned_with_block():
     assert field.shape[0] == interface.ACTION_BLOCK_BY_NAME["CARD_SELECT"].count
 
 
+def test_deck_and_keys_act_obs_fields():
+    # deck_ids is a DECK_MAX-wide card-id field (the overworld deck as an
+    # order-agnostic set); keys_act is a KEYS_ACT_DIM-wide real passthrough
+    # ([act, ruby, emerald, sapphire]). Both map to no action slot.
+    by = interface.OBS_FIELD_BY_NAME
+
+    deck = by["deck_ids"]
+    assert deck.shape == (interface.DECK_MAX,)
+    assert deck.dtype == np.int32
+    assert deck.bounds == "id"
+    assert deck.id_high == interface.N_CARD_IDS - 1
+
+    keys_act = by["keys_act"]
+    assert interface.KEYS_ACT_DIM == 4
+    assert keys_act.shape == (interface.KEYS_ACT_DIM,)
+    assert keys_act.dtype == np.float32
+    assert keys_act.bounds == "real"
+    assert keys_act.id_high is None
+
+    # Appended last, in order, so the prior 0.6.0 layout stays a clean prefix for
+    # warm-start migration: ..., card_select_ids, deck_ids, keys_act.
+    names = [f.name for f in interface.OBS_FIELDS]
+    assert names[-3:] == ["card_select_ids", "deck_ids", "keys_act"]
+
+
 # ---------------------------------------------------------------------------
 # Observation fields
 # ---------------------------------------------------------------------------
@@ -129,7 +154,7 @@ def test_card_select_obs_field_aligned_with_block():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 22
+    assert len(fields) == 24
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:
@@ -183,6 +208,7 @@ def test_id_fields_have_id_high():
         "reward_relic_ids": interface.N_RELIC_IDS,
         "reward_potion_ids": interface.N_POTION_IDS - 1,
         "card_select_ids": interface.N_CARD_IDS - 1,
+        "deck_ids": interface.N_CARD_IDS - 1,
     }
     # Pin the exact set of id fields, so silently switching one to another
     # bounds value (which __post_init__ would happily accept) is caught.

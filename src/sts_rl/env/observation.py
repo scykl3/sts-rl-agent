@@ -7,9 +7,11 @@ bump propagates here instead of silently desyncing.
 
 One encoder serves both modes. Pass a live ``BattleContext`` for combat, or
 ``bc=None`` for an overworld (run-mode) state: combat-only fields (hand, piles,
-enemies, powers, potions) then stay zero and ``map_context`` is filled from the
-run's map, plus the ``reward_*`` fields on a REWARDS screen. ``map_context`` and
-the ``reward_*`` fields are left zero during combat.
+enemies, powers) then stay zero, while ``map_context`` is filled from the run's
+map, ``deck_ids`` from the run deck, the potion belt from the overworld, and the
+``reward_*`` fields on a REWARDS screen. ``map_context``, ``deck_ids``, and the
+``reward_*`` fields are left zero during combat; the potion belt and ``keys_act``
+(act plus owned ruby / emerald / sapphire keys) are filled in both modes.
 
 Conventions:
 
@@ -34,6 +36,7 @@ from sts_rl.env._engine import slaythespire as sts
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     CHOICE_MAX,
+    DECK_MAX,
     HAND_MAX,
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
@@ -182,15 +185,18 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
     mutation.
     """
     obs = _empty_obs()
-    # relics and the screen one-hot are read from gc in both modes.
+    # relics, the screen one-hot, and keys/act are read from gc in both modes.
     _fill_relics_multihot(obs, gc)
     _fill_screen_onehot(obs, gc)
+    _fill_keys_act(obs, gc)
 
     if bc is None:
         _fill_run_scalars(obs, gc)
         _fill_map_context(obs, gc)
         _fill_reward_ids(obs, gc)
         _fill_card_select_ids(obs, gc)
+        _fill_deck_ids(obs, gc)
+        _fill_overworld_potions(obs, gc)
         return obs
 
     player = bc.player
@@ -465,6 +471,59 @@ def _fill_card_select_ids(obs: Obs, gc: Any) -> None:
     candidates = gc.screen_state_info.to_select_cards
     for i in range(min(len(candidates), CHOICE_MAX)):
         card_select_ids[i] = int(candidates[i].id)
+
+
+def _fill_keys_act(obs: Obs, gc: Any) -> None:
+    """Fill ``keys_act`` = [act, ruby, emerald, sapphire] for the current state.
+
+    ``act`` complements ``player_scalars`` (which carries floor but not act); the
+    three owned-key flags (ruby == red, emerald == green, sapphire == blue) track
+    Act-3 boss-door progress. Known in both overworld and combat, so this runs for
+    both. A raw passthrough block (like ``player_scalars``): written as-is, not
+    embedded.
+    """
+    obs["keys_act"][:] = (
+        gc.act,
+        1.0 if gc.red_key else 0.0,
+        1.0 if gc.green_key else 0.0,
+        1.0 if gc.blue_key else 0.0,
+    )
+
+
+def _fill_deck_ids(obs: Obs, gc: Any) -> None:
+    """Fill ``deck_ids`` from the overworld deck (order-agnostic id set), PAD tail.
+
+    Each card's id is written up to ``DECK_MAX``; a deck larger than the cap is
+    truncated to the fixed width. Overworld-only: in combat the draw / discard /
+    hand / exhaust piles already cover every card, so the field stays PAD there.
+    Card ids are written directly (like ``hand_ids`` / pile ids) -- startup enum
+    validation guarantees each fits ``card_embed``.
+    """
+    deck_ids = obs["deck_ids"]
+    deck = gc.deck
+    for i in range(min(len(deck), DECK_MAX)):
+        deck_ids[i] = int(deck[i].id)
+
+
+def _fill_overworld_potions(obs: Obs, gc: Any) -> None:
+    """Fill ``potion_ids`` / ``potion_usable`` from the overworld potion belt.
+
+    The combat encoder reads ``bc.potions``; out of combat the belt lives on the
+    ``GameContext``, which the binding does not expose as a direct attribute. The
+    read-only ``getNNRepresentation`` accessor is the bound path that surfaces it
+    (the belt up to the current capacity), so an overworld obs shows held potions
+    instead of reading all-PAD. Skips the engine's empty / invalid slot sentinels,
+    exactly like the combat and reward-belt fills; a skipped slot stays PAD.
+    """
+    belt = sts.getNNRepresentation(gc).potions
+    potion_ids = obs["potion_ids"]
+    potion_usable = obs["potion_usable"]
+    for i in range(min(len(belt), POTION_SLOTS)):
+        potion = int(belt[i])
+        if potion == int(_POTION_EMPTY) or potion == int(_POTION_INVALID):
+            continue
+        potion_ids[i] = potion
+        potion_usable[i] = 1.0
 
 
 def _fill_pile_ids(out: np.ndarray, pile: Any) -> None:

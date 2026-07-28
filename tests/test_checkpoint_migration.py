@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.encoder import CARD_EMBED_DIM, _PILE_POOLS
 from sts_rl.agent.checkpoint_migration import (
     OLD_ACTION_LAYOUTS,
     POLICY_LOGITS_BIAS_KEY,
@@ -40,6 +41,7 @@ from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     ACTION_DIM,
     INTERFACE_VERSION,
+    KEYS_ACT_DIM,
     InterfaceError,
 )
 
@@ -629,6 +631,41 @@ def test_migrate_trunk_accepts_known_prior_widths(known_feat: int) -> None:
     assert new_weight.shape == (HIDDEN, target)
     assert torch.equal(new_weight[:, :known_feat], old_weight)  # prefix preserved
     assert torch.count_nonzero(new_weight[:, known_feat:]) == 0  # suffix zeroed
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
+# The shipped 0.6.0 feature width, now a recorded prior that must widen to the
+# deck + keys/act layout. Fixed history, like the widths in _KNOWN_PRIOR_FEATURE_DIMS.
+SHIPPED_0_6_0_FEATURE_DIM = 4881
+
+
+def test_shipped_4881_prior_widens_to_deck_keys_act_layout() -> None:
+    """The 0.6.0 width (4881) is a recorded prior and widens cleanly to the new dim.
+
+    A warm-start checkpoint trained at the shipped 4881-wide encoder must widen to
+    the deck + keys/act layout: its trained columns preserved as the leading prefix,
+    the appended pooled-deck (mean+max) and keys/act columns zero-initialized. The
+    target width is checked symbolically against the interface / encoder constants,
+    never a hardcoded literal.
+    """
+    assert SHIPPED_0_6_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
+    target = _current_feature_dim()
+    # New width = 4881 + pooled deck (mean+max) + keys/act, derived symbolically.
+    assert target == SHIPPED_0_6_0_FEATURE_DIM + _PILE_POOLS * CARD_EMBED_DIM + KEYS_ACT_DIM
+
+    old_feat = SHIPPED_0_6_0_FEATURE_DIM
+    assert old_feat < target
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+
+    migrated = migrate_encoder_trunk_input_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :old_feat], old_weight)  # prefix preserved
+    assert torch.count_nonzero(new_weight[:, old_feat:]) == 0  # appended suffix zero
     model = ActorCritic(hidden_dim=HIDDEN)
     model.load_state_dict(migrated, strict=True)
     assert torch.equal(model.encoder.trunk[0].weight, new_weight)

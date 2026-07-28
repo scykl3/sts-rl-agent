@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.6.0.
+INTERFACE_VERSION 0.7.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.6.0"
+INTERFACE_VERSION: str = "0.7.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -90,6 +90,7 @@ PLAYER_SCALAR_DIM = 8  # hp_cur, hp_max, block, energy, gold, floor, ascension, 
 HAND_FEAT_DIM = 6  # upgraded, cost, is_attack, is_skill, is_power, ethereal
 ENEMY_SCALAR_DIM = 5  # hp_cur, hp_max, block, intent_val, intent_hits
 MAP_CONTEXT_DIM = 40  # current + available next node types/positions (run mode)
+KEYS_ACT_DIM = 4  # act + owned keys: ruby (red), emerald (green), sapphire (blue)
 
 # --- Type aliases ----------------------------------------------------------
 Obs = dict[str, np.ndarray]
@@ -227,6 +228,8 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("relics_multihot", np.float32, (N_RELIC_IDS,), "unit"),
     ObsField("player_powers", np.float32, (N_PLAYER_POWER_IDS,), "real"),
     ObsField("potion_ids", np.int32, (POTION_SLOTS,), "id", id_high=N_POTION_IDS - 1),
+    # "Usable this turn" in combat, but only "present" in the overworld (no overworld potion-use
+    # action), so usable-now holds only on combat screens, which screen_onehot distinguishes.
     ObsField("potion_usable", np.float32, (POTION_SLOTS,), "unit"),
     ObsField("hand_ids", np.int32, (HAND_MAX,), "id", id_high=N_CARD_IDS - 1),
     ObsField("hand_feats", np.float32, (HAND_MAX, HAND_FEAT_DIM), "real"),
@@ -259,6 +262,19 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     # holds; the positional index alone is meaningless. Zero (PAD) outside a
     # card-select screen and for slots past the candidate count.
     ObsField("card_select_ids", np.int32, (CHOICE_MAX,), "id", id_high=N_CARD_IDS - 1),
+    # The full overworld deck as an order-agnostic id set (the agent's own cards),
+    # PAD-padded to DECK_MAX. Populated only in the overworld (bc is None); in combat
+    # the draw / discard / hand / exhaust piles already cover every card, so it stays
+    # PAD there. CardId 0 is INVALID, so PAD 0 is a safe empty marker (no AKABEKO-style
+    # collision). Pooled -- not per-slot flattened -- by the encoder, since the deck
+    # maps to no action slot.
+    ObsField("deck_ids", np.int32, (DECK_MAX,), "id", id_high=N_CARD_IDS - 1),
+    # Small passthrough float block: [act, ruby, emerald, sapphire]. act complements
+    # player_scalars (which carries floor but not act); the three owned-key flags are
+    # Act-3 boss-door progress. Known in both overworld and combat. A passthrough real
+    # block (like player_scalars), NOT embedded. Appended last so the prior layout
+    # stays a clean prefix for warm-start migration.
+    ObsField("keys_act", np.float32, (KEYS_ACT_DIM,), "real"),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}
