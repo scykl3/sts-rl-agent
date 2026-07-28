@@ -360,6 +360,33 @@ def test_keys_act_is_passthrough_block():
     assert torch.equal(feats[:, -(tail + interface.KEYS_ACT_DIM) : -tail], known)
 
 
+def test_event_neow_is_passthrough_tail():
+    """event_onehot + the flattened Neow one-hots are raw passthroughs in the final tail.
+
+    They are the last appended blocks, so the concat's trailing _event_neow_tail_width()
+    columns are event_onehot, then the flattened neow bonus one-hots, then the flattened
+    neow drawback one-hots, unchanged from the input. Locks both the tail placement and
+    the event-vs-neow internal order.
+    """
+    enc = ObsFeatureEncoder()
+    obs = sample_observation_batch(BATCH)
+    ev = torch.arange(BATCH * interface.N_EVENT_IDS, dtype=torch.float32).reshape(
+        BATCH, interface.N_EVENT_IDS
+    )
+    nb = torch.arange(
+        BATCH * interface.NEOW_OPTION_SLOTS * interface.N_NEOW_BONUS, dtype=torch.float32
+    ).reshape(BATCH, interface.NEOW_OPTION_SLOTS, interface.N_NEOW_BONUS)
+    nd = torch.arange(
+        BATCH * interface.NEOW_OPTION_SLOTS * interface.N_NEOW_DRAWBACK, dtype=torch.float32
+    ).reshape(BATCH, interface.NEOW_OPTION_SLOTS, interface.N_NEOW_DRAWBACK)
+    obs["event_onehot"] = ev
+    obs["neow_bonus_onehot"] = nb
+    obs["neow_drawback_onehot"] = nd
+    feats = enc.encode_features(obs)
+    expected = torch.cat([ev, nb.reshape(BATCH, -1), nd.reshape(BATCH, -1)], dim=1)
+    assert torch.equal(feats[:, -_event_neow_tail_width() :], expected)
+
+
 def test_gradient_flows_through_deck_path():
     """A real card in deck_ids (all other card fields PAD) reaches card_embed.
 
