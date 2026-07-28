@@ -15,6 +15,7 @@ Two layers, mirroring ``test_train_combat``:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import types
 from pathlib import Path
@@ -25,6 +26,7 @@ import pytest
 
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.train import EvalRecord, TrainConfig, TrainHistory, train
+from sts_rl.env.reward import RewardConfig
 from sts_rl.eval import EvalReport, make_holdout_seeds
 
 # scripts/ is not an importable package, so put it on sys.path to import the
@@ -80,11 +82,22 @@ def _dummy_eval_env() -> gym.Env:
 class _StubRunEnv:
     """Engine-free stand-in for ``StsRunEnv``: records its construction kwargs and
     serves the provenance ``info`` keys ``main()`` reads off the initial reset, so
-    ``main()`` runs the whole warm-start wiring without a native engine build."""
+    ``main()`` runs the whole warm-start wiring without a native engine build.
 
-    def __init__(self, *, ascension: int, max_episode_steps: int) -> None:
+    ``reward_config`` mirrors the real ``StsRunEnv`` signature (``main()`` now passes
+    it); it is stored but otherwise unused by the stub.
+    """
+
+    def __init__(
+        self,
+        *,
+        ascension: int,
+        max_episode_steps: int,
+        reward_config: RewardConfig | None = None,
+    ) -> None:
         self.ascension = ascension
         self.max_episode_steps = max_episode_steps
+        self.reward_config = reward_config
 
     def reset(
         self, *, seed: int | None = None, options: object = None
@@ -505,6 +518,127 @@ def test_arg_parser_has_no_encounters_knob() -> None:
     """Run mode has no encounter pool, so --encounters (combat-only) is absent."""
     with pytest.raises(SystemExit):
         train_run.build_arg_parser().parse_args(["--encounters", "GREMLIN_NOB"])
+
+
+def _reward_ns(**overrides: float) -> argparse.Namespace:
+    """A Namespace carrying the four reward-shaping flag dests, each defaulting to
+    the matching ``RewardConfig()`` value; overrides replace individual coefficients.
+
+    Lets ``_reward_config_from_args`` be exercised without the parser, since the
+    helper only reads these four attributes.
+    """
+    base = RewardConfig()
+    values: dict[str, float] = {
+        "enemy_hp_removed_coef": base.enemy_hp_removed,
+        "damage_taken_coef": base.damage_taken,
+        "floor_progress_coef": base.floor_progress,
+        "boss_kill_coef": base.boss_kill,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_reward_config_from_args_maps_all_four_coefficients() -> None:
+    """Each shaping flag maps to its RewardConfig field, and the un-exposed anneal
+    schedule (beta_min / t_anneal) keeps the RewardConfig default. Engine-free."""
+    cfg = train_run._reward_config_from_args(
+        _reward_ns(
+            enemy_hp_removed_coef=0.1,
+            damage_taken_coef=-0.3,
+            floor_progress_coef=0.4,
+            boss_kill_coef=1.0,
+        )
+    )
+    assert (cfg.enemy_hp_removed, cfg.damage_taken, cfg.floor_progress, cfg.boss_kill) == (
+        0.1,
+        -0.3,
+        0.4,
+        1.0,
+    )
+    assert cfg.beta_min == RewardConfig().beta_min
+    assert cfg.t_anneal == RewardConfig().t_anneal
+
+
+def test_reward_config_from_args_defaults_reproduce_reward_config() -> None:
+    """With every flag at its default, the helper reproduces RewardConfig() exactly,
+    so an unspecified run keeps the default shaping. Engine-free (plain Namespace)."""
+    assert train_run._reward_config_from_args(_reward_ns()) == RewardConfig()
+
+
+def test_arg_parser_reward_shaping_flags_wire_to_config() -> None:
+    """The parser's reward-shaping flags default to RewardConfig() and --boss-kill-coef
+    overrides only boss_kill.
+
+    Engine-free: train_run.build_arg_parser uses a module constant for the step cap,
+    so it needs no engine (unlike train_combat's).
+    """
+    parser = train_run.build_arg_parser()
+    assert train_run._reward_config_from_args(parser.parse_args([])) == RewardConfig()
+    overridden = train_run._reward_config_from_args(parser.parse_args(["--boss-kill-coef", "1.0"]))
+    assert overridden.boss_kill == 1.0
+    # Overriding one coefficient leaves the others at their RewardConfig default.
+    assert overridden.enemy_hp_removed == RewardConfig().enemy_hp_removed
+
+
+def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() builds a RewardConfig from the shaping flags and passes it to BOTH the
+    training and eval envs, so --boss-kill-coef reaches the live reward.
+
+    Engine-free: train and StsRunEnv are stubbed. The stub records its
+    reward_config kwarg, so the CLI -> env wire is checked without a native build.
+
+    Revert-verify: drop reward_config=reward_config from either StsRunEnv build in
+    main() and that env's recorded coefficient falls back to the default, failing
+    the matching assertion.
+    """
+    captured_reward_configs: list[RewardConfig | None] = []
+
+    class _RewardStubRunEnv(_StubRunEnv):
+        def __init__(
+            self,
+            *,
+            ascension: int,
+            max_episode_steps: int,
+            reward_config: RewardConfig | None = None,
+        ) -> None:
+            super().__init__(
+                ascension=ascension,
+                max_episode_steps=max_episode_steps,
+                reward_config=reward_config,
+            )
+            captured_reward_configs.append(reward_config)
+
+    def _fake_train(
+        _env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _RewardStubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+    monkeypatch.setattr(sys, "argv", ["train_run", "--boss-kill-coef", "1.0"])
+
+    train_run.main()
+
+    # Both the training env and the eval env received the overridden shaping config.
+    assert len(captured_reward_configs) == 2
+    assert all(rc is not None and rc.boss_kill == 1.0 for rc in captured_reward_configs)
 
 
 @pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")

@@ -61,6 +61,17 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_combat.py \
 | `--max-grad-norm` | `0.5` | Global grad-norm clip |
 | `--target-kl` | None | Approximate-KL early-stop threshold (unset disables the early stop) |
 
+#### Reward shaping
+
+Coefficients for the per-step shaping terms; defaults match the built-in `RewardConfig`. The shaping sum is scaled by an annealed weight that decays toward zero over training, so these set the initial (pre-anneal) magnitude, not a constant bonus. `--floor-progress-coef` and `--boss-kill-coef` are run-mode signals and stay `0.0` in single-combat (exposed here only for parity with `train_run.py`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enemy-hp-removed-coef` | `0.05` | Shaping weight for the drop in enemy HP fraction (combat) |
+| `--damage-taken-coef` | `-0.02` | Shaping weight for the drop in player HP fraction (negative penalizes damage) |
+| `--floor-progress-coef` | `0.02` | Shaping weight per new floor descended (run mode; `0.0` in single-combat) |
+| `--boss-kill-coef` | `0.20` | Shaping weight per act boss defeated (run mode; `0.0` in single-combat) |
+
 #### Evaluation + checkpointing
 
 | Flag | Default | Description |
@@ -117,6 +128,17 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_run.py \
 | `--minibatch-size` | `64` | PPO minibatch size |
 | `--max-grad-norm` | `0.5` | Global grad-norm clip |
 | `--target-kl` | None | Approximate-KL early-stop threshold (unset disables the early stop) |
+
+#### Reward shaping
+
+Coefficients for the per-step shaping terms; defaults match the built-in `RewardConfig`. The shaping sum is scaled by an annealed weight that decays toward zero over training, so these set the initial (pre-anneal) magnitude, not a constant bonus. `--boss-kill-coef` fires once per act boss defeated (Act 1 -> 2, Act 2 -> 3), so raising it emphasizes act progress; note it still decays under the anneal.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enemy-hp-removed-coef` | `0.05` | Shaping weight for the drop in enemy HP fraction (combat) |
+| `--damage-taken-coef` | `-0.02` | Shaping weight for the drop in player HP fraction (negative penalizes damage) |
+| `--floor-progress-coef` | `0.02` | Shaping weight per new floor descended (overworld) |
+| `--boss-kill-coef` | `0.20` | Shaping weight per act boss defeated (overworld) |
 
 #### Evaluation + checkpointing
 

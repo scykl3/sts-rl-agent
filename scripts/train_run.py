@@ -62,6 +62,7 @@ from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
+from sts_rl.env.reward import RewardConfig
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 
 logger = logging.getLogger("train_run")
@@ -206,6 +207,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ppo_defaults.target_kl,
         help="approximate-KL early-stop threshold (unset disables the early stop)",
     )
+    # Reward-shaping coefficients. Defaults read from RewardConfig() so they track
+    # the canonical source instead of restating its literals. floor_progress and
+    # boss_kill drive overworld shaping (boss_kill fires once per act boss
+    # defeated); enemy_hp_removed and damage_taken drive combat shaping. The shaping
+    # sum is still scaled by the anneal beta(t), which is not exposed here and keeps
+    # its RewardConfig default.
+    reward_defaults = RewardConfig()
+    parser.add_argument(
+        "--enemy-hp-removed-coef",
+        type=float,
+        default=reward_defaults.enemy_hp_removed,
+        help="shaping weight for the drop in enemy HP fraction (combat)",
+    )
+    parser.add_argument(
+        "--damage-taken-coef",
+        type=float,
+        default=reward_defaults.damage_taken,
+        help="shaping weight for the drop in player HP fraction (negative penalizes damage)",
+    )
+    parser.add_argument(
+        "--floor-progress-coef",
+        type=float,
+        default=reward_defaults.floor_progress,
+        help="shaping weight per new floor descended (overworld)",
+    )
+    parser.add_argument(
+        "--boss-kill-coef",
+        type=float,
+        default=reward_defaults.boss_kill,
+        help="shaping weight per act boss defeated (overworld)",
+    )
     parser.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM, help="encoder trunk width")
     parser.add_argument("--ascension", type=int, default=DEFAULT_ASCENSION, help="ascension level")
     parser.add_argument(
@@ -278,6 +310,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "this above roughly one eval-std to avoid noise-driven premature or deferred stops",
     )
     return parser
+
+
+def _reward_config_from_args(args: argparse.Namespace) -> RewardConfig:
+    """Build the env's :class:`RewardConfig` from the reward-shaping CLI flags.
+
+    Only the four shaping coefficients are overridable; the anneal schedule
+    (``beta_min`` / ``t_anneal``) keeps its :class:`RewardConfig` default. Each
+    flag defaults to the corresponding ``RewardConfig()`` value, so an unspecified
+    run reproduces the default shaping exactly.
+    """
+    return RewardConfig(
+        enemy_hp_removed=args.enemy_hp_removed_coef,
+        damage_taken=args.damage_taken_coef,
+        floor_progress=args.floor_progress_coef,
+        boss_kill=args.boss_kill_coef,
+    )
 
 
 def _final_eval_report(
@@ -357,13 +405,25 @@ def main() -> None:
     # be unit-tested without a built engine.
     from sts_rl.env.run_adapter import StsRunEnv
 
+    # Same shaping config for both envs so training and holdout eval score the same
+    # reward; unset flags reproduce the RewardConfig() default.
+    reward_config = _reward_config_from_args(args)
+
     # Two env instances: `env` is the training env (its reset stream is seeded via
     # TrainConfig.seed through the collector), and `eval_env` is a SEPARATE
     # instance for greedy holdout eval - both the in-loop periodic eval and the
     # final eval - so evaluate() resetting per seed never disturbs the training
     # collector's rollout stream.
-    env = StsRunEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
-    eval_env = StsRunEnv(ascension=args.ascension, max_episode_steps=args.max_episode_steps)
+    env = StsRunEnv(
+        ascension=args.ascension,
+        max_episode_steps=args.max_episode_steps,
+        reward_config=reward_config,
+    )
+    eval_env = StsRunEnv(
+        ascension=args.ascension,
+        max_episode_steps=args.max_episode_steps,
+        reward_config=reward_config,
+    )
 
     # Provenance for reproducibility: engine_commit and interface_version are
     # always-present info keys. Read them from an initial reset; train() re-resets
