@@ -67,10 +67,10 @@ Coefficients for the per-step shaping terms; defaults match the built-in `Reward
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enemy-hp-removed-coef` | `0.05` | Shaping weight for the drop in enemy HP fraction (combat) |
-| `--damage-taken-coef` | `-0.02` | Shaping weight for the drop in player HP fraction (negative penalizes damage) |
-| `--floor-progress-coef` | `0.02` | Shaping weight per new floor descended (run mode; `0.0` in single-combat) |
-| `--boss-kill-coef` | `0.20` | Shaping weight per act boss defeated (run mode; `0.0` in single-combat) |
+| `--enemy-hp-removed-coef` | `RewardConfig.enemy_hp_removed` | Shaping weight for the drop in enemy HP fraction (combat) |
+| `--damage-taken-coef` | `RewardConfig.damage_taken` | Shaping weight for the drop in player HP fraction (negative penalizes damage) |
+| `--floor-progress-coef` | `RewardConfig.floor_progress` | Shaping weight per new floor descended (run mode; `0.0` in single-combat) |
+| `--boss-kill-coef` | `RewardConfig.boss_kill` | Shaping weight per act boss defeated (run mode; `0.0` in single-combat) |
 
 #### Evaluation + checkpointing
 
@@ -135,10 +135,10 @@ Coefficients for the per-step shaping terms; defaults match the built-in `Reward
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enemy-hp-removed-coef` | `0.05` | Shaping weight for the drop in enemy HP fraction (combat) |
-| `--damage-taken-coef` | `-0.02` | Shaping weight for the drop in player HP fraction (negative penalizes damage) |
-| `--floor-progress-coef` | `0.02` | Shaping weight per new floor descended (overworld) |
-| `--boss-kill-coef` | `0.20` | Shaping weight per act boss defeated (overworld) |
+| `--enemy-hp-removed-coef` | `RewardConfig.enemy_hp_removed` | Shaping weight for the drop in enemy HP fraction (combat) |
+| `--damage-taken-coef` | `RewardConfig.damage_taken` | Shaping weight for the drop in player HP fraction (negative penalizes damage) |
+| `--floor-progress-coef` | `RewardConfig.floor_progress` | Shaping weight per new floor descended (overworld) |
+| `--boss-kill-coef` | `RewardConfig.boss_kill` | Shaping weight per act boss defeated (overworld) |
 
 #### Evaluation + checkpointing
 
