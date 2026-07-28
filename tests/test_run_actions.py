@@ -245,9 +245,11 @@ def test_overworld_mask_gates_on_isvalidaction(monkeypatch: pytest.MonkeyPatch) 
 def test_event_option_slots_all_representable() -> None:
     """Event options across the whole EVENT_SELECT block map to distinct slots.
 
-    Several events use option indices above 3 (GOLDEN_IDOL, DESIGNER_IN_SPIRE, and
-    CURSED_TOME, which reaches 6), so options 4..6 are legal-capable, not dead. This
-    guards against re-tightening the cap on the mistaken belief that only 0..3 occur.
+    The stub-driven check confirms the slot->index mapping is one-to-one over options
+    0..count-1 (each maps to start + idx1), an out-of-range option (idx1 >= count) maps to
+    None, and a two-card MATCH_AND_KEEP pick (idx2 != 0) maps to None. It exercises the
+    mapping arithmetic only; engine legality of the higher option indices is covered by the
+    run-navigation fuzz test (test_run_navigation_no_false_positives), not this mapping test.
     """
     screen = sts.ScreenState.EVENT_SCREEN
     for idx1 in range(_EVENT.count):
