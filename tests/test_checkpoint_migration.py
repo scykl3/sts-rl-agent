@@ -636,27 +636,55 @@ def test_migrate_trunk_accepts_known_prior_widths(known_feat: int) -> None:
     assert torch.equal(model.encoder.trunk[0].weight, new_weight)
 
 
-# The shipped 0.6.0 feature width, now a recorded prior that must widen to the
-# deck + keys/act layout. Fixed history, like the widths in _KNOWN_PRIOR_FEATURE_DIMS.
+# The shipped 0.6.0 feature width (before the deck / keys-act append) and 0.7.0 width
+# (before the shop / boss / event-neow append), now recorded priors that must widen to
+# the current layout. Fixed history, like the widths in _KNOWN_PRIOR_FEATURE_DIMS. The
+# exact current width is locked in test_encoder (_expected_feature_dim); here we only
+# assert each prior is recorded, is narrower than current, and widens cleanly.
 SHIPPED_0_6_0_FEATURE_DIM = 4881
+SHIPPED_0_7_0_FEATURE_DIM = 4949
 
 
-def test_shipped_4881_prior_widens_to_deck_keys_act_layout() -> None:
-    """The 0.6.0 width (4881) is a recorded prior and widens cleanly to the new dim.
+def test_shipped_4881_prior_widens_to_current_layout() -> None:
+    """The 0.6.0 width (4881, pre deck / keys-act) is a recorded prior and widens cleanly.
 
-    A warm-start checkpoint trained at the shipped 4881-wide encoder must widen to
-    the deck + keys/act layout: its trained columns preserved as the leading prefix,
-    the appended pooled-deck (mean+max) and keys/act columns zero-initialized. The
-    target width is checked symbolically against the interface / encoder constants,
-    never a hardcoded literal.
+    A warm-start checkpoint trained at the shipped 4881-wide encoder must widen to the
+    current layout: its trained columns preserved as the leading prefix, every appended
+    column (the deck, keys/act, and later shop / boss / event-neow blocks) zero-initialized.
     """
     assert SHIPPED_0_6_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
     target = _current_feature_dim()
-    # New width = 4881 + pooled deck (mean+max) + keys/act, derived symbolically.
-    assert target == SHIPPED_0_6_0_FEATURE_DIM + _PILE_POOLS * CARD_EMBED_DIM + KEYS_ACT_DIM
-
     old_feat = SHIPPED_0_6_0_FEATURE_DIM
+    # The deck + keys/act blocks were the first append after 4881, so the current width
+    # is at least that much wider (later appends only add more).
+    assert target >= old_feat + _PILE_POOLS * CARD_EMBED_DIM + KEYS_ACT_DIM
+
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+
+    migrated = migrate_encoder_trunk_input_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :old_feat], old_weight)  # prefix preserved
+    assert torch.count_nonzero(new_weight[:, old_feat:]) == 0  # appended suffix zero
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
+def test_shipped_4949_prior_widens_to_shop_layout() -> None:
+    """The 0.7.0 width (4949, pre shop / boss / event-neow) is a recorded prior and widens.
+
+    A warm-start checkpoint trained at the shipped 4949-wide encoder (deck + keys/act, no
+    shop / boss / event-neow blocks yet) must widen to the current layout: trained columns
+    preserved as the leading prefix, the appended shop / boss / event-neow columns zeroed.
+    """
+    assert SHIPPED_0_7_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
+    target = _current_feature_dim()
+    old_feat = SHIPPED_0_7_0_FEATURE_DIM
     assert old_feat < target
+
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
     state[TRUNK_INPUT_WEIGHT_KEY] = old_weight

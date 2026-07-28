@@ -13,7 +13,7 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.7.0"
+    assert interface.INTERFACE_VERSION == "0.8.0"
 
 
 def test_action_dim_is_257():
@@ -141,10 +141,66 @@ def test_deck_and_keys_act_obs_fields():
     assert keys_act.bounds == "real"
     assert keys_act.id_high is None
 
-    # Appended last, in order, so the prior 0.6.0 layout stays a clean prefix for
-    # warm-start migration: ..., card_select_ids, deck_ids, keys_act.
+    # deck_ids / keys_act keep their relative order after card_select_ids (the 0.6.0
+    # tail); the 0.8.0 shop / boss / event-neow blocks are appended after keys_act, so
+    # this triple is now interior rather than the final three fields.
     names = [f.name for f in interface.OBS_FIELDS]
-    assert names[-3:] == ["card_select_ids", "deck_ids", "keys_act"]
+    ka = names.index("keys_act")
+    assert names[ka - 2 : ka + 1] == ["card_select_ids", "deck_ids", "keys_act"]
+
+
+def test_shop_boss_event_neow_obs_fields():
+    # The 0.8.0 shop / boss-relic / event-neow offer fields: shapes, dtypes, bounds,
+    # and their append-last placement after keys_act (so the prior layout stays a clean
+    # prefix for warm-start migration).
+    by = interface.OBS_FIELD_BY_NAME
+
+    assert by["shop_card_ids"].shape == (interface.SHOP_CARD_SLOTS,)
+    assert by["shop_relic_ids"].shape == (interface.SHOP_RELIC_SLOTS,)
+    assert by["shop_potion_ids"].shape == (interface.SHOP_POTION_SLOTS,)
+    assert by["shop_prices"].shape == (interface.SHOP_PRICE_SLOTS,)
+    assert by["shop_remove_cost"].shape == (1,)
+    assert by["boss_relic_ids"].shape == (interface.BOSS_RELIC_SLOTS,)
+    assert by["event_onehot"].shape == (interface.N_EVENT_IDS,)
+    assert by["neow_bonus_onehot"].shape == (interface.NEOW_OPTION_SLOTS, interface.N_NEOW_BONUS)
+    assert by["neow_drawback_onehot"].shape == (
+        interface.NEOW_OPTION_SLOTS,
+        interface.N_NEOW_DRAWBACK,
+    )
+
+    # Prices / remove-cost are raw real passthroughs; the one-hots are unit.
+    assert by["shop_prices"].bounds == "real"
+    assert by["shop_remove_cost"].bounds == "real"
+    for name in ("event_onehot", "neow_bonus_onehot", "neow_drawback_onehot"):
+        assert by[name].bounds == "unit"
+        assert by[name].dtype == np.float32
+
+    # Shop price vector covers cards + relics + potions (the buyable-item slots).
+    assert interface.SHOP_PRICE_SLOTS == (
+        interface.SHOP_CARD_SLOTS + interface.SHOP_RELIC_SLOTS + interface.SHOP_POTION_SLOTS
+    )
+
+    # Appended last, in fixed order, after keys_act.
+    names = [f.name for f in interface.OBS_FIELDS]
+    assert names[-9:] == [
+        "shop_card_ids",
+        "shop_relic_ids",
+        "shop_potion_ids",
+        "shop_prices",
+        "shop_remove_cost",
+        "boss_relic_ids",
+        "event_onehot",
+        "neow_bonus_onehot",
+        "neow_drawback_onehot",
+    ]
+
+
+def test_event_neow_enums_in_table_sizes():
+    # The event / Neow one-hot widths are validated at startup like the other enum
+    # tables (their max id must fit), so they must be registered in EXPECTED_TABLE_SIZES.
+    for key in ("N_EVENT_IDS", "N_NEOW_BONUS", "N_NEOW_DRAWBACK"):
+        assert key in interface.EXPECTED_TABLE_SIZES
+        assert interface.EXPECTED_TABLE_SIZES[key] == getattr(interface, key)
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +210,7 @@ def test_deck_and_keys_act_obs_fields():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 24
+    assert len(fields) == 33
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:
@@ -209,6 +265,12 @@ def test_id_fields_have_id_high():
         "reward_potion_ids": interface.N_POTION_IDS - 1,
         "card_select_ids": interface.N_CARD_IDS - 1,
         "deck_ids": interface.N_CARD_IDS - 1,
+        "shop_card_ids": interface.N_CARD_IDS - 1,
+        # Shop / boss relic offers reuse the INVALID-sentinel empty marker (== N_RELIC_IDS),
+        # like reward_relic_ids, since RelicId 0 (AKABEKO) is a real relic.
+        "shop_relic_ids": interface.N_RELIC_IDS,
+        "shop_potion_ids": interface.N_POTION_IDS - 1,
+        "boss_relic_ids": interface.N_RELIC_IDS,
     }
     # Pin the exact set of id fields, so silently switching one to another
     # bounds value (which __post_init__ would happily accept) is caught.

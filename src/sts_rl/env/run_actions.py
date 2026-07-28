@@ -42,6 +42,7 @@ from sts_rl.env.run import execute_overworld_action, is_run_over, overworld_acti
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     ACTION_DIM,
+    BOSS_RELIC_SLOTS,
     CHOICE_MAX,
     MAX_REWARD_CARD_GROUPS,
     MAX_REWARD_CARDS_PER_GROUP,
@@ -54,6 +55,9 @@ from sts_rl.interface import (
     REWARD_RELIC_OFFSET,
     REWARD_SINGING_BOWL_OFFSET,
     REWARD_SKIP_OFFSET,
+    SHOP_CARD_SLOTS,
+    SHOP_POTION_SLOTS,
+    SHOP_RELIC_SLOTS,
     InterfaceError,
     Mask,
 )
@@ -79,16 +83,18 @@ _REWARD_TYPE_MASK = 0x7
 _SINGING_BOWL_OPTION = 5
 
 # Shop sub-layout within SHOP_SELECT: 7 cards, 3 relics, 3 potions, remove, leave.
-_SHOP_CARDS = 7
-_SHOP_RELICS = 3
-_SHOP_POTIONS = 3
+# Slot counts come from the shared interface so the mask/decode sub-layout and the
+# shop observation fields cannot drift apart.
+_SHOP_CARDS = SHOP_CARD_SLOTS
+_SHOP_RELICS = SHOP_RELIC_SLOTS
+_SHOP_POTIONS = SHOP_POTION_SLOTS
 _SHOP_RELIC_OFFSET = _SHOP_CARDS
 _SHOP_POTION_OFFSET = _SHOP_RELIC_OFFSET + _SHOP_RELICS
 _SHOP_REMOVE_OFFSET = _SHOP_POTION_OFFSET + _SHOP_POTIONS
 _SHOP_SKIP_OFFSET = _SHOP_REMOVE_OFFSET + 1
 
 # Boss-relic sub-layout within BOSS_RELIC_SELECT: 3 relics then skip.
-_BOSS_RELIC_COUNT = 3
+_BOSS_RELIC_COUNT = BOSS_RELIC_SLOTS
 
 # Bound on auto-resolution steps between two agent actions; far above any real
 # chain of unrepresentable overworld screens, so it only backstops a loop bug.

@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.7.0.
+INTERFACE_VERSION 0.8.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.7.0"
+INTERFACE_VERSION: str = "0.8.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -63,6 +63,24 @@ MAX_REWARD_CARD_GROUPS = 2  # card-choice groups (a second appears with Prayer W
 MAX_REWARD_CARDS_PER_GROUP = 4  # cards per group == CardReward fixed_list<Card,4>
 MAX_REWARD_CARD_SLOTS = MAX_REWARD_CARD_GROUPS * MAX_REWARD_CARDS_PER_GROUP  # 8
 
+# --- Shop / boss-relic / Neow selection caps -------------------------------
+# The shop (SHOP_ROOM) offers up to 7 cards, 3 relics, and 3 potions, plus a
+# card-removal and leave, slot-aligned with the SHOP_SELECT action block. Prices
+# are one flat 13-wide vector laid out cards[0..6], relics[7..9], potions[10..12]
+# (the engine's Shop layout); -1 marks an empty / sold / already-bought slot.
+# run_actions.py imports these so the mask/decode sub-layout and the shop
+# observation fields stay in lockstep.
+SHOP_CARD_SLOTS = 7
+SHOP_RELIC_SLOTS = 3
+SHOP_POTION_SLOTS = 3
+SHOP_PRICE_SLOTS = SHOP_CARD_SLOTS + SHOP_RELIC_SLOTS + SHOP_POTION_SLOTS  # 13
+# The boss-relic screen (BOSS_RELIC_REWARDS) offers 3 relics, aligned with the
+# BOSS_RELIC_SELECT action block's first 3 slots.
+BOSS_RELIC_SLOTS = 3
+# Neow (the run's opening event) offers 4 options (engine NeowOptions ==
+# array<Option, 4>), aligned with EVENT_SELECT indices 0..3.
+NEOW_OPTION_SLOTS = 4
+
 # --- Enum cardinalities (confirm against engine enums at startup) ----------
 N_CARD_IDS = 380  # CardId; engine max id 370
 N_RELIC_IDS = 180  # RelicId; engine max id 179
@@ -84,6 +102,14 @@ N_MONSTER_IDS = 66
 N_MONSTER_MOVE_IDS = 197  # MonsterMoveId; engine max id 196
 N_NODE_TYPES = 8  # Room (real node types); engine max id 7
 N_SCREENS = 12  # ScreenState; engine max id 9
+# Event id one-hot width (which event the run is currently on). The per-option
+# semantics of a non-Neow event are not exposed by the engine (event_data is a
+# single opaque int), so only the event identity is encoded; Neow, whose options
+# ARE exposed, gets the dedicated bonus / drawback fields below.
+N_EVENT_IDS = 57  # Event; engine max id 56 (INVALID=0)
+# Neow option bonus / drawback one-hot widths (Neow::Bonus / Neow::Drawback).
+N_NEOW_BONUS = 20  # Neow::Bonus; engine max id 19 (INVALID=19)
+N_NEOW_DRAWBACK = 7  # Neow::Drawback; engine max id 6 (INVALID=0)
 
 # --- Observation feature widths (named so OBS_FIELDS carries no magic ints) -
 PLAYER_SCALAR_DIM = 8  # hp_cur, hp_max, block, energy, gold, floor, ascension, turn
@@ -280,6 +306,31 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     # block (like player_scalars), NOT embedded. Appended last so the prior layout
     # stays a clean prefix for warm-start migration.
     ObsField("keys_act", np.float32, (KEYS_ACT_DIM,), "real"),
+    # --- Shop screen (SHOP_ROOM), slot-aligned with the SHOP_SELECT action block ---
+    # Offered cards / relics / potions and their prices; PAD (0) / relic-INVALID on
+    # every other screen. Cards and potions PAD with id 0 (INVALID); relics use the
+    # RelicId.INVALID sentinel (id_high N_RELIC_IDS) for empty slots, since RelicId 0
+    # (AKABEKO) is a real relic (same reason as reward_relic_ids). Prices are one flat
+    # 13-wide vector (cards[0..6], relics[7..9], potions[10..12]); an empty / sold /
+    # already-bought slot is 0.0 and its id slot is PAD, matching the mask (only slots
+    # with a real price are legal to buy).
+    ObsField("shop_card_ids", np.int32, (SHOP_CARD_SLOTS,), "id", id_high=N_CARD_IDS - 1),
+    ObsField("shop_relic_ids", np.int32, (SHOP_RELIC_SLOTS,), "id", id_high=N_RELIC_IDS),
+    ObsField("shop_potion_ids", np.int32, (SHOP_POTION_SLOTS,), "id", id_high=N_POTION_IDS - 1),
+    ObsField("shop_prices", np.float32, (SHOP_PRICE_SLOTS,), "real"),
+    ObsField("shop_remove_cost", np.float32, (1,), "real"),
+    # --- Boss-relic screen (BOSS_RELIC_REWARDS), aligned with BOSS_RELIC_SELECT ---
+    # The 3 offered boss relics; RelicId.INVALID sentinel for empty (as reward relics).
+    ObsField("boss_relic_ids", np.int32, (BOSS_RELIC_SLOTS,), "id", id_high=N_RELIC_IDS),
+    # --- Event / Neow screen (EVENT_SCREEN) ---
+    # event_onehot marks which event the run is on (identity only; per-option
+    # semantics of a non-Neow event are not exposed by the engine). On the Neow
+    # event the four options' bonus / drawback are one-hot per option, slot-aligned
+    # with EVENT_SELECT indices 0..3; PAD (all-zero) off the event screen and, for
+    # neow_*, off the Neow event.
+    ObsField("event_onehot", np.float32, (N_EVENT_IDS,), "unit"),
+    ObsField("neow_bonus_onehot", np.float32, (NEOW_OPTION_SLOTS, N_NEOW_BONUS), "unit"),
+    ObsField("neow_drawback_onehot", np.float32, (NEOW_OPTION_SLOTS, N_NEOW_DRAWBACK), "unit"),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}
@@ -339,6 +390,9 @@ EXPECTED_TABLE_SIZES: dict[str, int] = {
     "N_MONSTER_MOVE_IDS": N_MONSTER_MOVE_IDS,
     "N_NODE_TYPES": N_NODE_TYPES,
     "N_SCREENS": N_SCREENS,
+    "N_EVENT_IDS": N_EVENT_IDS,
+    "N_NEOW_BONUS": N_NEOW_BONUS,
+    "N_NEOW_DRAWBACK": N_NEOW_DRAWBACK,
 }
 
 

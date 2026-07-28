@@ -9,9 +9,11 @@ One encoder serves both modes. Pass a live ``BattleContext`` for combat, or
 ``bc=None`` for an overworld (run-mode) state: combat-only fields (hand, piles,
 enemies, powers) then stay zero, while ``map_context`` is filled from the run's
 map, ``deck_ids`` from the run deck, the potion belt from the overworld, and the
-``reward_*`` fields on a REWARDS screen. ``map_context``, ``deck_ids``, and the
-``reward_*`` fields are left zero during combat; the potion belt and ``keys_act``
-(act plus owned ruby / emerald / sapphire keys) are filled in both modes.
+per-screen offer fields from whichever screen is live -- ``reward_*`` on a REWARDS
+screen, ``shop_*`` on a shop, ``boss_relic_ids`` on a boss-relic screen, and
+``event_onehot`` / ``neow_*`` on an event screen. Those overworld fields are left
+zero during combat; the potion belt and ``keys_act`` (act plus owned ruby / emerald
+/ sapphire keys) are filled in both modes.
 
 Conventions:
 
@@ -35,6 +37,7 @@ import numpy as np
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
+    BOSS_RELIC_SLOTS,
     CHOICE_MAX,
     DECK_MAX,
     HAND_MAX,
@@ -44,16 +47,24 @@ from sts_rl.interface import (
     MAX_REWARD_CARDS_PER_GROUP,
     MAX_REWARD_POTIONS,
     MAX_REWARD_RELICS,
+    N_EVENT_IDS,
     N_MONSTER_MOVE_IDS,
     N_MONSTER_POWER_IDS,
+    N_NEOW_BONUS,
+    N_NEOW_DRAWBACK,
     N_NODE_TYPES,
     N_PLAYER_POWER_IDS,
     N_RELIC_IDS,
     N_SCREENS,
+    NEOW_OPTION_SLOTS,
     OBS_FIELDS,
     PAD_ID,
     PILE_MAX,
     POTION_SLOTS,
+    SHOP_CARD_SLOTS,
+    SHOP_POTION_SLOTS,
+    SHOP_PRICE_SLOTS,
+    SHOP_RELIC_SLOTS,
     Obs,
 )
 
@@ -110,6 +121,15 @@ _SCREEN_REWARDS = int(sts.ScreenState.REWARDS)
 # order-aligned with the CARD_SELECT action block; PAD on every other screen.
 _SCREEN_CARD_SELECT = int(sts.ScreenState.CARD_SELECT)
 
+# Overworld screens whose offered options the shop / boss-relic / event fills read.
+_SCREEN_SHOP = int(sts.ScreenState.SHOP_ROOM)
+_SCREEN_BOSS_RELIC = int(sts.ScreenState.BOSS_RELIC_REWARDS)
+_SCREEN_EVENT = int(sts.ScreenState.EVENT_SCREEN)
+# Neow is the run's opening event; only on it are per-option bonus / drawback exposed.
+_NEOW_EVENT = int(sts.Event.NEOW)
+# Engine "no price / sold / already-bought" sentinel for a shop slot (Shop::prices).
+_SHOP_EMPTY_PRICE = -1
+
 # --- map_context layout (run mode) -----------------------------------------
 # The act map is a grid MAP_COLS wide and MAP_ROWS tall (verified against the
 # engine). MAP_SELECT chooses a target column, so the per-column features below
@@ -151,15 +171,16 @@ _COMBAT_ROOMS = (_ROOM_MONSTER, _ROOM_ELITE, _ROOM_BOSS)
 def _empty_obs() -> Obs:
     """Empty observation with every field's interface dtype and shape.
 
-    Fields are zero-filled (PAD_ID 0 for id fields, 0.0 for real / unit), EXCEPT
-    reward_relic_ids, which is seeded with the relic INVALID sentinel: RelicId 0
-    (AKABEKO) is a real relic, so an all-zero relic-offer field would read as "AKABEKO
-    offered in every slot". INVALID marks "no relic here" -- an empty offer, and every
-    non-reward / combat state where the field is left untouched -- which the encoder
-    maps to a zero contribution.
+    Fields are zero-filled (PAD_ID 0 for id fields, 0.0 for real / unit), EXCEPT the
+    relic-offer fields (reward / shop / boss), which are seeded with the relic INVALID
+    sentinel: RelicId 0 (AKABEKO) is a real relic, so an all-zero relic-offer field would
+    read as "AKABEKO offered in every slot". INVALID marks "no relic here" -- an empty
+    offer, and every non-offer / combat state where the field is left untouched -- which
+    the encoder maps to a zero contribution.
     """
     obs: Obs = {field.name: np.zeros(field.shape, dtype=field.dtype) for field in OBS_FIELDS}
-    obs["reward_relic_ids"].fill(_RELIC_INVALID)
+    for relic_field in ("reward_relic_ids", "shop_relic_ids", "boss_relic_ids"):
+        obs[relic_field].fill(_RELIC_INVALID)
     return obs
 
 
@@ -197,6 +218,9 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
         _fill_card_select_ids(obs, gc)
         _fill_deck_ids(obs, gc)
         _fill_overworld_potions(obs, gc)
+        _fill_shop(obs, gc)
+        _fill_boss_relics(obs, gc)
+        _fill_event_neow(obs, gc)
         return obs
 
     player = bc.player
@@ -524,6 +548,138 @@ def _fill_overworld_potions(obs: Obs, gc: Any) -> None:
             continue
         potion_ids[i] = potion
         potion_usable[i] = 1.0
+
+
+def _fill_shop(obs: Obs, gc: Any) -> None:
+    """Fill the shop fields from the live SHOP_ROOM screen, slot-aligned with the
+    ``SHOP_SELECT`` action block.
+
+    Only the shop screen carries a live ``shop``; on every other screen these fields
+    stay PAD / relic-INVALID, so the guard makes them meaningful exactly when the
+    ``SHOP_SELECT`` block is legal. Layout mirrors :mod:`sts_rl.env.run_actions`:
+    cards[0..6], relics[0..2], potions[0..2], and one flat 13-wide price vector
+    (cards[0..6], relics[7..9], potions[10..12]). A slot priced ``-1`` is empty / sold /
+    already-bought: its price stays 0.0 and its id stays PAD, matching the mask (only
+    slots with a real price are legal to buy).
+
+    Every item slot (card, relic, potion) is gated on a real price: buying an item sets
+    its price to -1 while leaving the item in the engine array, so the price gate is what
+    hides an already-bought item, keeping the observation consistent with the mask (which
+    only offers real-priced slots).
+
+    Card slots are raw-slot-aligned: for Ironclad the engine always generates all seven
+    card slots and never sets one to INVALID (buying only clears the price), so
+    ``shop.cards`` is length seven in slot order and the price gate hides bought slots.
+    A non-empty ``shop.cards`` of any other length would misalign the card ids against the
+    raw-slot price vector, so it is rejected loudly below rather than encoded as a silent
+    mismap.
+    """
+    if int(gc.screen_state) != _SCREEN_SHOP:
+        return
+    shop = gc.screen_state_info.shop
+    prices = shop.prices  # 13: cards[0..6], relics[7..9], potions[10..12]
+
+    shop_prices = obs["shop_prices"]
+    for i in range(min(len(prices), SHOP_PRICE_SLOTS)):
+        price = int(prices[i])
+        if price != _SHOP_EMPTY_PRICE:
+            shop_prices[i] = price
+    remove_cost = shop.remove_cost
+    if remove_cost is not None:
+        obs["shop_remove_cost"][0] = remove_cost
+
+    # Cards: raw-slot-aligned, gated by a real price. A bought slot keeps its card id in
+    # the engine array but its price is -1, so the gate hides it, matching the mask.
+    card_ids = obs["shop_card_ids"]
+    cards = shop.cards
+    if cards and len(cards) != SHOP_CARD_SLOTS:
+        raise AssertionError(
+            f"shop.cards has {len(cards)} entries, expected {SHOP_CARD_SLOTS}: the raw-slot "
+            "alignment of shop_card_ids against the price vector assumes every card slot is "
+            "populated (the Ironclad invariant); a shorter list would silently misalign"
+        )
+    for i in range(min(len(cards), SHOP_CARD_SLOTS)):
+        if int(prices[i]) != _SHOP_EMPTY_PRICE:
+            card_ids[i] = int(cards[i].id)
+
+    # Relics: gated on the relic price slot (cards occupy 0..6, so relic i is price 7+i).
+    # RelicId 0 (AKABEKO) is a REAL relic, so empty / bought slots keep the INVALID sentinel
+    # _empty_obs seeded (as reward_relic_ids); write only real, still-offered ids.
+    relic_ids = obs["shop_relic_ids"]
+    relics = shop.relics
+    for i in range(min(len(relics), SHOP_RELIC_SLOTS)):
+        if int(prices[SHOP_CARD_SLOTS + i]) == _SHOP_EMPTY_PRICE:
+            continue
+        rid = int(relics[i])
+        if 0 <= rid < N_RELIC_IDS:
+            relic_ids[i] = rid
+
+    # Potions: gated on the potion price slot (10+i), then skip the engine's empty /
+    # invalid sentinels (a skipped or bought slot stays PAD).
+    potion_ids = obs["shop_potion_ids"]
+    potions = shop.potions
+    for i in range(min(len(potions), SHOP_POTION_SLOTS)):
+        if int(prices[SHOP_CARD_SLOTS + SHOP_RELIC_SLOTS + i]) == _SHOP_EMPTY_PRICE:
+            continue
+        potion = potions[i]
+        if potion == _POTION_EMPTY or potion == _POTION_INVALID:
+            continue
+        potion_ids[i] = int(potion)
+
+
+def _fill_boss_relics(obs: Obs, gc: Any) -> None:
+    """Fill ``boss_relic_ids`` from the live BOSS_RELIC_REWARDS screen, aligned with
+    the ``BOSS_RELIC_SELECT`` action block's first three slots.
+
+    Only the boss-relic screen carries a live ``boss_relics``; elsewhere the field
+    stays at the relic INVALID sentinel :func:`_empty_obs` seeded. RelicId 0 (AKABEKO)
+    is a real relic, so empty slots use INVALID, not PAD 0 (as reward_relic_ids).
+    """
+    if int(gc.screen_state) != _SCREEN_BOSS_RELIC:
+        return
+    relic_ids = obs["boss_relic_ids"]
+    boss_relics = gc.screen_state_info.boss_relics
+    for i in range(min(len(boss_relics), BOSS_RELIC_SLOTS)):
+        rid = int(boss_relics[i])
+        if 0 <= rid < N_RELIC_IDS:
+            relic_ids[i] = rid
+
+
+def _fill_event_neow(obs: Obs, gc: Any) -> None:
+    """Fill ``event_onehot`` and, on the Neow event, ``neow_bonus_onehot`` /
+    ``neow_drawback_onehot`` from the live EVENT_SCREEN.
+
+    Only the event screen sets these; elsewhere they stay all-zero (PAD). A non-Neow
+    event exposes its per-option semantics only as one opaque ``event_data`` int, so a
+    generic event contributes just its identity one-hot. Neow's four options ARE exposed
+    (bonus + drawback per option), slot-aligned with ``EVENT_SELECT`` indices 0..3.
+    Indices are range-guarded (as :func:`_fill_screen_onehot`) so an enum bump past its
+    table drops the bit rather than overflowing.
+    """
+    if int(gc.screen_state) != _SCREEN_EVENT:
+        return
+    event_id = int(gc.cur_event)
+    if 0 <= event_id < N_EVENT_IDS:
+        obs["event_onehot"][event_id] = 1.0
+    if event_id != _NEOW_EVENT:
+        return
+    bonus = obs["neow_bonus_onehot"]  # (NEOW_OPTION_SLOTS, N_NEOW_BONUS)
+    drawback = obs["neow_drawback_onehot"]  # (NEOW_OPTION_SLOTS, N_NEOW_DRAWBACK)
+    options = gc.screen_state_info.neowRewards
+    # Each option's bonus / drawback is one-hot in its own row. Unlike the relic
+    # multihot (which drops INVALID), an INVALID option is encoded as its own bit here:
+    # a mini-blessing Neow has two real options and slots 2-3 at Bonus.INVALID, and the
+    # per-row one-hot lets the agent tell an INVALID (absent) option row from an all-zero
+    # off-screen row. All ids are range-guarded (as _fill_screen_onehot) so an enum bump
+    # past its table drops the bit rather than overflowing.
+    for i in range(min(len(options), NEOW_OPTION_SLOTS)):
+        option = options[i]
+        bonus_id = int(option.r)
+        drawback_id = int(option.d)
+        if 0 <= bonus_id < N_NEOW_BONUS:
+            bonus[i, bonus_id] = 1.0
+        if 0 <= drawback_id < N_NEOW_DRAWBACK:
+            drawback[i, drawback_id] = 1.0
 
 
 def _fill_pile_ids(out: np.ndarray, pile: Any) -> None:

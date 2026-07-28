@@ -15,6 +15,9 @@ Each embedding table holds ids `0..N-1`, so the invariant is `engine max_id < N`
 | `N_MONSTER_MOVE_IDS` | 197 | 196 | OK | MonsterMoveId (module)=196 |
 | `N_NODE_TYPES` | 8 | 7 | OK | Room (module)=7 [excl. sentinel NONE=8, INVALID=9] |
 | `N_SCREENS` | 12 | 9 | OK | ScreenState (module)=9 |
+| `N_EVENT_IDS` | 57 | 56 | OK | Event (module)=56 |
+| `N_NEOW_BONUS` | 20 | 18 | OK | NeowBonus (module)=18 [excl. sentinel INVALID=19] |
+| `N_NEOW_DRAWBACK` | 7 | 6 | OK | NeowDrawback (module)=6 |
 
 ## What the contract's startup guard reports
 
