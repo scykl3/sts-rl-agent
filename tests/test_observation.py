@@ -32,6 +32,7 @@ from sts_rl.env.observation import (
     _fill_deck_ids,
     _fill_keys_act,
     _fill_map_context,
+    _fill_neow_event,
     _fill_reward_ids,
     _fill_shop,
     encode_observation,
@@ -42,11 +43,15 @@ from sts_rl.interface import (
     CHOICE_MAX,
     DECK_MAX,
     MAX_BOSS_RELICS,
+    MAX_NEOW_OPTIONS,
     MAX_REWARD_CARD_GROUPS,
     MAX_REWARD_CARDS_PER_GROUP,
     MAX_REWARD_POTIONS,
     MAX_REWARD_RELICS,
     MAX_SHOP_CARDS,
+    N_EVENT_IDS,
+    N_NEOW_BONUS,
+    N_NEOW_DRAWBACK,
     N_NODE_TYPES,
     N_RELIC_IDS,
     OBS_FIELDS,
@@ -879,3 +884,134 @@ def test_fill_boss_relic_ids_noop_off_boss_screen() -> None:
     obs = _empty_obs()
     _fill_boss_relic_ids(obs, gc)
     assert np.all(obs["boss_relic_ids"] == N_RELIC_IDS)
+
+
+# --- Neow-event one-hots (EVENT_SCREEN) ------------------------------------
+
+
+def _neow_gc(options, cur_event=None, screen=None):
+    """A minimal gc whose screen + cur_event + neowRewards drive ``_fill_neow_event`` alone.
+
+    ``options`` is a sequence of ``(bonus_id, drawback_id)`` pairs; each becomes a
+    NeowOption-like object with ``.r`` / ``.d`` (all the fill reads). ``cur_event``
+    defaults to ``Event.NEOW`` and ``screen`` to ``EVENT_SCREEN``.
+    """
+    ssi = SimpleNamespace(neowRewards=[SimpleNamespace(r=r, d=d) for r, d in options])
+    return SimpleNamespace(
+        screen_state=sts.ScreenState.EVENT_SCREEN if screen is None else screen,
+        cur_event=sts.Event.NEOW if cur_event is None else cur_event,
+        screen_state_info=ssi,
+    )
+
+
+def test_neow_event_populated_from_live_run() -> None:
+    # A fresh run starts on the Neow event screen; encode overworld (bc=None) and confirm
+    # the event / Neow one-hots match the live screen. Proves the gc.cur_event and
+    # screen_state_info.neowRewards -> .r / .d binding path (not just a fake gc).
+    gc = start_run(seed=REGRESSION_SEED)
+    assert gc.screen_state == sts.ScreenState.EVENT_SCREEN
+    assert int(gc.cur_event) == int(sts.Event.NEOW)
+    obs = encode_observation(gc, None)
+
+    # event_onehot marks exactly the NEOW event.
+    assert obs["event_onehot"][int(sts.Event.NEOW)] == 1.0
+    assert obs["event_onehot"].sum() == 1.0
+
+    # Each offered option's NeowBonus / NeowDrawback sets its own per-option span.
+    options = gc.screen_state_info.neowRewards
+    assert len(options) == MAX_NEOW_OPTIONS
+    for k, opt in enumerate(options):
+        assert obs["neow_bonus"][k * N_NEOW_BONUS + int(opt.r)] == 1.0
+        assert obs["neow_drawback"][k * N_NEOW_DRAWBACK + int(opt.d)] == 1.0
+    assert obs["neow_bonus"].sum() == MAX_NEOW_OPTIONS
+    assert obs["neow_drawback"].sum() == MAX_NEOW_OPTIONS
+    assert build_observation_space().contains(obs)
+
+
+def test_fill_neow_event_sets_event_and_option_onehots() -> None:
+    # On the Neow screen: event_onehot marks NEOW, and each option's NeowBonus /
+    # NeowDrawback sets exactly one bit in that option's span. The populated blocks must
+    # differ from the empty all-zero baseline (revert guard: a no-op fill fails here).
+    options = [
+        (int(sts.NeowBonus.TRANSFORM_CARD), int(sts.NeowDrawback.NONE)),
+        (int(sts.NeowBonus.RANDOM_COMMON_RELIC), int(sts.NeowDrawback.NONE)),
+        (int(sts.NeowBonus.TWO_FIFTY_GOLD), int(sts.NeowDrawback.PERCENT_DAMAGE)),
+        (int(sts.NeowBonus.BOSS_RELIC), int(sts.NeowDrawback.LOSE_STARTER_RELIC)),
+    ]
+    gc = _neow_gc(options)
+    obs = _empty_obs()
+    _fill_neow_event(obs, gc)
+
+    # event_onehot: exactly the NEOW bit is set.
+    expected_event = np.zeros(N_EVENT_IDS, dtype=np.float32)
+    expected_event[int(sts.Event.NEOW)] = 1.0
+    assert np.array_equal(obs["event_onehot"], expected_event)
+
+    # Each option sets exactly one bit in its own per-option span, at the .r / .d id.
+    for k, (bonus, drawback) in enumerate(options):
+        assert obs["neow_bonus"][k * N_NEOW_BONUS + bonus] == 1.0
+        assert obs["neow_drawback"][k * N_NEOW_DRAWBACK + drawback] == 1.0
+    assert obs["neow_bonus"].sum() == MAX_NEOW_OPTIONS  # one bit per option
+    assert obs["neow_drawback"].sum() == MAX_NEOW_OPTIONS
+
+    # Revert guard: the populated one-hots differ from the empty baseline (a no-op fill,
+    # e.g. if _fill_neow_event were reverted, would leave them equal and fail this).
+    empty = _empty_obs()
+    for name in ("event_onehot", "neow_bonus", "neow_drawback"):
+        assert not np.array_equal(obs[name], empty[name]), name
+    assert build_observation_space().contains(obs)
+
+
+def test_fill_neow_event_non_neow_event_sets_only_event_onehot() -> None:
+    # A non-Neow event on the event screen sets only event_onehot (its cur_event bit);
+    # the per-option Neow blocks stay zero, since the option identities are Neow-specific.
+    other = next(
+        e
+        for e in sts.Event.__members__.values()
+        if int(e) != int(sts.Event.NEOW) and 0 <= int(e) < N_EVENT_IDS
+    )
+    gc = _neow_gc([], cur_event=other)
+    obs = _empty_obs()
+    _fill_neow_event(obs, gc)
+    assert obs["event_onehot"][int(other)] == 1.0
+    assert obs["event_onehot"].sum() == 1.0
+    assert not np.any(obs["neow_bonus"])
+    assert not np.any(obs["neow_drawback"])
+
+
+def test_fill_neow_event_truncates_options_to_cap() -> None:
+    # More options than fit are truncated to MAX_NEOW_OPTIONS (no overflow past the
+    # per-option one-hot spans), mirroring the reward / boss-relic slot truncation.
+    options = [(int(sts.NeowBonus.TWO_FIFTY_GOLD), int(sts.NeowDrawback.NONE))] * (
+        MAX_NEOW_OPTIONS + 2
+    )
+    gc = _neow_gc(options)
+    obs = _empty_obs()
+    _fill_neow_event(obs, gc)
+    assert obs["neow_bonus"].shape == (MAX_NEOW_OPTIONS * N_NEOW_BONUS,)
+    assert obs["neow_drawback"].shape == (MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK,)
+    assert obs["neow_bonus"].sum() == MAX_NEOW_OPTIONS  # one bit per kept option
+    assert obs["neow_drawback"].sum() == MAX_NEOW_OPTIONS
+
+
+def test_fill_neow_event_noop_off_event_screen() -> None:
+    # Off the event screen the fill is a no-op: every block stays all-zero, so a stale
+    # cur_event never leaks a phantom event bit.
+    options = [(int(sts.NeowBonus.TWO_FIFTY_GOLD), int(sts.NeowDrawback.PERCENT_DAMAGE))]
+    gc = _neow_gc(options, screen=sts.ScreenState.MAP_SCREEN)
+    obs = _empty_obs()
+    _fill_neow_event(obs, gc)
+    for name in ("event_onehot", "neow_bonus", "neow_drawback"):
+        assert not np.any(obs[name]), name
+
+
+def test_neow_event_fields_empty_off_event_screen_real_encode() -> None:
+    # In real encodes off the event screen (combat and the map screen), the Neow-event
+    # one-hots stay all-zero.
+    gc_combat, bc = _combat()
+    combat_obs = encode_observation(gc_combat, bc)
+    map_obs = encode_observation(_drive_to_first_map_screen(), None)
+    for obs in (combat_obs, map_obs):
+        assert not np.any(obs["event_onehot"])
+        assert not np.any(obs["neow_bonus"])
+        assert not np.any(obs["neow_drawback"])

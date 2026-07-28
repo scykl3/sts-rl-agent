@@ -170,6 +170,9 @@ PROBES: tuple[EnumProbe, ...] = (
     EnumProbe("N_MONSTER_MOVE_IDS", (("MonsterMoveId", "MonsterMoves.h", "MonsterMoveId"),)),
     EnumProbe("N_NODE_TYPES", (("Room", "Rooms.h", "Room"),)),
     EnumProbe("N_SCREENS", (("ScreenState", "", ""),)),
+    EnumProbe("N_EVENT_IDS", (("Event", "", ""),)),
+    EnumProbe("N_NEOW_BONUS", (("NeowBonus", "", ""),)),
+    EnumProbe("N_NEOW_DRAWBACK", (("NeowDrawback", "", ""),)),
 )
 
 

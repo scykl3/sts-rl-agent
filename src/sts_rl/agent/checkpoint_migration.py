@@ -83,11 +83,13 @@ TRUNK_INPUT_WEIGHT_KEY: str = "encoder.trunk.0.weight"
 #          blocks were appended)
 #   4949 - pre-shop/boss width (after the pooled deck and keys/act blocks, the shipped
 #          0.7.0 width; before the shop and boss-relic screen blocks were appended)
+#   5571 - pre-neow/event width (after the shop and boss-relic screen blocks, the
+#          shipped 0.8.0 width; before the Neow-event one-hot blocks were appended)
 # When a new feature block is appended at the END of the concat, add the PRE-APPEND
 # width here deliberately (the current width, just before the append) so an older
 # checkpoint of that width still migrates and any other narrower width is rejected
 # as a column mismap.
-_KNOWN_PRIOR_FEATURE_DIMS: tuple[int, ...] = (1349, 1605, 4881, 4949)
+_KNOWN_PRIOR_FEATURE_DIMS: tuple[int, ...] = (1349, 1605, 4881, 4949, 5571)
 
 # Historical action-block layouts, as ordered ``(name, count)`` specs copied
 # verbatim from each version's ``interface.py`` in git. Counts (not offsets) are

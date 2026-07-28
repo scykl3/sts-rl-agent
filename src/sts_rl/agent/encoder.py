@@ -45,6 +45,10 @@ to the hand/enemy slot order, so do NOT reorder):
     shop remove  1   (the card-removal service cost, a single raw price column)
     boss relics  N_RELIC_IDS   (offered act-boss relics as an order-agnostic multihot,
                  like the reward / shop relics; no relic embedding table)
+    neow/event   N_EVENT_IDS + MAX_NEOW_OPTIONS * (N_NEOW_BONUS + N_NEOW_DRAWBACK)
+                 (Neow-event one-hots: the current event id, then per-option NeowBonus
+                 and NeowDrawback one-hots; raw passthrough unit blocks like
+                 screen_onehot, appended last)
 """
 
 from __future__ import annotations
@@ -60,15 +64,19 @@ from sts_rl.interface import (
     KEYS_ACT_DIM,
     MAP_CONTEXT_DIM,
     MAX_ENEMIES,
+    MAX_NEOW_OPTIONS,
     MAX_REWARD_CARD_SLOTS,
     MAX_REWARD_POTIONS,
     MAX_SHOP_CARDS,
     MAX_SHOP_POTIONS,
     MAX_SHOP_RELICS,
     N_CARD_IDS,
+    N_EVENT_IDS,
     N_MONSTER_IDS,
     N_MONSTER_MOVE_IDS,
     N_MONSTER_POWER_IDS,
+    N_NEOW_BONUS,
+    N_NEOW_DRAWBACK,
     N_PLAYER_POWER_IDS,
     N_POTION_IDS,
     N_RELIC_IDS,
@@ -175,6 +183,13 @@ class ObsFeatureEncoder(nn.Module):
         shop_potion_prices = MAX_SHOP_POTIONS
         shop_remove_cost = 1
         boss_relics = N_RELIC_IDS
+        # Neow-event one-hots, appended LAST (after the boss-relic multihot) as raw
+        # passthrough unit blocks, so the prior layout stays a clean prefix for
+        # warm-start migration. event_onehot spans the Event id space; the two Neow
+        # blocks are MAX_NEOW_OPTIONS per-option NeowBonus / NeowDrawback one-hot spans.
+        event_onehot = N_EVENT_IDS
+        neow_bonus = MAX_NEOW_OPTIONS * N_NEOW_BONUS
+        neow_drawback = MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK
         return (
             hand
             + enemy
@@ -195,6 +210,9 @@ class ObsFeatureEncoder(nn.Module):
             + shop_potion_prices
             + shop_remove_cost
             + boss_relics
+            + event_onehot
+            + neow_bonus
+            + neow_drawback
         )
 
     def _pool_pile(self, pile_ids: Tensor) -> Tensor:
@@ -361,14 +379,23 @@ class ObsFeatureEncoder(nn.Module):
         boss_relic_scatter.scatter_(1, boss_relic_ids, 1.0)
         boss_relics = boss_relic_scatter[:, :N_RELIC_IDS]  # drop the INVALID/empty column
 
-        # CAUTION: the reward, card-select, deck, keys/act, and shop / boss-relic blocks
-        # are appended LAST, in this fixed order (reward cards, relics, potions, then
-        # card_select, the pooled deck, keys/act, then shop cards + prices, shop relics
-        # + prices, shop potions + prices, shop remove cost, and finally the boss-relic
-        # multihot), so an old checkpoint's trained input columns stay the leading prefix
-        # and migrate_encoder_trunk_input_width widens the trunk by a clean zero-init
-        # suffix. Do NOT insert a block ahead of these or reorder them, or the migration
-        # would silently mismap columns.
+        # NEOW-EVENT: three raw passthrough unit one-hot blocks (already coerced to
+        # float32 above), appended LAST after the boss-relic multihot. The env writes
+        # the one-hot (like screen_onehot and the relic multihots); the encoder only
+        # concatenates it, so no embedding table or masking code path is added here.
+        event_onehot = obs["event_onehot"]
+        neow_bonus = obs["neow_bonus"]
+        neow_drawback = obs["neow_drawback"]
+
+        # CAUTION: the reward, card-select, deck, keys/act, shop / boss-relic, and
+        # Neow-event blocks are appended LAST, in this fixed order (reward cards, relics,
+        # potions, then card_select, the pooled deck, keys/act, then shop cards + prices,
+        # shop relics + prices, shop potions + prices, shop remove cost, the boss-relic
+        # multihot, and finally the Neow-event one-hots: event, bonus, drawback), so an
+        # old checkpoint's trained input columns stay the leading prefix and
+        # migrate_encoder_trunk_input_width widens the trunk by a clean zero-init suffix.
+        # Do NOT insert a block ahead of these or reorder them, or the migration would
+        # silently mismap columns.
         return torch.cat(
             [
                 hand,
@@ -390,6 +417,9 @@ class ObsFeatureEncoder(nn.Module):
                 shop_potion_prices,
                 shop_remove_cost,
                 boss_relics,
+                event_onehot,
+                neow_bonus,
+                neow_drawback,
             ],
             dim=1,
         )

@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.8.0.
+INTERFACE_VERSION 0.9.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.8.0"
+INTERFACE_VERSION: str = "0.9.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -79,6 +79,14 @@ MAX_SHOP_POTIONS = 3
 # matching the BOSS_RELIC_SELECT action block's 3 relic sub-slots.
 MAX_BOSS_RELICS = 3
 
+# --- Neow-event observation cap (EVENT_SCREEN, cur_event == NEOW) ------------
+# The opening Neow event offers a fixed 4 reward options (engine neowRewards[4]);
+# each option pairs one NeowBonus with one NeowDrawback, encoded as two per-option
+# one-hot spans (see event_onehot / neow_bonus / neow_drawback in OBS_FIELDS). There
+# is no Neow action block -- the agent picks via EVENT_SELECT -- so this cap sizes
+# only the observation, not an action layout.
+MAX_NEOW_OPTIONS = 4
+
 # --- Enum cardinalities (confirm against engine enums at startup) ----------
 N_CARD_IDS = 380  # CardId; engine max id 370
 N_RELIC_IDS = 180  # RelicId; engine max id 179
@@ -100,6 +108,9 @@ N_MONSTER_IDS = 66
 N_MONSTER_MOVE_IDS = 197  # MonsterMoveId; engine max id 196
 N_NODE_TYPES = 8  # Room (real node types); engine max id 7
 N_SCREENS = 12  # ScreenState; engine max id 9
+N_EVENT_IDS = 57  # Event; engine max id 56
+N_NEOW_BONUS = 20  # NeowBonus; engine max id 19
+N_NEOW_DRAWBACK = 7  # NeowDrawback; engine max id 6
 
 # --- Observation feature widths (named so OBS_FIELDS carries no magic ints) -
 PLAYER_SCALAR_DIM = 8  # hp_cur, hp_max, block, energy, gold, floor, ascension, turn
@@ -322,6 +333,18 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     # Offered act-boss relics (BOSS_RELIC_REWARDS): a multihot mirroring reward_relic_ids
     # (id_high N_RELIC_IDS, INVALID empty marker); no price -- the boss relic is free.
     ObsField("boss_relic_ids", np.int32, (MAX_BOSS_RELICS,), "id", id_high=N_RELIC_IDS),
+    # Neow-event one-hots (EVENT_SCREEN). An env-written one-hot float block per field,
+    # like screen_onehot -- the environment scatters the bits and the encoder only
+    # concatenates them (no embedding table, no per-option identity). event_onehot marks
+    # the current event id (gc.cur_event) whenever an event is on screen; on the Neow
+    # event (cur_event == NEOW) the two Neow blocks are per-option one-hots of each
+    # offered option's NeowBonus (.r) and NeowDrawback (.d), laid out as MAX_NEOW_OPTIONS
+    # contiguous one-hot spans (option k's bonus at k * N_NEOW_BONUS + bonus id). All zero
+    # off an event screen; the Neow blocks stay zero for a non-Neow event. Appended last
+    # so the prior layout stays a clean prefix for warm-start migration.
+    ObsField("event_onehot", np.float32, (N_EVENT_IDS,), "unit"),
+    ObsField("neow_bonus", np.float32, (MAX_NEOW_OPTIONS * N_NEOW_BONUS,), "unit"),
+    ObsField("neow_drawback", np.float32, (MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK,), "unit"),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}
@@ -381,6 +404,9 @@ EXPECTED_TABLE_SIZES: dict[str, int] = {
     "N_MONSTER_MOVE_IDS": N_MONSTER_MOVE_IDS,
     "N_NODE_TYPES": N_NODE_TYPES,
     "N_SCREENS": N_SCREENS,
+    "N_EVENT_IDS": N_EVENT_IDS,
+    "N_NEOW_BONUS": N_NEOW_BONUS,
+    "N_NEOW_DRAWBACK": N_NEOW_DRAWBACK,
 }
 
 
