@@ -681,6 +681,41 @@ def test_combat_card_select_ids_reflect_engine_filter() -> None:
         assert csi[idx] == int(bc.cards.hand[idx].id)
 
 
+def test_combat_card_select_ids_draw_pile_source() -> None:
+    """``SECRET_WEAPON`` picks attacks from the DRAW pile, so it exercises a non-hand
+    pile source (the discard / exhaust / draw branches share this pile-indexed
+    mapping). The populated slots must be the draw-pile attack indices at their
+    absolute positions, matching ``build_mask`` -- guarding the binding's pile choice
+    and its sparse-index alignment, not just the hand path.
+    """
+    gc, bc = _combat()
+    bc.open_card_select(sts.CardSelectTask.SECRET_WEAPON, 1)  # draw pile, ATTACK filter
+    draw = bc.cards.drawPile
+    expected = {i for i in range(len(draw)) if int(draw[i].getType()) == _CARD_TYPE_ATTACK}
+    assert expected, "opening draw pile should hold at least one attack"
+
+    csi, populated, legal = _card_select_obs_and_legal(gc, bc)
+    assert populated == expected  # only draw-pile attacks, at their draw-pile indices
+    assert populated == legal
+    for idx in populated:
+        assert csi[idx] == int(draw[idx].id)
+
+
+def test_combat_card_select_ids_generated_source() -> None:
+    """A generated card-select (``DISCOVERY``) surfaces the offered cards at slots
+    0..2 -- the non-pile branch, reading ``cardSelectInfo.cards`` -- matching the mask.
+    """
+    gc, bc = _combat()
+    bc.open_discovery_select([sts.CardId.ANGER, sts.CardId.CLEAVE, sts.CardId.CLOTHESLINE], 1, True)
+    truth = dict(bc.card_select_candidate_ids())  # engine's (idx -> id) for the offered cards
+    assert truth, "discovery should offer candidates"
+
+    csi, populated, legal = _card_select_obs_and_legal(gc, bc)
+    assert populated == legal
+    for idx, card_id in truth.items():
+        assert csi[idx] == card_id
+
+
 # --- deck_ids (overworld deck) ---------------------------------------------
 
 
