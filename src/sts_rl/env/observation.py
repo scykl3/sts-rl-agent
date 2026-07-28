@@ -258,6 +258,10 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
     _fill_pile_ids(obs["discard_ids"], bc.cards.discardPile)
     _fill_pile_ids(obs["exhaust_ids"], bc.cards.exhaustPile)
 
+    # -- card-select candidates: set only when an in-combat card-select is active
+    # (Headbutt / Exhume / Discovery / ...); PAD otherwise, slot-aligned to CARD_SELECT.
+    _fill_combat_card_select_ids(obs, bc)
+
     # -- enemies: id, scalars, intent, powers, alive (per fixed slot)
     intents_hidden = bool(bc.intents_hidden)
     enemy_ids = obs["enemy_ids"]
@@ -471,6 +475,26 @@ def _fill_card_select_ids(obs: Obs, gc: Any) -> None:
     candidates = gc.screen_state_info.to_select_cards
     for i in range(min(len(candidates), CHOICE_MAX)):
         card_select_ids[i] = int(candidates[i].id)
+
+
+def _fill_combat_card_select_ids(obs: Obs, bc: Any) -> None:
+    """Fill ``card_select_ids`` from an active in-combat card-select, slot-aligned
+    with the ``CARD_SELECT`` action block.
+
+    The combat counterpart of :func:`_fill_card_select_ids`. Cards a combat select
+    picks FROM live in a pile (hand / draw / discard / exhaust) or are generated
+    (Discovery / Codex), so the engine returns ``(pick_index, card_id)`` pairs where
+    ``pick_index`` is the absolute pile index a ``SINGLE_CARD_SELECT`` action
+    consumes -- the same index the ``CARD_SELECT`` block uses (see
+    :mod:`sts_rl.env.actions`). Each candidate is written at its own index (not
+    compacted), so ``card_select_ids[i]`` is the card that ``SINGLE_CARD_SELECT(i)``
+    picks. The list is empty whenever no card-select is active, so a normal combat
+    step leaves the field PAD; indices past ``CHOICE_MAX`` are dropped to the width.
+    """
+    card_select_ids = obs["card_select_ids"]
+    for idx, card_id in bc.card_select_candidate_ids():
+        if 0 <= idx < CHOICE_MAX:
+            card_select_ids[idx] = card_id
 
 
 def _fill_keys_act(obs: Obs, gc: Any) -> None:

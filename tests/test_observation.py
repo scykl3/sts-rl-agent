@@ -16,11 +16,14 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
     pytest.skip(f"engine not built ({exc})", allow_module_level=True)
 
 from sts_rl.env._engine import slaythespire as sts
+from sts_rl.env.actions import build_mask
 from sts_rl.env.adapter import StsEnv
 from sts_rl.env.engine import start_combat
 from sts_rl.env.observation import (
     MAP_COLS,
     MAP_ROWS,
+    _CARD_TYPE_ATTACK,
+    _CARD_TYPE_POWER,
     _MAP_CUR_BLOCK,
     _MAP_CUR_POS,
     _MAP_CUR_ROOM_ONEHOT,
@@ -36,6 +39,7 @@ from sts_rl.env.observation import (
 from sts_rl.env.run import execute_overworld_action, overworld_actions, start_run
 from sts_rl.env.spaces import build_observation_space
 from sts_rl.interface import (
+    ACTION_BLOCK_BY_NAME,
     CHOICE_MAX,
     DECK_MAX,
     MAX_REWARD_CARD_GROUPS,
@@ -618,6 +622,58 @@ def test_card_select_ids_pad_off_card_select_screen() -> None:
     assert not np.any(encode_observation(gc_combat, bc)["card_select_ids"])
     map_obs = encode_observation(_drive_to_first_map_screen(), None)
     assert not np.any(map_obs["card_select_ids"])
+
+
+def _card_select_obs_and_legal(gc: object, bc: object):
+    """Encode ``bc`` and return ``(card_select_ids, populated_indices, legal_indices)``.
+
+    ``legal_indices`` are the ``SINGLE_CARD_SELECT`` choices ``build_mask`` marks
+    legal; ``populated_indices`` are the non-PAD ``card_select_ids`` slots. The
+    encode must be a valid observation.
+    """
+    obs = encode_observation(gc, bc)
+    assert build_observation_space().contains(obs)
+    csi = obs["card_select_ids"]
+    start = ACTION_BLOCK_BY_NAME["CARD_SELECT"].start
+    legal = set(np.flatnonzero(build_mask(bc)[start : start + CHOICE_MAX]).tolist())
+    populated = set(np.flatnonzero(csi).tolist())
+    return csi, populated, legal
+
+
+def test_combat_card_select_ids_unfiltered_pick() -> None:
+    """``EXHAUST_ONE`` picks from hand with no filter: every hand slot is a legal
+    pick, shown at its own index and nowhere else, matching ``build_mask``."""
+    gc, bc = _combat()
+    bc.open_card_select(sts.CardSelectTask.EXHAUST_ONE, 1)
+    hand = [int(bc.cards.hand[i].id) for i in range(bc.cards.cardsInHand)]
+    assert hand, "combat start should deal a non-empty hand"
+
+    csi, populated, legal = _card_select_obs_and_legal(gc, bc)
+    for i, card_id in enumerate(hand):
+        assert csi[i] == card_id  # each hand card at its own pick index
+    assert not np.any(csi[len(hand) :])  # PAD past the hand
+    assert populated == legal
+
+
+def test_combat_card_select_ids_reflect_engine_filter() -> None:
+    """``DUAL_WIELD`` offers only ATTACK/POWER cards, so a filtered subset of the
+    hand is legal. The populated slots must equal exactly the attack/power hand
+    indices and match ``build_mask`` -- guarding the binding's pile+filter mapping
+    against drift from the engine's own enumeration.
+    """
+    gc, bc = _combat()
+    bc.open_card_select(sts.CardSelectTask.DUAL_WIELD, 1)
+    attack_power = {_CARD_TYPE_ATTACK, _CARD_TYPE_POWER}
+    expected = {
+        i for i in range(bc.cards.cardsInHand) if int(bc.cards.hand[i].getType()) in attack_power
+    }
+    assert expected, "Ironclad opening hand always has at least one attack"
+
+    csi, populated, legal = _card_select_obs_and_legal(gc, bc)
+    assert populated == expected  # the engine's ATTACK/POWER filter is reflected
+    assert populated == legal  # and agrees with the mask
+    for idx in populated:
+        assert csi[idx] == int(bc.cards.hand[idx].id)
 
 
 # --- deck_ids (overworld deck) ---------------------------------------------
