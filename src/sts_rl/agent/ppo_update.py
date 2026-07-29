@@ -32,6 +32,9 @@ DEFAULT_MAX_GRAD_NORM: float = 0.5
 # moments (see RunningMoments). decay=1.0 gives retain 0, so every minibatch is
 # normalized against the whole rollout's population stats; that differs from the
 # prior per-minibatch normalization whenever there is more than one minibatch.
+# Effective smoothing depends on rollout size via the per-item exponent,
+# retain = (1 - decay) ** n, so at 5e-4 a ~2048-step rollout retains ~0.36 of
+# the prior estimate.
 DEFAULT_ADV_NORM_DECAY: float = 5e-4
 # Denominator floor for advantage normalization; avoids a blow-up when the
 # running advantage spread is near zero (all-equal or still-cold stream).
@@ -90,6 +93,12 @@ class PPOStats:
     # perfect, 0.0 is no better than predicting the mean, and it can be negative.
     explained_variance: float
     n_updates: int
+    # Running advantage-normalization scale from the shared/transient
+    # RunningMoments (its std and mean) as of this update; 0.0 when advantage
+    # normalization is off. Observability only. Defaulted and placed last so
+    # existing PPOStats(...) call sites are unaffected.
+    adv_norm_std: float = 0.0
+    adv_norm_mean: float = 0.0
 
 
 def _explained_variance(y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
@@ -147,21 +156,20 @@ def ppo_update(
     # Advantage normalization tracker. A shared instance passed by the caller
     # makes the EWMA persist across calls; a None arg falls back to a transient
     # tracker so standalone/test calls still normalize (against just this
-    # rollout). Obtained unconditionally so the minibatch loop below sees a
-    # non-None RunningMoments; it is only read when normalize_advantages is set.
-    moments = (
-        adv_moments
-        if adv_moments is not None
-        else RunningMoments(decay=config.adv_norm_decay, eps=ADV_NORM_EPS)
-    )
-    if config.normalize_advantages and len(buffer) > 0:
-        # Fold the WHOLE rollout's advantages into the running moments ONCE, before
-        # the epochs. A full-width unshuffled pass yields them in a single MiniBatch
-        # (the same buffer idiom as the explained-variance pass below), so this
-        # never depends on a buffer-specific advantages accessor - it works for
-        # both the single-env and the flattened vec buffer.
-        (adv_batch,) = buffer.iter_minibatches(len(buffer), shuffle=False)
-        moments.update(adv_batch.advantages)
+    # rollout). Built ONLY under normalize_advantages, so a normalization-disabled
+    # call never constructs (or validates) a tracker it will not read.
+    moments = adv_moments
+    if config.normalize_advantages:
+        if moments is None:
+            moments = RunningMoments(decay=config.adv_norm_decay, eps=ADV_NORM_EPS)
+        if len(buffer) > 0:
+            # Fold the WHOLE rollout's advantages into the running moments ONCE, before
+            # the epochs. A full-width unshuffled pass yields them in a single MiniBatch
+            # (the same buffer idiom as the explained-variance pass below), so this
+            # never depends on a buffer-specific advantages accessor - it works for
+            # both the single-env and the flattened vec buffer.
+            (adv_batch,) = buffer.iter_minibatches(len(buffer), shuffle=False)
+            moments.update(adv_batch.advantages)
 
     for _ in range(config.n_epochs):
         epoch_approx_kl_sum = 0.0
@@ -175,6 +183,7 @@ def ppo_update(
                 # standardized against those running stats, which are N=1-safe
                 # (population moments, no Bessel term), so no singleton is skipped;
                 # the > 0 guard only skips a (degenerate) empty minibatch.
+                assert moments is not None  # built above whenever normalize_advantages
                 advantages = moments.normalize(advantages)
 
             log_prob, entropy, value = actor_critic.evaluate_actions(mb.obs, mb.masks, mb.actions)
@@ -249,6 +258,8 @@ def ppo_update(
             grad_norm=0.0,
             explained_variance=0.0,
             n_updates=0,
+            adv_norm_std=moments.std if moments is not None else 0.0,
+            adv_norm_mean=moments.mean if moments is not None else 0.0,
         )
 
     # Explained variance is a property of the collection-time values vs the GAE
@@ -268,4 +279,6 @@ def ppo_update(
         grad_norm=grad_norm_sum / n_updates,
         explained_variance=explained_variance,
         n_updates=n_updates,
+        adv_norm_std=moments.std if moments is not None else 0.0,
+        adv_norm_mean=moments.mean if moments is not None else 0.0,
     )

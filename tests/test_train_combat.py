@@ -25,7 +25,7 @@ import gymnasium as gym
 import pytest
 
 from sts_rl.agent.actor_critic import ActorCritic
-from sts_rl.agent.train import EvalRecord, TrainHistory
+from sts_rl.agent.train import EvalRecord, TrainConfig, TrainHistory
 from sts_rl.env.reward import RewardConfig
 from sts_rl.env.reward_cli import reward_config_from_args
 from sts_rl.eval import EvalReport, make_holdout_seeds
@@ -294,6 +294,80 @@ def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> 
     # Both the training env and the eval env received the overridden shaping config.
     assert len(captured_reward_configs) == 2
     assert all(rc is not None and rc.boss_kill == 1.0 for rc in captured_reward_configs)
+
+
+def test_main_wires_adv_norm_decay_into_ppo_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() flows --adv-norm-decay into the nested PPOConfig (config.ppo.adv_norm_decay).
+
+    Engine-free: the adapter module (StsEnv + DEFAULT_MAX_EPISODE_STEPS), the encounter
+    pool, and train are stubbed, so main() runs its whole config-building path without a
+    native build. Passing a non-default value on argv and asserting it reaches config.ppo
+    threads the CLI -> PPOConfig wire for the advantage-normalization EWMA decay (parity
+    with test_train_run's same-named test).
+
+    Revert-verify: drop adv_norm_decay=args.adv_norm_decay from main()'s PPOConfig build
+    and config.ppo.adv_norm_decay falls back to the PPOConfig default, failing this.
+    """
+
+    class _StubEnv:
+        def __init__(
+            self,
+            *,
+            ascension: int,
+            max_episode_steps: int,
+            encounters: object,
+            reward_config: RewardConfig | None = None,
+        ) -> None:
+            pass
+
+        def reset(
+            self, *, seed: int | None = None, options: object = None
+        ) -> tuple[object, dict[str, object]]:
+            return None, {"engine_commit": "stub-commit", "interface_version": "stub-iface"}
+
+        def close(self) -> None:
+            pass
+
+    # Bind both deferred adapter import sites (build_arg_parser's DEFAULT_MAX_EPISODE_STEPS
+    # and main's StsEnv) to an engine-free fake module.
+    fake_adapter = types.ModuleType("sts_rl.env.adapter")
+    setattr(fake_adapter, "DEFAULT_MAX_EPISODE_STEPS", 500)
+    setattr(fake_adapter, "StsEnv", _StubEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.adapter", fake_adapter)
+    # act1_encounter_pool() builds from engine enums; stub it so the default (unset
+    # --encounters) path needs no engine.
+    monkeypatch.setattr(train_combat, "act1_encounter_pool", lambda: ())
+
+    captured: dict[str, object] = {}
+
+    def _fake_train(_env: object, config: TrainConfig, *, eval_env: object = None) -> TrainHistory:
+        captured["config"] = config
+        # A last eval snapshot over the driver's DEFAULT band (base seed + the
+        # --eval-episodes passed on argv below) keeps _final_eval_report on the reuse
+        # path, so the final eval needs neither the engine nor a stubbed evaluate.
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_combat.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_combat, "train", _fake_train)
+    # --eval-episodes 4 matches _make_report's n_episodes so the reuse guard fires.
+    monkeypatch.setattr(
+        sys, "argv", ["train_combat", "--adv-norm-decay", "0.25", "--eval-episodes", "4"]
+    )
+
+    train_combat.main()
+
+    config = cast(TrainConfig, captured["config"])
+    assert config.ppo.adv_norm_decay == 0.25
 
 
 @pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")

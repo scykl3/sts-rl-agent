@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
-from sts_rl.agent.ppo_update import PPOConfig, PPOStats, ppo_update
+from sts_rl.agent.ppo_update import DEFAULT_ADV_NORM_DECAY, PPOConfig, PPOStats, ppo_update
 from sts_rl.agent.rollout_buffer import RolloutBuffer
 from sts_rl.agent.running_moments import RunningMoments
 from sts_rl.interface import ACTION_DIM
@@ -122,6 +122,71 @@ def test_both_normalization_paths_run():
         stats = ppo_update(ac, buffer, optimizer, config)
         assert stats.n_updates == EXPECTED_UPDATES
         assert math.isfinite(stats.total_loss)
+
+
+def test_default_adv_norm_decay_is_pinned():
+    """PPOConfig().adv_norm_decay defaults to DEFAULT_ADV_NORM_DECAY.
+
+    Pins the default to the named constant so a change to the advantage-norm EWMA
+    smoothing is a deliberate, reviewed edit rather than a silent drift.
+    """
+    assert PPOConfig().adv_norm_decay == DEFAULT_ADV_NORM_DECAY
+
+
+def test_ppo_stats_report_running_adv_norm_scale():
+    """PPOStats surfaces the shared tracker's advantage-norm std/mean for observability.
+
+    After an update with normalize_advantages=True on a non-degenerate rollout,
+    PPOStats.adv_norm_std/adv_norm_mean equal the shared RunningMoments' std/mean
+    (the same tracker the update folded and normalized against), and the std is
+    strictly positive on a real (non-constant) advantage stream.
+
+    Revert-verify: drop the adv_norm_std/adv_norm_mean population at the return
+    site and both equalities fail (the fields fall back to their 0.0 defaults).
+    """
+    torch.manual_seed(0)
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    moments = RunningMoments(decay=0.1)
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    config = PPOConfig(
+        n_epochs=1, minibatch_size=MINIBATCH, normalize_advantages=True, adv_norm_decay=0.1
+    )
+
+    stats = ppo_update(ac, buffer, optimizer, config, adv_moments=moments)
+
+    assert stats.adv_norm_std == moments.std
+    assert stats.adv_norm_mean == moments.mean
+    assert stats.adv_norm_std > 0.0
+
+
+def test_normalization_disabled_with_none_tracker_does_not_raise():
+    """normalize_advantages=False with adv_moments=None must not build/validate a tracker.
+
+    The tracker is built lazily only under normalize_advantages, so a disabled call
+    never constructs a RunningMoments - even with an out-of-range adv_norm_decay=0.0
+    that RunningMoments' constructor would reject. Before the lazy build this raised
+    ValueError for a tracker the call never reads; the run must now complete and
+    report the running-scale fields as 0.0 (no tracker built).
+
+    Revert-verify: build the tracker unconditionally again and this raises
+    ValueError("decay must be in (0, 1], got 0.0").
+    """
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    config = PPOConfig(
+        n_epochs=N_EPOCHS,
+        minibatch_size=MINIBATCH,
+        normalize_advantages=False,
+        adv_norm_decay=0.0,
+    )
+
+    stats = ppo_update(ac, buffer, optimizer, config, adv_moments=None)
+    assert stats.n_updates == EXPECTED_UPDATES
+    assert math.isfinite(stats.total_loss)
+    assert stats.adv_norm_std == 0.0
+    assert stats.adv_norm_mean == 0.0
 
 
 def test_normalize_advantages_standardizes_against_full_batch():
