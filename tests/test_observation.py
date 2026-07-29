@@ -1179,11 +1179,11 @@ def test_event_phase_populated_from_live_run() -> None:
         assert build_observation_space().contains(obs)
 
 
-def test_event_phase_reflects_stale_event_data_on_nonmaintaining_event() -> None:
-    # Locks the deliberately-tolerated behavior: the engine resets event_data only for the
-    # events that maintain it, so on an event that does not, the counter can carry a leftover
-    # from a prior maintaining event. The fill mirrors that value faithfully; disambiguation
-    # is left to event_onehot, so the leftover is harmless.
+def test_event_phase_onehot_reflects_event_data_through_full_encode() -> None:
+    # Drives the full encode_observation path on a live start_run gc at a mid-range event_data
+    # value (6) and asserts the one-hot mirrors it end to end. The engine's reset-on-entry
+    # semantics (event_data is reset on entering events that do not maintain it) are engine
+    # behavior, tolerated here because the field is always paired with event_onehot.
     gc = start_run(seed=REGRESSION_SEED)
     assert gc.screen_state == sts.ScreenState.EVENT_SCREEN
     stale = 6  # a leftover phase counter from a prior maintaining event (e.g. COLOSSEUM)
