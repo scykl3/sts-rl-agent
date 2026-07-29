@@ -62,6 +62,7 @@ from sts_rl.agent.deck_economy_wrapper import DeckEconomyShapingWrapper
 from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
+from sts_rl.env.reward_cli import add_reward_shaping_args, reward_config_from_args
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 
 logger = logging.getLogger("train_run")
@@ -235,6 +236,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ppo_defaults.target_kl,
         help="approximate-KL early-stop threshold (unset disables the early stop)",
     )
+    # Reward-shaping coefficients (shared with train_combat). floor_progress and
+    # boss_kill drive overworld shaping (boss_kill fires once per act boss
+    # defeated); enemy_hp_removed and damage_taken drive combat shaping.
+    add_reward_shaping_args(parser)
     parser.add_argument("--hidden-dim", type=int, default=HIDDEN_DIM, help="encoder trunk width")
     parser.add_argument("--ascension", type=int, default=DEFAULT_ASCENSION, help="ascension level")
     parser.add_argument(
@@ -386,18 +391,29 @@ def main() -> None:
     # be unit-tested without a built engine.
     from sts_rl.env.run_adapter import StsRunEnv
 
+    # Same shaping config for both envs so training and holdout eval score the same
+    # reward; unset flags reproduce the RewardConfig() default.
+    reward_config = reward_config_from_args(args)
+
     # Two env instances: `env` is the training env (its reset stream is seeded via
     # TrainConfig.seed through the collector), and `eval_env` is a SEPARATE
     # instance for greedy holdout eval - both the in-loop periodic eval and the
     # final eval - so evaluate() resetting per seed never disturbs the training
     # collector's rollout stream.
-    # gamma is single-sourced from args.gamma (the same discount TrainConfig/GAE use) so
-    # the env's potential-based shaping telescopes against the return.
+    # reward_config carries the CLI-overridable shaping coefficients; gamma is
+    # single-sourced from args.gamma (the same discount TrainConfig/GAE use) so the
+    # env's potential-based shaping telescopes against the return.
     env = StsRunEnv(
-        ascension=args.ascension, max_episode_steps=args.max_episode_steps, gamma=args.gamma
+        ascension=args.ascension,
+        max_episode_steps=args.max_episode_steps,
+        reward_config=reward_config,
+        gamma=args.gamma,
     )
     eval_env = StsRunEnv(
-        ascension=args.ascension, max_episode_steps=args.max_episode_steps, gamma=args.gamma
+        ascension=args.ascension,
+        max_episode_steps=args.max_episode_steps,
+        reward_config=reward_config,
+        gamma=args.gamma,
     )
 
     # Optional potential-based deck/economy shaping on the TRAINING env ONLY. gamma is
