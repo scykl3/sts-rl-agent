@@ -21,11 +21,9 @@ def add_reward_shaping_args(parser: argparse.ArgumentParser) -> None:
     """Add the four reward-shaping coefficient flags to ``parser``.
 
     Each flag defaults to the corresponding ``RewardConfig()`` field, so a run
-    that sets none of them reproduces the default shaping exactly. Only the four
-    shaping coefficients are exposed; the anneal schedule (``beta_min`` /
-    ``t_anneal``) keeps its :class:`RewardConfig` default. The shaping sum is
-    still scaled by the anneal ``beta(t)``, so these set the initial (pre-anneal)
-    magnitude, not a constant bonus.
+    that sets none of them reproduces the default shaping exactly. These are the
+    four potential weights of the potential-based shaping (see
+    :mod:`sts_rl.env.reward`); :class:`RewardConfig` carries no other fields.
 
     ``floor_progress`` and ``boss_kill`` are overworld signals: they fire only in
     full-run training and stay ``0.0`` within a single combat, so on the combat
@@ -61,10 +59,9 @@ def add_reward_shaping_args(parser: argparse.ArgumentParser) -> None:
 def reward_config_from_args(args: argparse.Namespace) -> RewardConfig:
     """Build the env's :class:`RewardConfig` from the reward-shaping CLI flags.
 
-    Only the four shaping coefficients are overridable; the anneal schedule
-    (``beta_min`` / ``t_anneal``) keeps its :class:`RewardConfig` default. Each
-    flag defaults to the corresponding ``RewardConfig()`` value, so an
-    unspecified run reproduces the default shaping exactly.
+    The four potential weights are the only :class:`RewardConfig` fields, and each
+    flag defaults to the corresponding ``RewardConfig()`` value, so an unspecified
+    run reproduces the default shaping exactly.
     """
     return RewardConfig(
         enemy_hp_removed=args.enemy_hp_removed_coef,

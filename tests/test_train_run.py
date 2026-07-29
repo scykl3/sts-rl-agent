@@ -84,8 +84,8 @@ class _StubRunEnv:
     serves the provenance ``info`` keys ``main()`` reads off the initial reset, so
     ``main()`` runs the whole warm-start wiring without a native engine build.
 
-    ``reward_config`` mirrors the real ``StsRunEnv`` signature (``main()`` now passes
-    it); it is stored but otherwise unused by the stub.
+    ``reward_config`` and ``gamma`` mirror the real ``StsRunEnv`` signature
+    (``main()`` now passes both); they are stored but otherwise unused by the stub.
     """
 
     def __init__(
@@ -94,10 +94,12 @@ class _StubRunEnv:
         ascension: int,
         max_episode_steps: int,
         reward_config: RewardConfig | None = None,
+        gamma: float = 1.0,
     ) -> None:
         self.ascension = ascension
         self.max_episode_steps = max_episode_steps
         self.reward_config = reward_config
+        self.gamma = gamma
 
     def reset(
         self, *, seed: int | None = None, options: object = None
@@ -607,11 +609,13 @@ def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> 
             ascension: int,
             max_episode_steps: int,
             reward_config: RewardConfig | None = None,
+            gamma: float = 1.0,
         ) -> None:
             super().__init__(
                 ascension=ascension,
                 max_episode_steps=max_episode_steps,
                 reward_config=reward_config,
+                gamma=gamma,
             )
             captured_reward_configs.append(reward_config)
 

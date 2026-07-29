@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.10.0.
+INTERFACE_VERSION 0.11.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.10.0"
+INTERFACE_VERSION: str = "0.11.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -117,6 +117,11 @@ PLAYER_SCALAR_DIM = 8  # hp_cur, hp_max, block, energy, gold, floor, ascension, 
 HAND_FEAT_DIM = 6  # upgraded, cost, is_attack, is_skill, is_power, ethereal
 ENEMY_SCALAR_DIM = 5  # hp_cur, hp_max, block, intent_val, intent_hits
 MAP_CONTEXT_DIM = 40  # current + available next node types/positions (run mode)
+# DAG lookahead aggregates toward the act boss (run mode): a global summary plus a
+# per-MAP_SELECT-column "forward cone". A SEPARATE field (not folded into
+# map_context) so the encoder can append it last, keeping warm-start a clean
+# zero-init suffix widen. Its internal layout is guarded in sts_rl.env.observation.
+MAP_LOOKAHEAD_DIM = 17
 KEYS_ACT_DIM = 4  # act + owned keys: ruby (red), emerald (green), sapphire (blue)
 # Multi-stage event phase, a one-hot over the engine's event_data scratch counter. It is a
 # meaningful event stage only for events that maintain the counter (COLOSSEUM, CURSED_TOME,
@@ -367,15 +372,19 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     # "not on an event screen". An env-written unit block (no embedding table), appended
     # last so the prior layout stays a clean prefix for warm-start migration.
     ObsField("event_phase_onehot", np.float32, (EVENT_PHASE_DIM,), "unit"),
+    # Map lookahead aggregates toward the act boss (a global summary + per-column
+    # forward cone). An env-written real block, appended last so the prior layout
+    # stays a clean prefix for warm-start migration.
+    ObsField("map_lookahead", np.float32, (MAP_LOOKAHEAD_DIM,), "real"),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}
 
 # --- Reward / info surface -------------------------------------------------
-# Reward is: reward = terminal + beta(t) * sum(shaping_terms).
-# The terminal component is never annealed; only the shaping sum is scaled by
-# the schedule beta(t). The tunable coefficients are part of the training
-# configuration, not these shared definitions.
+# Reward is: reward = terminal + sum(shaping_terms), where the shaping terms are
+# the per-term potential-based contributions gamma * Phi_term(s') - Phi_term(s)
+# (see sts_rl.env.reward). The terminal component is the sparse win/loss signal;
+# the potential weights and gamma are training configuration, not shared here.
 TERMINAL_WIN_REWARD: float = 1.0
 TERMINAL_LOSS_REWARD: float = -1.0
 SHAPING_TERMS: tuple[str, ...] = (

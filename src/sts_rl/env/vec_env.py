@@ -225,9 +225,10 @@ class SubprocVecEnv:
     def set_global_step(self, t: int) -> None:
         """Broadcast the shared global env-step count to every worker.
 
-        Keeps the shaping anneal ``beta(t)`` on its intended horizon under
-        parallel workers, where each worker's own step count understates total
-        interactions (see :meth:`StsEnv.set_global_step`).
+        Potential-based shaping is un-annealed, so this no longer affects reward;
+        it is retained so a shared step counter (used for diagnostics or by shaping
+        wrappers) stays consistent across parallel workers, where each worker's own
+        step count understates total interactions (see :meth:`StsEnv.set_global_step`).
         """
         self._assert_open()
         self._command_all(_CMD_SET_GLOBAL_STEP, [t] * self.num_envs)

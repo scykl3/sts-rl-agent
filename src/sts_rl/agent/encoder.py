@@ -40,8 +40,8 @@ Context tokens - never PAD, so every attention row has at least one valid key
                      relics_multihot / screen_onehot / keys_act / shop_remove_cost
     PILE (x4)     4  draw / discard / exhaust / deck, each mean+max pooled over
                      card_embed (order-agnostic, so pooled, not per-slot)
-    OFFER_CONTEXT 1  MLP over map_context / event_onehot / event_phase_onehot /
-                     neow_bonus / neow_drawback
+    OFFER_CONTEXT 1  MLP over map_context / map_lookahead / event_onehot /
+                     event_phase_onehot / neow_bonus / neow_drawback
 
 No sinusoidal positional encoding: attention is permutation-equivariant (correct
 for the pooled order-agnostic sets) and slotted types are disambiguated by the
@@ -74,6 +74,7 @@ from sts_rl.interface import (
     HAND_MAX,
     KEYS_ACT_DIM,
     MAP_CONTEXT_DIM,
+    MAP_LOOKAHEAD_DIM,
     MAX_BOSS_RELICS,
     MAX_ENEMIES,
     MAX_NEOW_OPTIONS,
@@ -231,6 +232,7 @@ _OFFER_INPUT_DIM = (
     + MAX_NEOW_OPTIONS * N_NEOW_BONUS
     + MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK
     + EVENT_PHASE_DIM
+    + MAP_LOOKAHEAD_DIM
 )
 
 
@@ -545,6 +547,7 @@ class ObsFeatureEncoder(nn.Module):
                 obs["neow_bonus"],
                 obs["neow_drawback"],
                 obs["event_phase_onehot"],
+                obs["map_lookahead"],
             ],
             dim=1,
         )

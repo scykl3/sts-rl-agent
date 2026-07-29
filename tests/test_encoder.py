@@ -475,6 +475,7 @@ def test_token_widths_derive_from_interface_constants():
         + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS
         + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK
         + interface.EVENT_PHASE_DIM
+        + interface.MAP_LOOKAHEAD_DIM
     )
     assert _CLS_INPUT_DIM == expected_cls
     assert _OFFER_INPUT_DIM == expected_offer
