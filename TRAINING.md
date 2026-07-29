@@ -60,6 +60,7 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_combat.py \
 | `--minibatch-size` | `64` | PPO minibatch size |
 | `--max-grad-norm` | `0.5` | Global grad-norm clip |
 | `--target-kl` | None | Approximate-KL early-stop threshold (unset disables the early stop) |
+| `--adv-norm-decay` | `0.0005` | Per-item EWMA decay for advantage normalization: a persistent running mean/std across iterations (more stable than per-batch, especially single-env). Set `1.0` to revert to per-batch normalization |
 
 #### Reward shaping
 
@@ -119,8 +120,8 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_run.py \
 |------|---------|-------------|
 | `--learning-rate` | `0.0003` | Adam step size |
 | `--anneal-lr` | `False` | Linearly decay the learning rate across the run |
-| `--gamma` | `0.99` | GAE discount factor |
-| `--gae-lambda` | `0.95` | GAE trace-decay lambda |
+| `--gamma` | `1.0` | GAE discount factor; the full-run default is undiscounted so the terminal win/loss signal reaches early-run decisions (combat training keeps `0.99`) |
+| `--gae-lambda` | `0.97` | GAE trace-decay lambda |
 | `--clip-coef` | `0.2` | PPO surrogate/value clip coefficient |
 | `--vf-coef` | `0.5` | Value-loss weight in the PPO objective |
 | `--ent-coef` | `0.01` | Entropy-bonus weight in the PPO objective |
@@ -128,6 +129,7 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_run.py \
 | `--minibatch-size` | `64` | PPO minibatch size |
 | `--max-grad-norm` | `0.5` | Global grad-norm clip |
 | `--target-kl` | None | Approximate-KL early-stop threshold (unset disables the early stop) |
+| `--adv-norm-decay` | `0.0005` | Per-item EWMA decay for advantage normalization: a persistent running mean/std across iterations (more stable than per-batch, especially single-env). Set `1.0` to revert to per-batch normalization |
 
 #### Reward shaping
 
@@ -166,6 +168,41 @@ When `--checkpoint-dir` is set, the script writes two files:
 - `last.pt` - the most recent checkpoint, written every iteration.
 
 Without `--eval-every` there is no periodic eval and no `best.pt` ranking.
+
+## Supervised pretraining (optional warm-start)
+
+Before PPO, an optional supervised stage can bootstrap the network so the full run starts from a sensible prior rather than uniform-random exploration. Its output is a checkpoint that `train_run.py --warm-start` loads directly (same 3-key format). The stage has two parts, both starting from a warm-start policy (typically a combat-trained checkpoint from `train_combat.py`):
+
+1. Behavior cloning of the card-reward pick, in two steps:
+
+```bash
+# Collect a dataset: select non-card decisions with a warm-start policy, record the
+# heuristic teacher's action at every card-reward step.
+PYTHONPATH=src:engine/sts_lightspeed/build python scripts/collect_bc.py \
+    --warm-start runs/combat/checkpoints/best.pt --output bc_data.npz \
+    --n-episodes 200 --seed 42
+
+# Train the card-pick sub-slice on that dataset; writes a warm-start-compatible checkpoint.
+PYTHONPATH=src python scripts/train_bc.py \
+    --dataset bc_data.npz --warm-start runs/combat/checkpoints/best.pt \
+    --output bc_best.pt --epochs 30 --lr 1e-4 --seed 42
+```
+
+2. Outcome-regression pretraining: self-play full runs with the behavior-cloned policy, label each decision by its episode's Act 1 clear outcome, and fine-tune the value head with a win-probability `BCEWithLogits` loss (the policy head is frozen). The result feeds `train_run.py --warm-start`.
+
+```bash
+PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_sl.py \
+    --warm-start bc_best.pt --out sl_best.pt \
+    --num-episodes 500 --epochs 30 --seed 42 --ascension 0
+# Reuse a previously collected self-play dataset instead of self-playing again:
+#   python scripts/train_sl.py --dataset sp_data.npz --out sl_best.pt --epochs 30
+```
+
+Then run `scripts/train_run.py --warm-start sl_best.pt` as usual; the discount, potential-based reward, map-lookahead observation, EWMA advantage normalization, and the transformer encoder with pointer policy head are all on by default, so no extra flags are needed to enable them.
+
+## Paired evaluation (A/B comparison)
+
+To compare two checkpoints (for example a candidate against a baseline), `sts_rl.eval.paired_evaluate(policy_a, policy_b, env, seeds)` runs both policies over one shared holdout seed set and returns a `PairedEvalReport` with per-seed paired win-rate, Act 1 clear-rate, and return deltas, their paired standard errors, and an exact McNemar p-value on the discordant win/loss seeds. Because both policies see the same seeds, the difference has far lower variance than differencing two independent `evaluate()` runs, so a small real gap shows through the ~0.03-0.04 per-run win-rate noise. It is a library call (used, for instance, by `train_sl.py`'s outcome gate), not a training flag.
 
 ## Reproducibility
 
