@@ -41,6 +41,7 @@ from sts_rl.interface import (
     DECK_MAX,
     HAND_MAX,
     MAP_CONTEXT_DIM,
+    MAP_LOOKAHEAD_DIM,
     MAX_BOSS_RELICS,
     MAX_ENEMIES,
     MAX_NEOW_OPTIONS,
@@ -188,12 +189,35 @@ if _MAP_CUR_BLOCK + _MAP_NEXT_BLOCK != MAP_CONTEXT_DIM:
         f"MAP_CONTEXT_DIM ({MAP_CONTEXT_DIM})"
     )
 
+# The `map_lookahead` field: DAG aggregates toward the act boss, a SEPARATE obs
+# field (not folded into map_context) so the encoder appends it last, keeping the
+# warm-start migration a clean zero-init suffix. A global block summarizes what lies
+# ahead of the current node; a per-column block extends each MAP_SELECT column with
+# the "forward cone" reached through that choice.
+_MAP_AGG_GLOBAL = 3  # min elites-to-boss, max elites-to-boss, rows to nearest rest
+_MAP_AGG_PER_COL = 2  # per column: min elites-to-boss, rows to nearest rest beyond it
+_MAP_LOOKAHEAD_BLOCK = _MAP_AGG_GLOBAL + MAP_COLS * _MAP_AGG_PER_COL
+if _MAP_LOOKAHEAD_BLOCK != MAP_LOOKAHEAD_DIM:
+    raise AssertionError(
+        f"map_lookahead layout ({_MAP_LOOKAHEAD_BLOCK}) must equal "
+        f"MAP_LOOKAHEAD_DIM ({MAP_LOOKAHEAD_DIM})"
+    )
+
 # Room ids that gate the per-column combat/elite flags (a live enum, not magic ints).
 _ROOM_MONSTER = int(sts.Room.MONSTER)
 _ROOM_ELITE = int(sts.Room.ELITE)
 _ROOM_BOSS = int(sts.Room.BOSS)
+_ROOM_REST = int(sts.Room.REST)
 # A combat node from the map's perspective: normal fight, elite, or act boss.
 _COMBAT_ROOMS = (_ROOM_MONSTER, _ROOM_ELITE, _ROOM_BOSS)
+
+# Lookahead scaling (raw-but-scaled to [0, 1], like the progress features). Elites
+# on any single-act path are few, so cap generously without clipping real maps.
+# "No rest reachable ahead" saturates the distance to 1.0 (MAP_ROWS rows); any real
+# reachable rest is at most MAP_ROWS-1 rows away, so it stays strictly below the
+# no-rest sentinel and never collides with it.
+MAP_LOOKAHEAD_ELITE_CAP = 6.0
+_MAP_NO_REST_DIST = float(MAP_ROWS)
 
 
 def _empty_obs() -> Obs:
@@ -429,15 +453,59 @@ def _fill_run_scalars(obs: Obs, gc: Any) -> None:
     )
 
 
-def _fill_map_context(obs: Obs, gc: Any) -> None:
-    """Fill ``map_context`` from the run's map: current node + reachable next nodes.
+def _map_dp(
+    spire_map: Any,
+) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
+    """Per-node DAG DP over the act map, for the lookahead aggregates.
 
-    Layout (sums to ``MAP_CONTEXT_DIM``): a current block -- room-type one-hot,
-    normalized ``(x, y)`` position, normalized ``(act, floor)`` -- followed by one
+    For every existing grid node returns three ``MAP_ROWS x MAP_COLS`` grids:
+    ``emin`` / ``emax`` -- the fewest / most elite rooms on a path from that node to
+    the act boss (counting the node itself) -- and ``drest`` -- rows to the nearest
+    reachable rest (``0`` at a rest node, ``_MAP_NO_REST_DIST`` if none is
+    reachable). The act boss sits above the top row and adds no elites and no rest,
+    so top-row nodes terminate there. Non-existent cells keep the defaults and are
+    never read, since ``edges`` only points at real nodes. Bottom-up because a
+    node's value depends only on its next-row children.
+    """
+    emin = [[0.0] * MAP_COLS for _ in range(MAP_ROWS)]
+    emax = [[0.0] * MAP_COLS for _ in range(MAP_ROWS)]
+    drest = [[_MAP_NO_REST_DIST] * MAP_COLS for _ in range(MAP_ROWS)]
+    for y in range(MAP_ROWS - 1, -1, -1):
+        for x in range(MAP_COLS):
+            room = int(spire_map.get_room_type(x, y))
+            if not (0 <= room < N_NODE_TYPES):
+                continue
+            self_elite = 1.0 if room == _ROOM_ELITE else 0.0
+            # Top-row nodes' only successor is the act boss (terminal): no children.
+            children = [] if y == MAP_ROWS - 1 else [int(c) for c in spire_map.edges(x, y)]
+            if children:
+                emin[y][x] = self_elite + min(emin[y + 1][c] for c in children)
+                emax[y][x] = self_elite + max(emax[y + 1][c] for c in children)
+                child_rest = min(drest[y + 1][c] for c in children)
+            else:
+                emin[y][x] = self_elite
+                emax[y][x] = self_elite
+                child_rest = _MAP_NO_REST_DIST
+            drest[y][x] = 0.0 if room == _ROOM_REST else min(_MAP_NO_REST_DIST, 1.0 + child_rest)
+    return emin, emax, drest
+
+
+def _fill_map_context(obs: Obs, gc: Any) -> None:
+    """Fill ``map_context`` and ``map_lookahead`` from the run's map.
+
+    ``map_context`` (``MAP_CONTEXT_DIM``): a current block -- room-type one-hot,
+    normalized ``(x, y)`` position, normalized ``(act, floor)`` -- then one
     per-column block for each of the ``MAP_COLS`` map columns, aligned to the
-    ``MAP_SELECT`` action index. Each per-column block is
-    ``(reachable, is_combat, is_elite, room_type_norm)`` for the node reachable at
-    that column in the next row; unreachable columns stay zero.
+    ``MAP_SELECT`` action index (``(reachable, is_combat, is_elite, room_type_norm)``
+    for the node reachable at that column in the next row; unreachable columns stay
+    zero).
+
+    ``map_lookahead`` (``MAP_LOOKAHEAD_DIM``): DAG aggregates toward the act boss --
+    a global ``(min elites-to-boss, max elites-to-boss, rows-to-nearest-rest)`` over
+    the reachable next nodes, then the same ``(min elites-to-boss,
+    rows-to-nearest-rest)`` per MAP_SELECT column (the "forward cone" beyond that
+    choice). Elite counts are scaled by ``MAP_LOOKAHEAD_ELITE_CAP`` and rest
+    distances by ``MAP_ROWS``.
 
     Before the first row the engine reports ``cur == (-1, -1)``; the normalized
     position is then negative (a distinct pre-map signal) and the reachable set is
@@ -493,6 +561,38 @@ def _fill_map_context(obs: Obs, gc: Any) -> None:
         ctx[slot + 2] = 1.0 if room_id == _ROOM_ELITE else 0.0
         if 0 <= room_id < N_NODE_TYPES:
             ctx[slot + 3] = room_id / (N_NODE_TYPES - 1)
+
+    # --- Lookahead aggregates over the reachable DAG toward the act boss --------
+    # Written to the SEPARATE `map_lookahead` field: a global (min/max elites-to-boss,
+    # rows-to-nearest-rest) over the reachable next nodes, then a per-column forward
+    # cone (min elites-to-boss, rows-to-nearest-rest through that column). On the boss
+    # boundary the next node is the act boss (no elites, no rest). With no reachable
+    # next node (parked on the boss node) the field stays zero.
+    look = obs["map_lookahead"]
+    if reachable:  # parked on the boss node has no next node; leave the field zero
+        emin, emax, drest = _map_dp(spire_map)
+        per_col_base = _MAP_AGG_GLOBAL
+        global_emin = global_drest = float("inf")
+        global_emax = 0.0
+        for col in reachable:
+            if on_boss_boundary:
+                c_emin = c_emax = 0.0
+                c_drest = _MAP_NO_REST_DIST
+            else:
+                c_emin, c_emax, c_drest = (
+                    emin[next_row][col],
+                    emax[next_row][col],
+                    drest[next_row][col],
+                )
+            global_emin = min(global_emin, c_emin)
+            global_emax = max(global_emax, c_emax)
+            global_drest = min(global_drest, c_drest)
+            slot = per_col_base + col * _MAP_AGG_PER_COL
+            look[slot] = min(c_emin, MAP_LOOKAHEAD_ELITE_CAP) / MAP_LOOKAHEAD_ELITE_CAP
+            look[slot + 1] = c_drest / _MAP_NO_REST_DIST
+        look[0] = min(global_emin, MAP_LOOKAHEAD_ELITE_CAP) / MAP_LOOKAHEAD_ELITE_CAP
+        look[1] = min(global_emax, MAP_LOOKAHEAD_ELITE_CAP) / MAP_LOOKAHEAD_ELITE_CAP
+        look[2] = min(global_drest, _MAP_NO_REST_DIST) / _MAP_NO_REST_DIST
 
 
 def _fill_reward_ids(obs: Obs, gc: Any) -> None:

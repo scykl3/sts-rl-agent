@@ -42,6 +42,7 @@ from sts_rl.interface import (
     ACTION_DIM,
     INTERFACE_VERSION,
     KEYS_ACT_DIM,
+    MAP_LOOKAHEAD_DIM,
     MAX_NEOW_OPTIONS,
     MAX_SHOP_CARDS,
     MAX_SHOP_POTIONS,
@@ -656,6 +657,10 @@ SHIPPED_0_7_0_FEATURE_DIM = 4949
 # prior that must widen to the Neow-event layout. Fixed history.
 SHIPPED_0_8_0_FEATURE_DIM = 5571
 
+# The shipped 0.9.0 feature width (0.8.0 + Neow-event one-hot blocks), now a recorded
+# prior that must widen to the map-lookahead layout. Fixed history.
+SHIPPED_0_9_0_FEATURE_DIM = 5736
+
 
 def _shop_boss_block_width() -> int:
     """Total width appended for the shop + boss-relic screen blocks (the 0.8.0 append).
@@ -773,10 +778,41 @@ def test_shipped_5571_prior_widens_to_neow_event_layout() -> None:
     """
     assert SHIPPED_0_8_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
     target = _current_feature_dim()
-    # New width = 5571 + the appended Neow-event one-hot blocks, symbolic.
-    assert target == SHIPPED_0_8_0_FEATURE_DIM + _neow_event_block_width()
+    # New width = 5571 + the Neow-event one-hot blocks + the map-lookahead block,
+    # symbolic (5571 predates both appends, so it widens across both).
+    assert target == SHIPPED_0_8_0_FEATURE_DIM + _neow_event_block_width() + MAP_LOOKAHEAD_DIM
 
     old_feat = SHIPPED_0_8_0_FEATURE_DIM
+    assert old_feat < target
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+
+    migrated = migrate_encoder_trunk_input_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :old_feat], old_weight)  # prefix preserved
+    assert torch.count_nonzero(new_weight[:, old_feat:]) == 0  # appended suffix zero
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
+def test_shipped_5736_prior_widens_to_map_lookahead_layout() -> None:
+    """The 0.9.0 width (5736) is a recorded prior and widens cleanly to the current dim.
+
+    A warm-start checkpoint trained at the shipped 5736-wide encoder (through the
+    Neow-event blocks, before the map-lookahead block) must widen to the current
+    layout: its trained columns preserved as the leading prefix, the appended
+    map-lookahead columns zero-initialized. The target width is checked symbolically
+    against the interface / encoder constants, never a hardcoded literal.
+    """
+    assert SHIPPED_0_9_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
+    target = _current_feature_dim()
+    # New width = 5736 + the appended map-lookahead block, symbolic.
+    assert target == SHIPPED_0_9_0_FEATURE_DIM + MAP_LOOKAHEAD_DIM
+
+    old_feat = SHIPPED_0_9_0_FEATURE_DIM
     assert old_feat < target
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)

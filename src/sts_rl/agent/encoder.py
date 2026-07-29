@@ -49,6 +49,8 @@ to the hand/enemy slot order, so do NOT reorder):
                  (Neow-event one-hots: the current event id, then per-option NeowBonus
                  and NeowDrawback one-hots; raw passthrough unit blocks like
                  screen_onehot, appended last)
+    map lookahead MAP_LOOKAHEAD_DIM   (DAG aggregates toward the act boss: a global
+                 summary + per-column forward cone; raw passthrough block, appended last)
 """
 
 from __future__ import annotations
@@ -63,6 +65,7 @@ from sts_rl.interface import (
     HAND_MAX,
     KEYS_ACT_DIM,
     MAP_CONTEXT_DIM,
+    MAP_LOOKAHEAD_DIM,
     MAX_ENEMIES,
     MAX_NEOW_OPTIONS,
     MAX_REWARD_CARD_SLOTS,
@@ -190,6 +193,9 @@ class ObsFeatureEncoder(nn.Module):
         event_onehot = N_EVENT_IDS
         neow_bonus = MAX_NEOW_OPTIONS * N_NEOW_BONUS
         neow_drawback = MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK
+        # Map lookahead aggregates, appended LAST (after the Neow-event blocks) as a raw
+        # passthrough block, so the prior layout stays a clean prefix for warm-start.
+        map_lookahead = MAP_LOOKAHEAD_DIM
         return (
             hand
             + enemy
@@ -213,6 +219,7 @@ class ObsFeatureEncoder(nn.Module):
             + event_onehot
             + neow_bonus
             + neow_drawback
+            + map_lookahead
         )
 
     def _pool_pile(self, pile_ids: Tensor) -> Tensor:
@@ -387,15 +394,20 @@ class ObsFeatureEncoder(nn.Module):
         neow_bonus = obs["neow_bonus"]
         neow_drawback = obs["neow_drawback"]
 
-        # CAUTION: the reward, card-select, deck, keys/act, shop / boss-relic, and
-        # Neow-event blocks are appended LAST, in this fixed order (reward cards, relics,
-        # potions, then card_select, the pooled deck, keys/act, then shop cards + prices,
-        # shop relics + prices, shop potions + prices, shop remove cost, the boss-relic
-        # multihot, and finally the Neow-event one-hots: event, bonus, drawback), so an
-        # old checkpoint's trained input columns stay the leading prefix and
-        # migrate_encoder_trunk_input_width widens the trunk by a clean zero-init suffix.
-        # Do NOT insert a block ahead of these or reorder them, or the migration would
-        # silently mismap columns.
+        # MAP LOOKAHEAD: a raw passthrough block (already coerced to float32 above) of
+        # DAG aggregates toward the act boss (the env fills it; the encoder only
+        # concatenates it). Appended LAST, after the Neow-event blocks.
+        map_lookahead = obs["map_lookahead"]
+
+        # CAUTION: the reward, card-select, deck, keys/act, shop / boss-relic, Neow-event,
+        # and map-lookahead blocks are appended LAST, in this fixed order (reward cards,
+        # relics, potions, then card_select, the pooled deck, keys/act, then shop cards +
+        # prices, shop relics + prices, shop potions + prices, shop remove cost, the
+        # boss-relic multihot, the Neow-event one-hots: event, bonus, drawback, and
+        # finally the map-lookahead block), so an old checkpoint's trained input columns
+        # stay the leading prefix and migrate_encoder_trunk_input_width widens the trunk
+        # by a clean zero-init suffix. Do NOT insert a block ahead of these or reorder
+        # them, or the migration would silently mismap columns.
         return torch.cat(
             [
                 hand,
@@ -420,6 +432,7 @@ class ObsFeatureEncoder(nn.Module):
                 event_onehot,
                 neow_bonus,
                 neow_drawback,
+                map_lookahead,
             ],
             dim=1,
         )

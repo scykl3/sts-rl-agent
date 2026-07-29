@@ -21,13 +21,17 @@ from sts_rl.env.adapter import StsEnv
 from sts_rl.env.engine import start_combat
 from sts_rl.env.observation import (
     MAP_COLS,
+    MAP_LOOKAHEAD_ELITE_CAP,
     MAP_ROWS,
     SHOP_PRICE_SCALE,
     _CARD_TYPE_ATTACK,
     _CARD_TYPE_POWER,
+    _MAP_AGG_GLOBAL,
+    _MAP_AGG_PER_COL,
     _MAP_CUR_BLOCK,
     _MAP_CUR_POS,
     _MAP_CUR_ROOM_ONEHOT,
+    _MAP_NO_REST_DIST,
     _MAP_PER_COL_FEATS,
     _empty_obs,
     _fill_boss_relic_ids,
@@ -38,6 +42,7 @@ from sts_rl.env.observation import (
     _fill_neow_event,
     _fill_reward_ids,
     _fill_shop,
+    _map_dp,
     encode_observation,
 )
 from sts_rl.env.run import execute_overworld_action, overworld_actions, start_run
@@ -176,8 +181,9 @@ def test_padding_slots_beyond_live_enemies_are_zero() -> None:
     # No potions at run start: every belt slot is PAD and unusable.
     assert np.all(obs["potion_ids"] == 0)
     assert np.all(obs["potion_usable"] == 0.0)
-    # map_context is a run-mode feature, unset during combat.
+    # map_context / map_lookahead are run-mode features, unset during combat.
     assert np.all(obs["map_context"] == 0.0)
+    assert np.all(obs["map_lookahead"] == 0.0)
 
 
 def test_player_powers_indexed_by_status_id() -> None:
@@ -401,6 +407,17 @@ def test_map_context_encodes_act_boss_above_top_row() -> None:
         assert mc[slot + 2] == 0.0  # is_elite: the boss is not an elite
         assert mc[slot + 3] == boss_norm  # room type is BOSS, not SHOP (id 0)
 
+    # map_lookahead on the boss boundary: the next node is the act boss (0 elites, no
+    # rest), so the global summary and every boss-col forward cone reflect that.
+    look = obs["map_lookahead"]
+    assert look[0] == 0.0  # global min elites-to-boss
+    assert look[1] == 0.0  # global max elites-to-boss
+    assert look[2] == pytest.approx(1.0)  # no rest reachable -> distance saturates
+    for col in boss_cols:
+        slot = _MAP_AGG_GLOBAL + col * _MAP_AGG_PER_COL
+        assert look[slot] == 0.0  # 0 elites through the boss
+        assert look[slot + 1] == pytest.approx(1.0)  # no rest through the boss
+
 
 def test_map_context_on_boss_node_does_not_index_off_grid() -> None:
     # While the boss reward / relic screens are up, the engine parks the run ON the
@@ -427,6 +444,132 @@ def test_map_context_on_boss_node_does_not_index_off_grid() -> None:
     assert np.isfinite(mc).all()
     assert _encoded_reachable_cols(mc) == set()  # no next-row node from the boss
     assert mc[int(sts.Room.BOSS)] == 1.0  # current-room one-hot marks the boss
+
+
+# --- map lookahead aggregates ----------------------------------------------
+
+
+class _FakeMap:
+    """Hand-built act map for lookahead-DP tests: ``get_room_type`` + ``edges`` only.
+
+    ``rooms`` maps ``(x, y)`` to a Room id for populated nodes (absent cells read as
+    INVALID, i.e. not a real node); ``adj`` maps ``(x, y)`` to the next-row columns
+    reachable from it.
+    """
+
+    def __init__(
+        self, rooms: dict[tuple[int, int], int], adj: dict[tuple[int, int], list[int]]
+    ) -> None:
+        self._rooms = rooms
+        self._adj = adj
+
+    def get_room_type(self, x: int, y: int) -> int:
+        return self._rooms.get((x, y), int(sts.Room.INVALID))
+
+    def edges(self, x: int, y: int) -> list[int]:
+        return list(self._adj.get((x, y), []))
+
+
+def _diamond_map() -> _FakeMap:
+    """A small map: a monster forking to a rest (left) and an elite (right).
+
+    (3, TOP-2) MONSTER --> (2, TOP-1) REST  --> (3, TOP) MONSTER --> boss
+                      \\--> (4, TOP-1) ELITE --> (3, TOP) MONSTER --> boss
+    """
+    top = MAP_ROWS - 1
+    rooms = {
+        (3, top): int(sts.Room.MONSTER),
+        (2, top - 1): int(sts.Room.REST),
+        (4, top - 1): int(sts.Room.ELITE),
+        (3, top - 2): int(sts.Room.MONSTER),
+    }
+    adj = {
+        (3, top - 2): [2, 4],
+        (2, top - 1): [3],
+        (4, top - 1): [3],
+    }
+    return _FakeMap(rooms, adj)
+
+
+def test_map_dp_computes_elites_and_rest_distance() -> None:
+    top = MAP_ROWS - 1
+    emin, emax, drest = _map_dp(_diamond_map())
+
+    # Top monster -> boss: no elite, no rest ahead.
+    assert emin[top][3] == 0.0 and emax[top][3] == 0.0
+    assert drest[top][3] == _MAP_NO_REST_DIST
+    # The rest node itself is distance 0; the elite node counts one elite.
+    assert drest[top - 1][2] == 0.0 and emin[top - 1][2] == 0.0
+    assert emin[top - 1][4] == 1.0 and emax[top - 1][4] == 1.0
+    assert drest[top - 1][4] == _MAP_NO_REST_DIST
+    # The fork: best path has 0 elites (via the rest), worst has 1 (via the elite);
+    # the nearest rest is one row ahead.
+    assert emin[top - 2][3] == 0.0
+    assert emax[top - 2][3] == 1.0
+    assert drest[top - 2][3] == 1.0
+
+
+def test_map_context_lookahead_forward_cone_and_global() -> None:
+    top = MAP_ROWS - 1
+    fake_gc = SimpleNamespace(
+        map=_diamond_map(),
+        cur_map_node_x=3,
+        cur_map_node_y=top - 2,
+        cur_room=int(sts.Room.MONSTER),
+        act=1,
+        floor_num=top - 2,
+    )
+    obs = _empty_obs()
+    _fill_map_context(obs, fake_gc)
+    look = obs["map_lookahead"]
+
+    per_col = _MAP_AGG_GLOBAL
+    # Global: best-case 0 elites, worst-case 1 elite (scaled), nearest rest 1 row (via col 2 -> 0).
+    assert look[0] == pytest.approx(0.0)
+    assert look[1] == pytest.approx(1.0 / MAP_LOOKAHEAD_ELITE_CAP)
+    assert look[2] == pytest.approx(0.0)
+    # Column 2 leads to the rest (0 elites, rest at distance 0).
+    s2 = per_col + 2 * _MAP_AGG_PER_COL
+    assert look[s2] == pytest.approx(0.0)
+    assert look[s2 + 1] == pytest.approx(0.0)
+    # Column 4 leads to the elite (1 elite, no rest reachable -> saturates to 1.0).
+    s4 = per_col + 4 * _MAP_AGG_PER_COL
+    assert look[s4] == pytest.approx(1.0 / MAP_LOOKAHEAD_ELITE_CAP)
+    assert look[s4 + 1] == pytest.approx(1.0)
+    # An unreachable column carries no forward cone.
+    s0 = per_col + 0 * _MAP_AGG_PER_COL
+    assert look[s0] == 0.0 and look[s0 + 1] == 0.0
+
+
+def test_map_context_lookahead_is_finite_and_normalized_on_real_map() -> None:
+    # On a real generated map the whole lookahead block must stay finite and scaled
+    # to [0, 1]; at the run's first decision there is a reachable next row, so the
+    # global summary is populated (not all zero).
+    gc = start_run(seed=REGRESSION_SEED)
+    obs = _empty_obs()
+    _fill_map_context(obs, gc)
+    block = obs["map_lookahead"]
+
+    assert np.isfinite(block).all()
+    assert (block >= 0.0).all() and (block <= 1.0).all()
+    assert block.any()  # non-vacuous: some lookahead feature fired
+
+
+def test_map_context_lookahead_zero_when_parked_on_boss() -> None:
+    # Parked on the boss node (cur_y past the top grid row) there is no next-row
+    # node, so the lookahead block stays entirely zero (mirrors the empty reachable set).
+    spire_map = start_run(seed=REGRESSION_SEED).map
+    fake_gc = SimpleNamespace(
+        map=spire_map,
+        cur_map_node_x=0,
+        cur_map_node_y=MAP_ROWS,
+        cur_room=int(sts.Room.BOSS),
+        act=1,
+        floor_num=MAP_ROWS,
+    )
+    obs = _empty_obs()
+    _fill_map_context(obs, fake_gc)
+    assert np.allclose(obs["map_lookahead"], 0.0)
 
 
 # --- reward_* fields (REWARDS screen) --------------------------------------
