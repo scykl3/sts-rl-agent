@@ -40,8 +40,8 @@ Context tokens - never PAD, so every attention row has at least one valid key
                      relics_multihot / screen_onehot / keys_act / shop_remove_cost
     PILE (x4)     4  draw / discard / exhaust / deck, each mean+max pooled over
                      card_embed (order-agnostic, so pooled, not per-slot)
-    OFFER_CONTEXT 1  MLP over map_context / event_onehot / neow_bonus /
-                     neow_drawback
+    OFFER_CONTEXT 1  MLP over map_context / event_onehot / event_phase_onehot /
+                     neow_bonus / neow_drawback
 
 No sinusoidal positional encoding: attention is permutation-equivariant (correct
 for the pooled order-agnostic sets) and slotted types are disambiguated by the
@@ -69,6 +69,7 @@ from torch import Tensor, nn
 from sts_rl.interface import (
     CHOICE_MAX,
     ENEMY_SCALAR_DIM,
+    EVENT_PHASE_DIM,
     HAND_FEAT_DIM,
     HAND_MAX,
     KEYS_ACT_DIM,
@@ -229,6 +230,7 @@ _OFFER_INPUT_DIM = (
     + N_EVENT_IDS
     + MAX_NEOW_OPTIONS * N_NEOW_BONUS
     + MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK
+    + EVENT_PHASE_DIM
 )
 
 
@@ -537,7 +539,13 @@ class ObsFeatureEncoder(nn.Module):
         ]
 
         offer_input = torch.cat(
-            [obs["map_context"], obs["event_onehot"], obs["neow_bonus"], obs["neow_drawback"]],
+            [
+                obs["map_context"],
+                obs["event_onehot"],
+                obs["neow_bonus"],
+                obs["neow_drawback"],
+                obs["event_phase_onehot"],
+            ],
             dim=1,
         )
         offer_token = self._finalize_context(_OFFER_NAME, self.offer_mlp(offer_input))

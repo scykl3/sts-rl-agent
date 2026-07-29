@@ -175,6 +175,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ppo_defaults.target_kl,
         help="approximate-KL early-stop threshold (unset disables the early stop)",
     )
+    parser.add_argument(
+        "--adv-norm-decay",
+        type=float,
+        default=ppo_defaults.adv_norm_decay,
+        help="per-item EWMA decay for advantage normalization (1.0 = per-batch)",
+    )
     # Reward-shaping coefficients (shared with train_run). floor_progress and
     # boss_kill are run-mode signals and stay 0.0 in single-combat, exposed here
     # only for parity with train_run.
@@ -305,6 +311,7 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
+        adv_norm_decay=args.adv_norm_decay,
     )
 
     config = TrainConfig(

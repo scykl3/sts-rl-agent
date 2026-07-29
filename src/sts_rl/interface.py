@@ -1,6 +1,6 @@
 """Shared interface definitions for the Slay the Spire RL environment and agent.
 
-INTERFACE_VERSION 0.9.0.
+INTERFACE_VERSION 0.10.0.
 
 This module is the single source of truth shared by the environment and the
 agent. It defines the observation shapes, action-index layout, dtypes, mask
@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.9.0"
+INTERFACE_VERSION: str = "0.10.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -118,6 +118,15 @@ HAND_FEAT_DIM = 6  # upgraded, cost, is_attack, is_skill, is_power, ethereal
 ENEMY_SCALAR_DIM = 5  # hp_cur, hp_max, block, intent_val, intent_hits
 MAP_CONTEXT_DIM = 40  # current + available next node types/positions (run mode)
 KEYS_ACT_DIM = 4  # act + owned keys: ruby (red), emerald (green), sapphire (blue)
+# Multi-stage event phase, a one-hot over the engine's event_data scratch counter. It is a
+# meaningful event stage only for events that maintain the counter (COLOSSEUM, CURSED_TOME,
+# and similar multi-stage events), where it disambiguates otherwise-identical EVENT_SELECT
+# slots reused across stages. The engine does not reset event_data on entry to every event,
+# so on an event that does not use it the value may be left over from a prior event; that is
+# harmless because it is always paired with event_onehot and the stage-dependent events
+# reset the counter on entry. All-zero still means "not on an event screen". The last slot
+# (index EVENT_PHASE_DIM - 1) buckets any event_data >= EVENT_PHASE_DIM - 1.
+EVENT_PHASE_DIM = 8
 
 # --- Type aliases ----------------------------------------------------------
 Obs = dict[str, np.ndarray]
@@ -345,6 +354,19 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("event_onehot", np.float32, (N_EVENT_IDS,), "unit"),
     ObsField("neow_bonus", np.float32, (MAX_NEOW_OPTIONS * N_NEOW_BONUS,), "unit"),
     ObsField("neow_drawback", np.float32, (MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK,), "unit"),
+    # Multi-stage event phase one-hot (EVENT_SCREEN). One-hots the engine's event_data
+    # scratch counter. It is a meaningful event stage only for events that maintain the
+    # counter (COLOSSEUM, CURSED_TOME, and similar multi-stage events), where it
+    # disambiguates otherwise-identical EVENT_SELECT slots reused across stages. The engine
+    # does not reset event_data on entry to every event, so on an event that does not use it
+    # the value may be left over from a prior event; that is harmless because it is always
+    # paired with event_onehot (the agent conditions on event identity) and the
+    # stage-dependent events reset the counter on entry. The last slot (index
+    # EVENT_PHASE_DIM - 1) buckets any event_data >= EVENT_PHASE_DIM - 1. Like the other
+    # event one-hots it is all-zero off an event screen, so all-zero unambiguously means
+    # "not on an event screen". An env-written unit block (no embedding table), appended
+    # last so the prior layout stays a clean prefix for warm-start migration.
+    ObsField("event_phase_onehot", np.float32, (EVENT_PHASE_DIM,), "unit"),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}

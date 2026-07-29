@@ -460,7 +460,7 @@ def test_token_widths_derive_from_interface_constants():
         assert enc.entity_proj[spec.name].out_features == HIDDEN_DIM
 
     assert enc.pile_proj.in_features == _PILE_POOLS * CARD_EMBED_DIM
-    # CLS folds the six global blocks; OFFER folds the map / event / Neow blocks.
+    # CLS folds the six global blocks; OFFER folds map / event / event-phase / Neow.
     expected_cls = (
         interface.PLAYER_SCALAR_DIM
         + interface.N_PLAYER_POWER_IDS
@@ -474,6 +474,7 @@ def test_token_widths_derive_from_interface_constants():
         + interface.N_EVENT_IDS
         + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS
         + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK
+        + interface.EVENT_PHASE_DIM
     )
     assert _CLS_INPUT_DIM == expected_cls
     assert _OFFER_INPUT_DIM == expected_offer
