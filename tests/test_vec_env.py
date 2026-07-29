@@ -138,19 +138,18 @@ def test_autoreset_exposes_final_observation_and_info() -> None:
         assert masks.any(axis=1).all()
 
 
-def test_set_global_step_broadcasts_and_zeros_annealed_shaping() -> None:
-    # With a short anneal horizon, pushing the shared clock far past it must make
-    # every worker's per-step shaping vanish (non-terminal reward == 0).
+def test_set_global_step_broadcasts_without_affecting_reward() -> None:
+    # set_global_step broadcasts the shared step counter to every worker. Potential
+    # -based shaping is un-annealed, so the counter does not change reward: a
+    # non-terminal step's reward is exactly the potential-shaping delta regardless.
     num_envs = 2
-    cfg = RewardConfig(beta_min=0.0, t_anneal=4.0)
-    make = partial(_make_env, reward_config=cfg)
-    with SubprocVecEnv(make, num_envs) as vec:
+    with SubprocVecEnv(_make_env, num_envs) as vec:
         vec.reset(seeds=[REGRESSION_SEED, REGRESSION_SEED + 1])
-        vec.set_global_step(10_000)  # well past t_anneal on every worker
-        _, rewards, terminated, truncated, _, _ = vec.step(_end_turn_actions(num_envs))
-        for r, term, trunc in zip(rewards, terminated, truncated):
+        vec.set_global_step(10_000)  # broadcast to all workers; must not raise
+        _, rewards, terminated, truncated, _, infos = vec.step(_end_turn_actions(num_envs))
+        for r, term, trunc, info in zip(rewards, terminated, truncated, infos):
             if not (term or trunc):
-                assert r == pytest.approx(0.0)  # beta == 0 wipes shaping
+                assert r == pytest.approx(sum(info["shaping_terms"].values()))
 
 
 def test_step_rejects_wrong_action_shape() -> None:

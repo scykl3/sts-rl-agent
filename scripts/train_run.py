@@ -60,7 +60,6 @@ from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.checkpoint_migration import load_checkpoint
 from sts_rl.agent.deck_economy_wrapper import DeckEconomyShapingWrapper
 from sts_rl.agent.encoder import HIDDEN_DIM
-from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
 from sts_rl.env.reward_cli import add_reward_shaping_args, reward_config_from_args
@@ -81,6 +80,16 @@ DEFAULT_ASCENSION = 0
 # parser - imports engine-free and its pure helpers stay unit-testable without a
 # native build.
 DEFAULT_MAX_EPISODE_STEPS = 3000
+# Full-run training uses an UNDISCOUNTED return (gamma = 1.0). Over a run of
+# hundreds of decisions, gamma = 0.99 shrinks the terminal +/-1 win/loss signal to
+# near-zero for early choices (0.99^500 ~ 0.007), so drafting and routing get almost
+# no learning signal from winning. gae_lambda = 0.97 tempers the higher advantage
+# variance an undiscounted objective brings. These deliberately differ from the
+# shorter-horizon combat defaults in sts_rl.agent.ppo (0.99 / 0.95), where discounting
+# is already far-sighted enough. The env's reward gamma is single-sourced from --gamma
+# so any potential-based shaping telescopes against this same return.
+FULL_RUN_GAMMA = 1.0
+FULL_RUN_GAE_LAMBDA = 0.97
 # Single-env only for now: the vectorized StsRunEnv path is blocked on an env-owner
 # type-hint widening (see the module docstring and _validate_num_envs).
 DEFAULT_NUM_ENVS = 1
@@ -156,11 +165,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="linearly decay the learning rate across the run",
     )
-    parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA, help="GAE discount factor")
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=FULL_RUN_GAMMA,
+        help="GAE discount factor (full-run default is undiscounted, 1.0)",
+    )
     parser.add_argument(
         "--gae-lambda",
         type=float,
-        default=DEFAULT_GAE_LAMBDA,
+        default=FULL_RUN_GAE_LAMBDA,
         help="GAE trace-decay lambda",
     )
     parser.add_argument(
@@ -392,15 +406,20 @@ def main() -> None:
     # instance for greedy holdout eval - both the in-loop periodic eval and the
     # final eval - so evaluate() resetting per seed never disturbs the training
     # collector's rollout stream.
+    # reward_config carries the CLI-overridable shaping coefficients; gamma is
+    # single-sourced from args.gamma (the same discount TrainConfig/GAE use) so the
+    # env's potential-based shaping telescopes against the return.
     env = StsRunEnv(
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
         reward_config=reward_config,
+        gamma=args.gamma,
     )
     eval_env = StsRunEnv(
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
         reward_config=reward_config,
+        gamma=args.gamma,
     )
 
     # Optional potential-based deck/economy shaping on the TRAINING env ONLY. gamma is

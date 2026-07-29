@@ -37,8 +37,8 @@ def _reward_ns(**overrides: float) -> argparse.Namespace:
 
 
 def test_reward_config_from_args_maps_all_four_coefficients() -> None:
-    """Each shaping flag maps to its RewardConfig field, and the un-exposed anneal
-    schedule (beta_min / t_anneal) keeps the RewardConfig default."""
+    """Each shaping flag maps to its RewardConfig field; the four potential weights
+    are the only fields RewardConfig carries, so mapping them is complete."""
     cfg = reward_config_from_args(
         _reward_ns(
             enemy_hp_removed_coef=0.1,
@@ -53,8 +53,6 @@ def test_reward_config_from_args_maps_all_four_coefficients() -> None:
         0.4,
         1.0,
     )
-    assert cfg.beta_min == RewardConfig().beta_min
-    assert cfg.t_anneal == RewardConfig().t_anneal
 
 
 def test_reward_config_from_args_defaults_reproduce_reward_config() -> None:

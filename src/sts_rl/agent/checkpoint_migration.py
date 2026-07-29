@@ -87,11 +87,13 @@ TRUNK_INPUT_WEIGHT_KEY: str = "encoder.trunk.0.weight"
 #          shipped 0.8.0 width; before the Neow-event one-hot blocks were appended)
 #   5736 - pre-event-phase width (after the Neow-event one-hot blocks, the shipped 0.9.0
 #          width; before the event-phase one-hot block was appended)
+#   5744 - pre-map-lookahead width (after the event-phase one-hot block, the shipped
+#          0.10.0 width; before the map-lookahead block was appended)
 # When a new feature block is appended at the END of the concat, add the PRE-APPEND
 # width here deliberately (the current width, just before the append) so an older
 # checkpoint of that width still migrates and any other narrower width is rejected
 # as a column mismap.
-_KNOWN_PRIOR_FEATURE_DIMS: tuple[int, ...] = (1349, 1605, 4881, 4949, 5571, 5736)
+_KNOWN_PRIOR_FEATURE_DIMS: tuple[int, ...] = (1349, 1605, 4881, 4949, 5571, 5736, 5744)
 
 # Historical action-block layouts, as ordered ``(name, count)`` specs copied
 # verbatim from each version's ``interface.py`` in git. Counts (not offsets) are

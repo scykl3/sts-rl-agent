@@ -13,7 +13,7 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.10.0"
+    assert interface.INTERFACE_VERSION == "0.11.0"
 
 
 def test_action_dim_is_257():
@@ -143,12 +143,13 @@ def test_deck_and_keys_act_obs_fields():
 
     # Appended last, in order, so the prior layout stays a clean prefix for warm-start
     # migration: ..., card_select_ids, deck_ids, keys_act, then the shop / boss-relic
-    # screen block, the Neow-event one-hots, then the event-phase one-hot (the current
-    # concat tail). Pinning keys_act's position locks the 0.7.0 prefix boundary;
-    # boss_relic_ids locks the 0.8.0 boundary, and neow_drawback the 0.9.0 boundary,
-    # ahead of the appended event-phase block.
+    # screen block, the Neow-event one-hots, the event-phase one-hot, then the
+    # map-lookahead block (the current concat tail). Pinning keys_act's position locks the
+    # 0.7.0 prefix boundary; boss_relic_ids locks the 0.8.0 boundary, neow_drawback the
+    # 0.9.0 boundary, and event_phase_onehot the 0.10.0 boundary, ahead of the appended
+    # map-lookahead block.
     names = [f.name for f in interface.OBS_FIELDS]
-    assert names[-13:] == [
+    assert names[-14:] == [
         "keys_act",
         "shop_card_ids",
         "shop_card_prices",
@@ -162,6 +163,7 @@ def test_deck_and_keys_act_obs_fields():
         "neow_bonus",
         "neow_drawback",
         "event_phase_onehot",
+        "map_lookahead",
     ]
 
 
@@ -228,16 +230,18 @@ def test_neow_event_obs_fields():
 
 def test_event_phase_obs_field():
     # event_phase_onehot is an EVENT_PHASE_DIM-wide env-written unit one-hot over the
-    # engine's event_data phase counter (no id_high), appended LAST as the concat tail so
-    # the prior layout stays a clean prefix for warm-start migration.
+    # engine's event_data phase counter (no id_high), appended after the Neow-event blocks
+    # (ahead of the map-lookahead tail) so the prior layout stays a clean prefix for
+    # warm-start migration.
     assert interface.EVENT_PHASE_DIM == 8
     field = interface.OBS_FIELD_BY_NAME["event_phase_onehot"]
     assert field.shape == (interface.EVENT_PHASE_DIM,)
     assert field.bounds == "unit"
     assert field.dtype == np.float32
     assert field.id_high is None
-    # It is the very last field, so the appended block is the concat tail.
-    assert interface.OBS_FIELDS[-1].name == "event_phase_onehot"
+    # It sits just before the map-lookahead block, which is the current concat tail.
+    assert interface.OBS_FIELDS[-1].name == "map_lookahead"
+    assert interface.OBS_FIELDS[-2].name == "event_phase_onehot"
 
 
 def test_new_enum_tables_are_engine_validated():
@@ -256,7 +260,7 @@ def test_new_enum_tables_are_engine_validated():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 36
+    assert len(fields) == 37
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:
@@ -274,6 +278,7 @@ def test_obs_field_shapes_match_constants():
     assert by_name["enemy_powers"].shape == (interface.MAX_ENEMIES, interface.N_MONSTER_POWER_IDS)
     assert by_name["relics_multihot"].shape == (interface.N_RELIC_IDS,)
     assert by_name["map_context"].shape == (40,)
+    assert by_name["map_lookahead"].shape == (17,)
     # Pin the per-card feature width (6) directly; the space-vs-registry test is
     # tautological here since both sides read the same registry.
     assert by_name["hand_feats"].shape == (interface.HAND_MAX, 6)
@@ -287,12 +292,14 @@ def test_obs_dim_constants_match_expected_literals():
     assert interface.ENEMY_SCALAR_DIM == 5
     assert interface.HAND_FEAT_DIM == 6
     assert interface.MAP_CONTEXT_DIM == 40
+    assert interface.MAP_LOOKAHEAD_DIM == 17
     # And OBS_FIELDS must actually use them.
     by_name = interface.OBS_FIELD_BY_NAME
     assert by_name["player_scalars"].shape == (interface.PLAYER_SCALAR_DIM,)
     assert by_name["enemy_scalars"].shape == (interface.MAX_ENEMIES, interface.ENEMY_SCALAR_DIM)
     assert by_name["hand_feats"].shape == (interface.HAND_MAX, interface.HAND_FEAT_DIM)
     assert by_name["map_context"].shape == (interface.MAP_CONTEXT_DIM,)
+    assert by_name["map_lookahead"].shape == (interface.MAP_LOOKAHEAD_DIM,)
 
 
 def test_id_fields_have_id_high():

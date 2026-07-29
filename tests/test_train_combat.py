@@ -244,6 +244,7 @@ def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> 
             max_episode_steps: int,
             encounters: object,
             reward_config: RewardConfig | None = None,
+            gamma: float = 1.0,
         ) -> None:
             captured_reward_configs.append(reward_config)
 
@@ -317,6 +318,7 @@ def test_main_wires_adv_norm_decay_into_ppo_config(monkeypatch: pytest.MonkeyPat
             max_episode_steps: int,
             encounters: object,
             reward_config: RewardConfig | None = None,
+            gamma: float = 1.0,
         ) -> None:
             pass
 

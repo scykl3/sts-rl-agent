@@ -7,9 +7,10 @@ builds on.
 Observations are encoded from the live engine state by
 :func:`sts_rl.env.observation.encode_observation`; the raw readout also stays in
 ``info['combat']`` for debugging. Reward is the terminal win/loss signal plus
-annealed per-step shaping (see :mod:`sts_rl.env.reward`):
-``reward = terminal + beta(t) * sum(shaping_terms)``, where ``t`` is the env's
-cumulative step count across episodes.
+potential-based per-step shaping (see :mod:`sts_rl.env.reward`):
+``reward = terminal + (gamma * Phi(s') - Phi(s))``, where ``Phi`` is the shaping
+potential and ``gamma`` is the trainer's discount. In this single-combat env the
+potential is the enemy-HP and player-HP terms; floor / act terms are ``0``.
 
 Action legality is enforced through :func:`sts_rl.env.actions.build_mask`: an
 action is decoded and executed only after it is confirmed legal, so an invalid
@@ -30,9 +31,10 @@ from sts_rl.env.actions import auto_resolve, build_mask, decode_action
 from sts_rl.env.engine import CombatSnapshot, engine_commit, read_combat, start_combat
 from sts_rl.env.observation import encode_observation
 from sts_rl.env.reward import (
+    DEFAULT_SHAPING_GAMMA,
     RewardConfig,
-    combat_shaping_terms,
-    shaping_reward,
+    shaping_delta,
+    state_potentials,
     zero_shaping_terms,
 )
 from sts_rl.env.spaces import build_spaces
@@ -61,8 +63,12 @@ class StsEnv(gym.Env):
         strict: if ``True``, an illegal action passed to :meth:`step` raises
             :class:`~sts_rl.interface.InterfaceError` instead of only flagging
             ``invalid_action`` in ``info`` and leaving the state unchanged.
-        reward_config: shaping coefficients and anneal schedule; defaults to
+        reward_config: potential weights for the shaping terms; defaults to
             :class:`~sts_rl.env.reward.RewardConfig`.
+        gamma: discount for the potential-based shaping term
+            ``gamma * Phi(s') - Phi(s)``. Pass the trainer's GAE discount so the
+            shaping telescopes against the same return; defaults to
+            :data:`~sts_rl.env.reward.DEFAULT_SHAPING_GAMMA`.
         render_mode: one of ``None``, ``"ansi"``, ``"human"``.
         encounters: optional non-empty pool of engine ``MonsterEncounter`` values.
             When given, each :meth:`reset` samples one (deterministically from the
@@ -82,6 +88,7 @@ class StsEnv(gym.Env):
         max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
         strict: bool = False,
         reward_config: RewardConfig | None = None,
+        gamma: float = DEFAULT_SHAPING_GAMMA,
         render_mode: str | None = None,
         encounters: Sequence[Any] | None = None,  # sts.MonsterEncounter values | None
     ) -> None:
@@ -103,18 +110,16 @@ class StsEnv(gym.Env):
         self._max_episode_steps = max_episode_steps
         self._strict = strict
         self._reward_config = reward_config if reward_config is not None else RewardConfig()
+        self._gamma = float(gamma)
         # Fixed pool of chosen encounters sampled once per reset; None keeps the
         # default navigate-to-first-combat behavior.
         self._encounters = tuple(encounters) if encounters is not None else None
         # Cached once; the pinned commit does not change during a run.
         self._engine_commit = engine_commit()
 
-        # Cumulative env steps; drives the shaping anneal beta(t). Not reset
-        # between episodes (t is training progress, not within-episode time).
-        # A single env self-increments this once per step, which is correct in
-        # isolation. Under parallel workers the per-worker count understates
-        # total interactions, so the trainer should set the shared global step
-        # via set_global_step(); see its docstring.
+        # Cumulative env-step counter, exposed via set_global_step for diagnostics
+        # and back-compat (the vectorized runner and shaping wrappers broadcast it).
+        # Potential-based shaping is un-annealed, so this no longer affects reward.
         self._global_step = 0
 
         # Per-episode state, populated by reset() before use.
@@ -124,8 +129,9 @@ class StsEnv(gym.Env):
         self._ep_return = 0.0
         self._episode_seed: int | None = None
         self._mask = np.zeros(ACTION_DIM, dtype=np.bool_)
-        # Snapshot from before the current step, for per-step shaping deltas.
-        self._prev_snapshot: CombatSnapshot | None = None
+        # Shaping potential Phi(s) of the state before the current step, per term,
+        # for the potential-based delta gamma * Phi(s') - Phi(s).
+        self._prev_potentials: dict[str, float] = zero_shaping_terms()
 
     # -- Gymnasium API ------------------------------------------------------
 
@@ -145,7 +151,7 @@ class StsEnv(gym.Env):
         self._ep_return = 0.0
         self._refresh_mask()
         snapshot = read_combat(self._bc)
-        self._prev_snapshot = snapshot
+        self._prev_potentials = state_potentials(self._reward_config, combat=snapshot)
         return self._observation(), self._build_info(
             invalid_action=False, shaping_terms=zero_shaping_terms(), snapshot=snapshot
         )
@@ -164,9 +170,9 @@ class StsEnv(gym.Env):
             if self._strict:
                 raise InterfaceError(f"illegal action {action} for the current mask")
             # Do not touch the engine: executing an invalid action is unsafe. The
-            # state is unchanged, so no shaping delta and no reward accrue, but the
-            # step still counts as one env interaction and advances the anneal clock.
-            # Only the count matters here (no beta index is read on this path).
+            # state is unchanged, so Phi is unchanged and no shaping or reward
+            # accrues (the previous potential is left as the baseline); the step
+            # still counts as one env interaction.
             self._steps += 1
             self._global_step += 1
             truncated = self._steps >= self._max_episode_steps
@@ -180,8 +186,6 @@ class StsEnv(gym.Env):
             return self._observation(), 0.0, False, truncated, info
 
         assert engine_action is not None  # guaranteed: legal implies a mapped, valid action
-        prev_snapshot = self._prev_snapshot
-        assert prev_snapshot is not None  # reset() populates it before any step
         engine_action.execute(self._bc)
         self._steps += 1
 
@@ -197,12 +201,22 @@ class StsEnv(gym.Env):
             terminal = TERMINAL_WIN_REWARD if won else TERMINAL_LOSS_REWARD
         truncated = (not terminated) and self._steps >= self._max_episode_steps
 
-        shaping_terms = combat_shaping_terms(prev_snapshot, snapshot, self._reward_config)
-        # beta is indexed by steps already taken, so the first-ever step sees
-        # beta(0); the clock advances after the reward is computed.
-        reward = terminal + shaping_reward(shaping_terms, self._global_step, self._reward_config)
+        # Potential-based shaping F = gamma * Phi(s') - Phi(s). Phi(s') := 0 on BOTH
+        # a terminated and a truncated step, so every episode's shaping telescopes to
+        # -Phi(s_0) regardless of where it ends - policy-invariant. Zeroing on
+        # truncation (rather than emitting the real gamma * Phi(s')) is deliberate: on
+        # truncation the collector bootstraps V of the post-reset observation, not the
+        # truncated state's true successor (see rollout_collector), and this matches
+        # the DeckEconomyShapingWrapper convention. Un-annealed.
+        curr_potentials = (
+            zero_shaping_terms()
+            if terminated or truncated
+            else state_potentials(self._reward_config, combat=snapshot)
+        )
+        shaping_terms = shaping_delta(self._prev_potentials, curr_potentials, self._gamma)
+        reward = terminal + sum(shaping_terms.values())
+        self._prev_potentials = curr_potentials
         self._global_step += 1
-        self._prev_snapshot = snapshot
 
         self._ep_return += reward
         info = self._build_info(
@@ -226,15 +240,13 @@ class StsEnv(gym.Env):
         return [actual_seed]
 
     def set_global_step(self, t: int) -> None:
-        """Set the shaping anneal clock to the true global env-step count.
+        """Set the cumulative env-step counter to the shared global step.
 
-        ``beta(t)`` (see :mod:`sts_rl.env.reward`) is indexed by ``t``. A single
-        env self-increments its clock by one per :meth:`step`, which is correct
-        in isolation. Under parallel workers the per-worker count understates
-        total interactions by the worker factor, stretching the effective anneal
-        horizon; the training loop should call this (e.g. once per collected
-        batch) with the shared global step so the anneal stays on its intended
-        schedule. Subsequent steps advance from the value set here.
+        Potential-based shaping is un-annealed, so this no longer affects reward.
+        The counter is retained for diagnostics and back-compat: the vectorized
+        runner and shaping wrappers broadcast a shared step count through this
+        method, so it stays a supported no-op-on-reward setter. Subsequent steps
+        advance from the value set here; negative values are rejected.
         """
         if t < 0:
             raise InterfaceError(f"global_step must be >= 0, got {t}")
