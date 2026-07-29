@@ -52,7 +52,7 @@ import torch
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
-from sts_rl.agent.ppo_update import PPOConfig, PPOStats, ppo_update
+from sts_rl.agent.ppo_update import ADV_NORM_EPS, PPOConfig, PPOStats, ppo_update
 from sts_rl.agent.rollout_buffer import RolloutBuffer, SupportsMinibatches, VecRolloutBuffer
 from sts_rl.agent.rollout_collector import (
     CollectStats,
@@ -60,6 +60,7 @@ from sts_rl.agent.rollout_collector import (
     VecEnvProtocol,
     VecRolloutCollector,
 )
+from sts_rl.agent.running_moments import RunningMoments
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 from sts_rl.interface import INTERFACE_VERSION
 
@@ -499,6 +500,11 @@ def train(
             "value-head warmup: freezing trunk + policy for %d iters (critic-only)",
             config.value_warmup_iters,
         )
+    # One persistent advantage-normalization tracker for the whole run, so its
+    # EWMA carries across iterations (see ppo_update). Checkpoint persistence of
+    # these running stats is out of scope: on resume the EWMA simply re-warms
+    # from the first post-resume rollout.
+    adv_moments = RunningMoments(decay=config.ppo.adv_norm_decay, eps=ADV_NORM_EPS)
     global_step = 0
     for iteration in range(config.num_iterations):
         # Lift the warmup freeze exactly at the boundary iteration: from here on
@@ -538,7 +544,9 @@ def train(
         # step counter advances by num_envs * n_steps (exactly n_steps when
         # num_envs == 1, preserving the single-env accounting).
         global_step += config.num_envs * config.n_steps
-        ppo_stats = ppo_update(actor_critic, buffer_for_update, optimizer, config.ppo)
+        ppo_stats = ppo_update(
+            actor_critic, buffer_for_update, optimizer, config.ppo, adv_moments=adv_moments
+        )
 
         records.append(
             IterationRecord(

@@ -514,6 +514,56 @@ def test_main_wires_warmup_and_early_stop_into_config(monkeypatch: pytest.Monkey
     assert config.early_stop_min_delta == 0.02
 
 
+def test_main_wires_adv_norm_decay_into_ppo_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() flows --adv-norm-decay into the nested PPOConfig (config.ppo.adv_norm_decay).
+
+    Engine-free: train and StsRunEnv are stubbed. Passing a non-default value on argv
+    and asserting it reaches config.ppo threads the CLI -> PPOConfig wire for the
+    advantage-normalization EWMA decay.
+
+    Revert-verify: drop adv_norm_decay=args.adv_norm_decay from main()'s PPOConfig build
+    and config.ppo.adv_norm_decay falls back to the PPOConfig default, failing this.
+    """
+    captured: dict[str, object] = {}
+
+    def _fake_train(
+        _env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        captured["config"] = config
+        # A last eval snapshot over the driver's DEFAULT band keeps _final_eval_report on
+        # the reuse path, so the final eval needs neither the engine nor a stubbed evaluate.
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+
+    # Bind main()'s deferred StsRunEnv import to the engine-free stub.
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _StubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+
+    monkeypatch.setattr(sys, "argv", ["train_run", "--adv-norm-decay", "0.25"])
+
+    train_run.main()
+
+    config = cast(TrainConfig, captured["config"])
+    assert config.ppo.adv_norm_decay == 0.25
+
+
 def test_arg_parser_has_no_encounters_knob() -> None:
     """Run mode has no encounter pool, so --encounters (combat-only) is absent."""
     with pytest.raises(SystemExit):
