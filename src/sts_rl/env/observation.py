@@ -39,6 +39,7 @@ from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     CHOICE_MAX,
     DECK_MAX,
+    EVENT_PHASE_DIM,
     HAND_MAX,
     MAP_CONTEXT_DIM,
     MAP_LOOKAHEAD_DIM,
@@ -258,12 +259,13 @@ def encode_observation(gc: Any, bc: Any) -> Obs:
     mutation.
     """
     obs = _empty_obs()
-    # relics, the screen one-hot, keys/act, and the Neow-event one-hots are read from
-    # gc in both modes.
+    # relics, the screen one-hot, keys/act, the Neow-event one-hots, and the event
+    # phase one-hot are read from gc in both modes.
     _fill_relics_multihot(obs, gc)
     _fill_screen_onehot(obs, gc)
     _fill_keys_act(obs, gc)
     _fill_neow_event(obs, gc)
+    _fill_event_phase(obs, gc)
 
     if bc is None:
         _fill_run_scalars(obs, gc)
@@ -437,6 +439,36 @@ def _fill_neow_event(obs: Obs, gc: Any) -> None:
             neow_bonus[k * N_NEOW_BONUS + bonus] = 1.0
         if 0 <= drawback < N_NEOW_DRAWBACK:
             neow_drawback[k * N_NEOW_DRAWBACK + drawback] = 1.0
+
+
+def _fill_event_phase(obs: Obs, gc: Any) -> None:
+    """Fill ``event_phase_onehot`` from the live EVENT_SCREEN, mirroring the event-screen
+    gating of :func:`_fill_neow_event`.
+
+    Runs in both modes (the event screen is an overworld state, but the encode dispatch
+    is shared). One-hots the engine's ``screen_state_info.event_data`` scratch counter. It
+    is a meaningful event stage only for events that maintain the counter (COLOSSEUM,
+    CURSED_TOME, and similar multi-stage events), where it disambiguates
+    otherwise-identical ``EVENT_SELECT`` slots reused across stages. The engine does not
+    reset ``event_data`` on entry to every event, so on an event that does not use it the
+    value may be left over from a prior event; that is harmless because it is always paired
+    with ``event_onehot`` (the agent conditions on event identity) and the stage-dependent
+    events reset the counter on entry.
+
+    Off the event screen the block stays all-zero (no bit set), so all-zero
+    unambiguously means "not on an event screen", the same gating convention as
+    ``event_onehot`` and the Neow blocks, which is why ``_empty_obs`` needs no sentinel
+    here.
+
+    The index is clamped into ``[0, EVENT_PHASE_DIM - 1]``: the last slot (index
+    ``EVENT_PHASE_DIM - 1``) buckets any ``event_data >= EVENT_PHASE_DIM - 1``, so an
+    unexpectedly large counter saturates the last slot rather than overflowing the array;
+    a negative value (not emitted by the engine) clamps to slot 0.
+    """
+    if int(gc.screen_state) != _SCREEN_EVENT:
+        return
+    phase = min(max(int(gc.screen_state_info.event_data), 0), EVENT_PHASE_DIM - 1)
+    obs["event_phase_onehot"][phase] = 1.0
 
 
 def _fill_run_scalars(obs: Obs, gc: Any) -> None:

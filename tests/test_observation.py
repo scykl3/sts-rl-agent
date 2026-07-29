@@ -37,6 +37,7 @@ from sts_rl.env.observation import (
     _fill_boss_relic_ids,
     _fill_card_select_ids,
     _fill_deck_ids,
+    _fill_event_phase,
     _fill_keys_act,
     _fill_map_context,
     _fill_neow_event,
@@ -51,6 +52,7 @@ from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     CHOICE_MAX,
     DECK_MAX,
+    EVENT_PHASE_DIM,
     MAX_BOSS_RELICS,
     MAX_NEOW_OPTIONS,
     MAX_REWARD_CARD_GROUPS,
@@ -1285,3 +1287,97 @@ def test_fill_neow_event_drops_out_of_range_option_ids() -> None:
     last = MAX_NEOW_OPTIONS - 1
     assert not np.any(obs["neow_bonus"][last * N_NEOW_BONUS : (last + 1) * N_NEOW_BONUS])
     assert not np.any(obs["neow_drawback"][last * N_NEOW_DRAWBACK : (last + 1) * N_NEOW_DRAWBACK])
+
+
+# --- event_phase_onehot (EVENT_SCREEN multi-stage phase) -------------------
+
+
+def _event_phase_gc(event_data, screen=None):
+    """A minimal gc whose screen + event_data drive ``_fill_event_phase`` alone.
+
+    ``event_data`` is the engine's phase counter (a small non-negative int); ``screen``
+    defaults to ``EVENT_SCREEN``.
+    """
+    return SimpleNamespace(
+        screen_state=sts.ScreenState.EVENT_SCREEN if screen is None else screen,
+        screen_state_info=SimpleNamespace(event_data=event_data),
+    )
+
+
+def test_event_phase_populated_from_live_run() -> None:
+    # A fresh run starts on the event screen; set the engine's event_data phase counter
+    # and confirm encode_observation one-hots it at min(k, EVENT_PHASE_DIM - 1), with the
+    # overflow slot bucketing any k >= EVENT_PHASE_DIM - 1. Proves the live
+    # gc.screen_state_info.event_data binding path (not just a fake gc).
+    gc = start_run(seed=REGRESSION_SEED)
+    assert gc.screen_state == sts.ScreenState.EVENT_SCREEN
+    for k in (0, 2, 7, 9):
+        gc.screen_state_info.event_data = k
+        obs = encode_observation(gc, None)
+        phase = obs["event_phase_onehot"]
+        expected_slot = min(k, EVENT_PHASE_DIM - 1)
+        assert phase[expected_slot] == 1.0, k
+        assert phase.sum() == 1.0, k  # exactly one bit set
+        assert np.count_nonzero(phase) == 1, k
+        assert build_observation_space().contains(obs)
+
+
+def test_event_phase_onehot_reflects_event_data_through_full_encode() -> None:
+    # Drives the full encode_observation path on a live start_run gc at a mid-range event_data
+    # value (6) and asserts the one-hot mirrors it end to end. The engine's reset-on-entry
+    # semantics (event_data is reset on entry only for the events that maintain it, e.g.
+    # COLOSSEUM and CURSED_TOME; other events leave a leftover value) are engine behavior,
+    # tolerated here because the field is always paired with event_onehot.
+    gc = start_run(seed=REGRESSION_SEED)
+    assert gc.screen_state == sts.ScreenState.EVENT_SCREEN
+    stale = 6  # a leftover phase counter from a prior maintaining event (e.g. COLOSSEUM)
+    gc.screen_state_info.event_data = stale
+    obs = encode_observation(gc, None)
+    phase = obs["event_phase_onehot"]
+    assert phase[stale] == 1.0
+    assert np.count_nonzero(phase) == 1  # only slot 6 set; all other slots zero
+    assert build_observation_space().contains(obs)
+
+
+def test_fill_event_phase_onehots_and_buckets_overflow() -> None:
+    # On the event screen the phase counter one-hots at its slot; slots 0..EVENT_PHASE_DIM-2
+    # are distinct phases and the last slot buckets any event_data >= EVENT_PHASE_DIM - 1. A
+    # negative value (never emitted by the engine) clamps to slot 0. Revert guard: a no-op
+    # fill would leave the block all-zero and fail the one-bit assertion.
+    overflow = EVENT_PHASE_DIM - 1
+    cases = (
+        (0, 0),
+        (4, 4),
+        (overflow, overflow),
+        (EVENT_PHASE_DIM, overflow),  # one past the last slot -> bucketed
+        (99, overflow),  # far past -> bucketed, no overflow
+        (-3, 0),  # negative -> clamped to slot 0
+    )
+    for value, expected_slot in cases:
+        gc = _event_phase_gc(value)
+        obs = _empty_obs()
+        _fill_event_phase(obs, gc)
+        phase = obs["event_phase_onehot"]
+        assert phase[expected_slot] == 1.0, value
+        assert phase.sum() == 1.0, value
+        assert np.count_nonzero(phase) == 1, value
+
+
+def test_fill_event_phase_noop_off_event_screen() -> None:
+    # Off the event screen the fill is a no-op: the block stays all-zero, so all-zero
+    # unambiguously means "not on an event screen" (a stale event_data never leaks a bit off
+    # the event screen).
+    gc = _event_phase_gc(3, screen=sts.ScreenState.MAP_SCREEN)
+    obs = _empty_obs()
+    _fill_event_phase(obs, gc)
+    assert not np.any(obs["event_phase_onehot"])
+
+
+def test_event_phase_empty_off_event_screen_real_encode() -> None:
+    # In real encodes off the event screen (combat and the map screen), the event-phase
+    # one-hot stays all-zero.
+    gc_combat, bc = _combat()
+    combat_obs = encode_observation(gc_combat, bc)
+    map_obs = encode_observation(_drive_to_first_map_screen(), None)
+    for obs in (combat_obs, map_obs):
+        assert not np.any(obs["event_phase_onehot"]), obs["screen_onehot"].argmax()

@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-INTERFACE_VERSION: str = "0.10.0"
+INTERFACE_VERSION: str = "0.11.0"
 
 # Sentinel id that fills empty pile / potion / enemy slots.
 PAD_ID: int = 0
@@ -123,6 +123,15 @@ MAP_CONTEXT_DIM = 40  # current + available next node types/positions (run mode)
 # zero-init suffix widen. Its internal layout is guarded in sts_rl.env.observation.
 MAP_LOOKAHEAD_DIM = 17
 KEYS_ACT_DIM = 4  # act + owned keys: ruby (red), emerald (green), sapphire (blue)
+# Multi-stage event phase, a one-hot over the engine's event_data scratch counter. It is a
+# meaningful event stage only for events that maintain the counter (COLOSSEUM, CURSED_TOME,
+# and similar multi-stage events), where it disambiguates otherwise-identical EVENT_SELECT
+# slots reused across stages. The engine does not reset event_data on entry to every event,
+# so on an event that does not use it the value may be left over from a prior event; that is
+# harmless because it is always paired with event_onehot and the stage-dependent events
+# reset the counter on entry. All-zero still means "not on an event screen". The last slot
+# (index EVENT_PHASE_DIM - 1) buckets any event_data >= EVENT_PHASE_DIM - 1.
+EVENT_PHASE_DIM = 8
 
 # --- Type aliases ----------------------------------------------------------
 Obs = dict[str, np.ndarray]
@@ -281,7 +290,6 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("enemy_alive", np.float32, (MAX_ENEMIES,), "unit"),
     ObsField("screen_onehot", np.float32, (N_SCREENS,), "unit"),
     ObsField("map_context", np.float32, (MAP_CONTEXT_DIM,), "real"),
-    ObsField("map_lookahead", np.float32, (MAP_LOOKAHEAD_DIM,), "real"),
     # Run-mode REWARDS-screen contents, slot-aligned with the REWARD_SELECT
     # block's card / relic / potion sub-slots so the agent sees which item each
     # takeable slot holds; the positional index alone is meaningless. Zero (PAD)
@@ -351,6 +359,23 @@ OBS_FIELDS: tuple[ObsField, ...] = (
     ObsField("event_onehot", np.float32, (N_EVENT_IDS,), "unit"),
     ObsField("neow_bonus", np.float32, (MAX_NEOW_OPTIONS * N_NEOW_BONUS,), "unit"),
     ObsField("neow_drawback", np.float32, (MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK,), "unit"),
+    # Multi-stage event phase one-hot (EVENT_SCREEN). One-hots the engine's event_data
+    # scratch counter. It is a meaningful event stage only for events that maintain the
+    # counter (COLOSSEUM, CURSED_TOME, and similar multi-stage events), where it
+    # disambiguates otherwise-identical EVENT_SELECT slots reused across stages. The engine
+    # does not reset event_data on entry to every event, so on an event that does not use it
+    # the value may be left over from a prior event; that is harmless because it is always
+    # paired with event_onehot (the agent conditions on event identity) and the
+    # stage-dependent events reset the counter on entry. The last slot (index
+    # EVENT_PHASE_DIM - 1) buckets any event_data >= EVENT_PHASE_DIM - 1. Like the other
+    # event one-hots it is all-zero off an event screen, so all-zero unambiguously means
+    # "not on an event screen". An env-written unit block (no embedding table), appended
+    # last so the prior layout stays a clean prefix for warm-start migration.
+    ObsField("event_phase_onehot", np.float32, (EVENT_PHASE_DIM,), "unit"),
+    # Map lookahead aggregates toward the act boss (a global summary + per-column
+    # forward cone). An env-written real block, appended last so the prior layout
+    # stays a clean prefix for warm-start migration.
+    ObsField("map_lookahead", np.float32, (MAP_LOOKAHEAD_DIM,), "real"),
 )
 
 OBS_FIELD_BY_NAME: dict[str, ObsField] = {f.name: f for f in OBS_FIELDS}

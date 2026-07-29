@@ -13,7 +13,7 @@ from sts_rl.env import spaces
 
 
 def test_interface_version():
-    assert interface.INTERFACE_VERSION == "0.10.0"
+    assert interface.INTERFACE_VERSION == "0.11.0"
 
 
 def test_action_dim_is_257():
@@ -143,11 +143,13 @@ def test_deck_and_keys_act_obs_fields():
 
     # Appended last, in order, so the prior layout stays a clean prefix for warm-start
     # migration: ..., card_select_ids, deck_ids, keys_act, then the shop / boss-relic
-    # screen block, then the Neow-event one-hots (the current concat tail). Pinning
-    # keys_act's position locks the 0.7.0 prefix boundary; boss_relic_ids locks the
-    # 0.8.0 boundary, ahead of the appended Neow-event block.
+    # screen block, the Neow-event one-hots, the event-phase one-hot, then the
+    # map-lookahead block (the current concat tail). Pinning keys_act's position locks the
+    # 0.7.0 prefix boundary; boss_relic_ids locks the 0.8.0 boundary, neow_drawback the
+    # 0.9.0 boundary, and event_phase_onehot the 0.10.0 boundary, ahead of the appended
+    # map-lookahead block.
     names = [f.name for f in interface.OBS_FIELDS]
-    assert names[-12:] == [
+    assert names[-14:] == [
         "keys_act",
         "shop_card_ids",
         "shop_card_prices",
@@ -160,6 +162,8 @@ def test_deck_and_keys_act_obs_fields():
         "event_onehot",
         "neow_bonus",
         "neow_drawback",
+        "event_phase_onehot",
+        "map_lookahead",
     ]
 
 
@@ -224,6 +228,22 @@ def test_neow_event_obs_fields():
     assert interface.MAX_NEOW_OPTIONS == 4
 
 
+def test_event_phase_obs_field():
+    # event_phase_onehot is an EVENT_PHASE_DIM-wide env-written unit one-hot over the
+    # engine's event_data phase counter (no id_high), appended after the Neow-event blocks
+    # (ahead of the map-lookahead tail) so the prior layout stays a clean prefix for
+    # warm-start migration.
+    assert interface.EVENT_PHASE_DIM == 8
+    field = interface.OBS_FIELD_BY_NAME["event_phase_onehot"]
+    assert field.shape == (interface.EVENT_PHASE_DIM,)
+    assert field.bounds == "unit"
+    assert field.dtype == np.float32
+    assert field.id_high is None
+    # It sits just before the map-lookahead block, which is the current concat tail.
+    assert interface.OBS_FIELDS[-1].name == "map_lookahead"
+    assert interface.OBS_FIELDS[-2].name == "event_phase_onehot"
+
+
 def test_new_enum_tables_are_engine_validated():
     # The Neow-event enum tables must be in the startup validation map (like N_SCREENS),
     # so a future engine enum bump that overflows one is caught rather than silently
@@ -240,7 +260,7 @@ def test_new_enum_tables_are_engine_validated():
 
 def test_obs_fields_count_and_unique_names():
     fields = interface.OBS_FIELDS
-    assert len(fields) == 36
+    assert len(fields) == 37
     names = [f.name for f in fields]
     assert len(names) == len(set(names))
     for f in fields:

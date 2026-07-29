@@ -49,8 +49,12 @@ to the hand/enemy slot order, so do NOT reorder):
                  (Neow-event one-hots: the current event id, then per-option NeowBonus
                  and NeowDrawback one-hots; raw passthrough unit blocks like
                  screen_onehot, appended last)
+    event phase  EVENT_PHASE_DIM   (multi-stage event phase one-hot over the engine's
+                 event_data counter; a raw passthrough unit block like screen_onehot,
+                 appended after the Neow-event blocks)
     map lookahead MAP_LOOKAHEAD_DIM   (DAG aggregates toward the act boss: a global
-                 summary + per-column forward cone; raw passthrough block, appended last)
+                 summary + per-column forward cone; a raw passthrough block, appended
+                 last so the prior layout stays a clean prefix)
 """
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ from torch import Tensor, nn
 from sts_rl.interface import (
     CHOICE_MAX,
     ENEMY_SCALAR_DIM,
+    EVENT_PHASE_DIM,
     HAND_FEAT_DIM,
     HAND_MAX,
     KEYS_ACT_DIM,
@@ -193,7 +198,10 @@ class ObsFeatureEncoder(nn.Module):
         event_onehot = N_EVENT_IDS
         neow_bonus = MAX_NEOW_OPTIONS * N_NEOW_BONUS
         neow_drawback = MAX_NEOW_OPTIONS * N_NEOW_DRAWBACK
-        # Map lookahead aggregates, appended LAST (after the Neow-event blocks) as a raw
+        # Multi-stage event phase one-hot, a raw passthrough unit block appended after
+        # the Neow-event blocks.
+        event_phase = EVENT_PHASE_DIM
+        # Map lookahead aggregates, appended LAST (after the event-phase block) as a raw
         # passthrough block, so the prior layout stays a clean prefix for warm-start.
         map_lookahead = MAP_LOOKAHEAD_DIM
         return (
@@ -219,6 +227,7 @@ class ObsFeatureEncoder(nn.Module):
             + event_onehot
             + neow_bonus
             + neow_drawback
+            + event_phase
             + map_lookahead
         )
 
@@ -394,20 +403,26 @@ class ObsFeatureEncoder(nn.Module):
         neow_bonus = obs["neow_bonus"]
         neow_drawback = obs["neow_drawback"]
 
+        # EVENT PHASE: a raw passthrough unit one-hot block (already coerced to float32
+        # above), appended after the Neow-event blocks. The env one-hots the engine's
+        # event_data phase counter; the encoder only concatenates it (no embedding table).
+        event_phase_onehot = obs["event_phase_onehot"]
+
         # MAP LOOKAHEAD: a raw passthrough block (already coerced to float32 above) of
         # DAG aggregates toward the act boss (the env fills it; the encoder only
-        # concatenates it). Appended LAST, after the Neow-event blocks.
+        # concatenates it). Appended LAST, after the event-phase block.
         map_lookahead = obs["map_lookahead"]
 
         # CAUTION: the reward, card-select, deck, keys/act, shop / boss-relic, Neow-event,
-        # and map-lookahead blocks are appended LAST, in this fixed order (reward cards,
-        # relics, potions, then card_select, the pooled deck, keys/act, then shop cards +
-        # prices, shop relics + prices, shop potions + prices, shop remove cost, the
-        # boss-relic multihot, the Neow-event one-hots: event, bonus, drawback, and
-        # finally the map-lookahead block), so an old checkpoint's trained input columns
-        # stay the leading prefix and migrate_encoder_trunk_input_width widens the trunk
-        # by a clean zero-init suffix. Do NOT insert a block ahead of these or reorder
-        # them, or the migration would silently mismap columns.
+        # event-phase, and map-lookahead blocks are appended LAST, in this fixed order
+        # (reward cards, relics, potions, then card_select, the pooled deck, keys/act,
+        # then shop cards + prices, shop relics + prices, shop potions + prices, shop
+        # remove cost, the boss-relic multihot, the Neow-event one-hots (event, bonus,
+        # drawback), the event-phase one-hot, and finally the map-lookahead block), so an
+        # old checkpoint's trained input columns stay the leading prefix and
+        # migrate_encoder_trunk_input_width widens the trunk by a clean zero-init suffix.
+        # Do NOT insert a block ahead of these or reorder them, or the migration would
+        # silently mismap columns.
         return torch.cat(
             [
                 hand,
@@ -432,6 +447,7 @@ class ObsFeatureEncoder(nn.Module):
                 event_onehot,
                 neow_bonus,
                 neow_drawback,
+                event_phase_onehot,
                 map_lookahead,
             ],
             dim=1,

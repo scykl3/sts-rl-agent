@@ -40,6 +40,7 @@ from sts_rl.agent.train import (
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
     ACTION_DIM,
+    EVENT_PHASE_DIM,
     INTERFACE_VERSION,
     KEYS_ACT_DIM,
     MAP_LOOKAHEAD_DIM,
@@ -657,9 +658,13 @@ SHIPPED_0_7_0_FEATURE_DIM = 4949
 # prior that must widen to the Neow-event layout. Fixed history.
 SHIPPED_0_8_0_FEATURE_DIM = 5571
 
-# The shipped 0.9.0 feature width (0.8.0 + Neow-event one-hot blocks), now a recorded
-# prior that must widen to the map-lookahead layout. Fixed history.
+# The shipped 0.9.0 feature width (0.8.0 + Neow-event blocks), now a recorded prior that
+# must widen to the event-phase (and later) layout. Fixed history.
 SHIPPED_0_9_0_FEATURE_DIM = 5736
+
+# The shipped 0.10.0 feature width (0.9.0 + event-phase block), now a recorded prior that
+# must widen to the map-lookahead layout. Fixed history.
+SHIPPED_0_10_0_FEATURE_DIM = 5744
 
 
 def _shop_boss_block_width() -> int:
@@ -772,15 +777,18 @@ def test_shipped_5571_prior_widens_to_neow_event_layout() -> None:
 
     A warm-start checkpoint trained at the shipped 5571-wide encoder (shop + boss-relic
     blocks, before the Neow-event screen blocks) must widen to the current layout: its
-    trained columns preserved as the leading prefix, the appended event / Neow-bonus /
-    Neow-drawback one-hot columns zero-initialized. The target width is checked
+    trained columns preserved as the leading prefix, every later-appended column (the
+    event / Neow-bonus / Neow-drawback one-hots that made the 0.9.0 width, then the
+    event-phase one-hot) zero-initialized. The intermediate 0.9.0 relationship is checked
     symbolically against the interface / encoder constants, never a hardcoded literal.
     """
     assert SHIPPED_0_8_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
     target = _current_feature_dim()
-    # New width = 5571 + the Neow-event one-hot blocks + the map-lookahead block,
-    # symbolic (5571 predates both appends, so it widens across both).
-    assert target == SHIPPED_0_8_0_FEATURE_DIM + _neow_event_block_width() + MAP_LOOKAHEAD_DIM
+    # 5571 + the Neow-event blocks was the 0.9.0 width (5736), itself now a recorded
+    # prior; the event-phase block was appended after it. Derived symbolically, never a
+    # hardcoded literal.
+    assert SHIPPED_0_8_0_FEATURE_DIM + _neow_event_block_width() == SHIPPED_0_9_0_FEATURE_DIM
+    assert SHIPPED_0_9_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
 
     old_feat = SHIPPED_0_8_0_FEATURE_DIM
     assert old_feat < target
@@ -798,21 +806,52 @@ def test_shipped_5571_prior_widens_to_neow_event_layout() -> None:
     assert torch.equal(model.encoder.trunk[0].weight, new_weight)
 
 
-def test_shipped_5736_prior_widens_to_map_lookahead_layout() -> None:
+def test_shipped_5736_prior_widens_to_current_layout() -> None:
     """The 0.9.0 width (5736) is a recorded prior and widens cleanly to the current dim.
 
-    A warm-start checkpoint trained at the shipped 5736-wide encoder (through the
-    Neow-event blocks, before the map-lookahead block) must widen to the current
-    layout: its trained columns preserved as the leading prefix, the appended
-    map-lookahead columns zero-initialized. The target width is checked symbolically
-    against the interface / encoder constants, never a hardcoded literal.
+    A warm-start checkpoint trained at the shipped 5736-wide encoder (Neow-event blocks,
+    before both the event-phase and map-lookahead blocks) must widen to the current
+    layout across both appends: its trained columns preserved as the leading prefix, the
+    appended event-phase and map-lookahead columns zero-initialized. The target width is
+    checked symbolically against the interface constants, never a hardcoded literal.
     """
     assert SHIPPED_0_9_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
     target = _current_feature_dim()
-    # New width = 5736 + the appended map-lookahead block, symbolic.
-    assert target == SHIPPED_0_9_0_FEATURE_DIM + MAP_LOOKAHEAD_DIM
+    # New width = 5736 + the event-phase block + the map-lookahead block, symbolic
+    # (5736 predates both appends, so it widens across both).
+    assert target == SHIPPED_0_9_0_FEATURE_DIM + EVENT_PHASE_DIM + MAP_LOOKAHEAD_DIM
 
     old_feat = SHIPPED_0_9_0_FEATURE_DIM
+    assert old_feat < target
+    state = _build_current_state_dict()
+    old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
+    state[TRUNK_INPUT_WEIGHT_KEY] = old_weight
+
+    migrated = migrate_encoder_trunk_input_width(state, target)
+    new_weight = migrated[TRUNK_INPUT_WEIGHT_KEY]
+    assert new_weight.shape == (HIDDEN, target)
+    assert torch.equal(new_weight[:, :old_feat], old_weight)  # prefix preserved
+    assert torch.count_nonzero(new_weight[:, old_feat:]) == 0  # appended suffix zero
+    model = ActorCritic(hidden_dim=HIDDEN)
+    model.load_state_dict(migrated, strict=True)
+    assert torch.equal(model.encoder.trunk[0].weight, new_weight)
+
+
+def test_shipped_5744_prior_widens_to_map_lookahead_layout() -> None:
+    """The 0.10.0 width (5744) is a recorded prior and widens cleanly to the current dim.
+
+    A warm-start checkpoint trained at the shipped 5744-wide encoder (through the
+    event-phase block, before the map-lookahead block) must widen to the current layout:
+    its trained columns preserved as the leading prefix, the appended map-lookahead
+    columns zero-initialized. The target width is checked symbolically against the
+    interface constants, never a hardcoded literal.
+    """
+    assert SHIPPED_0_10_0_FEATURE_DIM in _KNOWN_PRIOR_FEATURE_DIMS
+    target = _current_feature_dim()
+    # New width = 5744 + the appended map-lookahead block, symbolic.
+    assert target == SHIPPED_0_10_0_FEATURE_DIM + MAP_LOOKAHEAD_DIM
+
+    old_feat = SHIPPED_0_10_0_FEATURE_DIM
     assert old_feat < target
     state = _build_current_state_dict()
     old_weight = torch.arange(HIDDEN * old_feat, dtype=torch.float32).reshape(HIDDEN, old_feat)
