@@ -1,10 +1,17 @@
-"""Actor-critic wrapper composing the shared trunk with both heads.
+"""Actor-critic wrapper composing the shared encoder with both heads.
 
-Ties the head-agnostic :class:`~sts_rl.agent.encoder.ObsFeatureEncoder` trunk to
-its two consumers - :class:`~sts_rl.agent.policy_head.MaskedPolicyHead` (actor)
-and :class:`~sts_rl.agent.value_head.ValueHead` (critic) - behind one module.
-The point of the shared trunk is that a single encode feeds both heads, so this
-wrapper encodes exactly once per call and hands the same feature vector to each.
+Ties the head-agnostic :class:`~sts_rl.agent.encoder.ObsFeatureEncoder`
+transformer to its two consumers - :class:`~sts_rl.agent.policy_head.PointerPolicyHead`
+(actor) and :class:`~sts_rl.agent.value_head.ValueHead` (critic) - behind one
+module. The point of the shared encoder is that a single encode feeds both
+heads, so this wrapper encodes exactly once per call and shares that one encode
+across the two heads.
+
+The encoder returns ``(per_token, pooled_cls, key_padding_mask)``. The pointer
+policy head reads the per-token embeddings and the padding mask (it scores each
+per-entity action against its entity token); the value head reads the pooled
+``CLS`` context. ``get_value`` runs only the value head, so it skips the pointer
+head entirely.
 
 No env interaction, rollout buffer, optimizer, or training loop lives here: this
 is only the network. The PPO caller owns those and decides gradient context -
@@ -17,24 +24,28 @@ from __future__ import annotations
 from torch import Tensor, nn
 
 from sts_rl.agent.encoder import HIDDEN_DIM, ObsFeatureEncoder
-from sts_rl.agent.policy_head import MaskedPolicyHead
+from sts_rl.agent.policy_head import PointerPolicyHead
 from sts_rl.agent.value_head import ValueHead
 
 
 class ActorCritic(nn.Module):
-    """Shared-trunk actor-critic: one encoder feeding a policy and a value head.
+    """Shared-encoder actor-critic: one encoder feeding a policy and a value head.
 
     ``act`` is the rollout path (sample or greedy) and ``evaluate_actions`` is
     the PPO update path (recompute log-prob/entropy/value with gradients). Both
-    encode once and share the features across the two heads.
+    encode once and share that single encode across the two heads.
     """
 
     def __init__(self, hidden_dim: int = HIDDEN_DIM) -> None:
         super().__init__()
-        self.encoder = ObsFeatureEncoder(hidden_dim)
+        # hidden_dim is the transformer d_model; the constructor name is kept so
+        # the training config (TrainConfig.hidden_dim) and saved checkpoints keep
+        # a single width setting.
+        self.encoder = ObsFeatureEncoder(d_model=hidden_dim)
         # Wire each head's input width from the encoder's output_dim (not a
-        # literal), so a trunk-width change propagates without a mismatch.
-        self.policy = MaskedPolicyHead(input_dim=self.encoder.output_dim)
+        # literal), so a width change propagates without a mismatch. The pointer
+        # head reads the per-token embeddings; the value head reads pooled CLS.
+        self.policy = PointerPolicyHead(input_dim=self.encoder.output_dim)
         self.value = ValueHead(input_dim=self.encoder.output_dim)
 
     def act(
@@ -49,11 +60,14 @@ class ActorCritic(nn.Module):
         wrapped in ``no_grad`` here: the rollout caller owns the gradient
         context (it wraps collection in ``no_grad``; the update path needs grad).
         """
-        # Encode ONCE and share features across both heads - the whole point of
-        # the trunk is no double-encoding per step.
-        features = self.encoder(obs)
-        action, log_prob, entropy = self.policy.act(features, mask, deterministic)
-        value = self.value(features)
+        # Encode ONCE and share the single encode across both heads - the whole
+        # point of the shared encoder is no double-encoding per step. The pointer
+        # head reads the per-token embeddings + padding mask; value reads pooled CLS.
+        per_token, pooled_cls, key_padding_mask = self.encoder(obs)
+        action, log_prob, entropy = self.policy.act(
+            per_token, key_padding_mask, mask, deterministic
+        )
+        value = self.value(pooled_cls)
         return action, log_prob, entropy, value
 
     def evaluate_actions(
@@ -67,10 +81,10 @@ class ActorCritic(nn.Module):
         Gradients flow through the shared encoder and both heads. ``actions`` is
         ``(B,)``; each returned tensor is ``(B,)``.
         """
-        # Single encode shared by both heads (same trunk as the rollout path).
-        features = self.encoder(obs)
-        log_prob, entropy = self.policy.evaluate_actions(features, mask, actions)
-        value = self.value(features)
+        # Single encode shared by both heads (same encoder as the rollout path).
+        per_token, pooled_cls, key_padding_mask = self.encoder(obs)
+        log_prob, entropy = self.policy.evaluate_actions(per_token, key_padding_mask, mask, actions)
+        value = self.value(pooled_cls)
         return log_prob, entropy, value
 
     def get_value(self, obs: dict[str, Tensor]) -> Tensor:
@@ -81,4 +95,5 @@ class ActorCritic(nn.Module):
         is taken there, so running the policy head or building an action mask
         would be wasted work.
         """
-        return self.value(self.encoder(obs))
+        _per_token, pooled_cls, _mask = self.encoder(obs)
+        return self.value(pooled_cls)
