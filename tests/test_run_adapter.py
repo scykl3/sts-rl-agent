@@ -21,7 +21,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
 
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.actions import decode_action
-from sts_rl.env.reward import RewardConfig, beta
+from sts_rl.env.reward import RewardConfig, state_potentials
 from sts_rl.env.run import overworld_actions
 from sts_rl.env.run_actions import decode_overworld_action
 from sts_rl.env.run_adapter import _MAX_SEED, StsRunEnv
@@ -31,6 +31,7 @@ from sts_rl.interface import (
     INFO_KEYS_ALWAYS,
     INFO_KEYS_TERMINAL,
     INTERFACE_VERSION,
+    SHAPING_TERMS,
     TERMINAL_LOSS_REWARD,
     TERMINAL_WIN_REWARD,
     InterfaceError,
@@ -65,14 +66,12 @@ def _drive(env: StsRunEnv, first_info: dict, policy) -> list[dict]:
 
     Each record captures the state the action was taken in and the step's outcome:
     ``acted_in_combat``, ``reward``, ``terminated``, ``truncated``, ``shaping`` (the
-    step's ``shaping_terms``), ``info``, and ``t_before`` (the anneal clock read
-    before the step, for reconstructing ``beta(t)``).
+    step's ``shaping_terms``), and ``info``.
     """
     info = first_info
     trace: list[dict] = []
     for _ in range(MAX_DRIVE_STEPS):
         acted_in_combat = info["screen"] == _COMBAT
-        t_before = env._global_step
         _, reward, terminated, truncated, info = env.step(policy(info))
         trace.append(
             {
@@ -82,7 +81,6 @@ def _drive(env: StsRunEnv, first_info: dict, policy) -> list[dict]:
                 "truncated": truncated,
                 "shaping": info["shaping_terms"],
                 "info": info,
-                "t_before": t_before,
             }
         )
         if terminated or truncated:
@@ -253,41 +251,44 @@ def test_scripted_run_reaches_terminal_loss() -> None:
     env.close()
 
 
-def test_reward_equals_terminal_plus_annealed_shaping() -> None:
-    """On every non-terminal step, reward == beta(t) * sum(info['shaping_terms'])."""
-    cfg = RewardConfig()
-    env = StsRunEnv(reward_config=cfg)
+def test_reward_equals_terminal_plus_potential_shaping() -> None:
+    """On every non-terminal step, reward == sum(info['shaping_terms']).
+
+    The shaping is the potential delta gamma * Phi(s') - Phi(s), un-annealed, so a
+    non-terminal step's reward is exactly that sum (no terminal component).
+    """
+    env = StsRunEnv()
     _, info = env.reset(seed=REGRESSION_SEED)
     for _ in range(MAX_DRIVE_STEPS):
-        t_before = env._global_step
         _, reward, terminated, truncated, info = env.step(_greedy_action(info))
         if terminated or truncated:
             break
-        expected = beta(t_before, cfg) * sum(info["shaping_terms"].values())
-        assert reward == pytest.approx(expected)
+        assert reward == pytest.approx(sum(info["shaping_terms"].values()))
     env.close()
 
 
-def test_shaping_terms_are_mode_appropriate() -> None:
-    """Combat steps carry only combat shaping; overworld steps only run shaping."""
+def test_mid_combat_steps_have_no_progress_shaping() -> None:
+    """A step that both starts and ends inside a combat carries no floor/act shaping.
+
+    The run-level floor and act potentials are constant while a fight is live, and
+    gamma is 1.0 by default, so their potential delta is exactly 0 on a mid-combat
+    step. (The act-boss-winning step ends in the overworld, so it is excluded and
+    may credit boss_kill.)
+    """
     env = StsRunEnv()
     _, info = env.reset(seed=REGRESSION_SEED)
-    saw_combat_step = saw_overworld_step = False
+    saw_mid_combat = False
     for _ in range(MAX_DRIVE_STEPS):
         acted_in_combat = info["screen"] == _COMBAT
         _, _, terminated, truncated, info = env.step(_greedy_action(info))
-        terms = info["shaping_terms"]
-        if acted_in_combat:
-            saw_combat_step = True
-            assert terms["floor_progress"] == 0.0
-            assert terms["boss_kill"] == 0.0
-        else:
-            saw_overworld_step = True
-            assert terms["enemy_hp_removed"] == 0.0
-            assert terms["damage_taken"] == 0.0
+        stayed_in_combat = acted_in_combat and info["screen"] == _COMBAT
+        if stayed_in_combat and not (terminated or truncated):
+            saw_mid_combat = True
+            assert info["shaping_terms"]["floor_progress"] == 0.0
+            assert info["shaping_terms"]["boss_kill"] == 0.0
         if terminated or truncated:
             break
-    assert saw_combat_step and saw_overworld_step
+    assert saw_mid_combat  # the drive spent at least one step inside a fight
     env.close()
 
 
@@ -393,32 +394,29 @@ def test_invalid_render_mode_rejected() -> None:
         StsRunEnv(render_mode="rgb_array")
 
 
-def test_run_shaping_credited_exactly_once_across_combats() -> None:
-    """Floor / boss shaping is credited once per floor / act gained, never on combat.
+def test_run_potential_shaping_telescopes_per_term() -> None:
+    """Each term's summed shaping over a full drive telescopes to -Phi_term(s_0).
 
-    The run-shaping baseline persists across an intervening combat and updates only
-    on overworld steps, so the summed floor_progress / boss_kill contributions
-    telescope to the observed floor / act delta - no double count at the boundary,
-    none missed. Combat steps contribute zero to either term.
+    Potential-based shaping is policy-invariant: with gamma = 1 (the default) the
+    undiscounted sum of a term's per-step delta over a trajectory ending at a
+    terminal (Phi := 0 there) is Phi_term(terminal) - Phi_term(s_0) = -Phi_term(s_0),
+    independent of the path. This is the potential analogue of "credited exactly
+    once" and holds across the intervening combats: floor / act progress rewarded
+    along the way is returned at the terminal.
     """
     cfg = RewardConfig()
-    env = StsRunEnv(reward_config=cfg)
+    env = StsRunEnv(reward_config=cfg)  # gamma defaults to 1.0
     _, info0 = env.reset(seed=ACT_CROSSING_SEED)
-    init_floor, init_act = info0["floor"], info0["act"]
+    phi0 = state_potentials(cfg, run=info0["run"])  # overworld start: no combat term
     trace = _drive(env, info0, _greedy_action)
-    final = trace[-1]["info"]
 
-    floor_credit = sum(rec["shaping"]["floor_progress"] for rec in trace)
-    boss_credit = sum(rec["shaping"]["boss_kill"] for rec in trace)
-    assert floor_credit == pytest.approx(cfg.floor_progress * (final["floor"] - init_floor))
-    assert boss_credit == pytest.approx(cfg.boss_kill * (final["act"] - init_act))
-    # Non-vacuous: this drive actually cleared an act boss, so boss_kill fired.
-    assert final["act"] > init_act
-    # No run-shaping is ever credited on a combat step (that is combat shaping's job).
-    for rec in trace:
-        if rec["acted_in_combat"]:
-            assert rec["shaping"]["floor_progress"] == 0.0
-            assert rec["shaping"]["boss_kill"] == 0.0
+    assert trace[-1]["terminated"] or trace[-1]["truncated"]  # Phi was cashed out
+    for term in SHAPING_TERMS:
+        total = sum(rec["shaping"][term] for rec in trace)
+        assert total == pytest.approx(-phi0[term], abs=1e-6)
+    # Non-vacuous: the run starts in act 1, so the boss potential at s_0 is nonzero
+    # and the boss term's total telescopes to a nonzero value, not a trivial 0.
+    assert phi0["boss_kill"] != 0.0
     env.close()
 
 
@@ -435,7 +433,7 @@ def test_terminal_reward_added_once_on_terminal_step() -> None:
 
     assert trace[-1]["terminated"] and not trace[-1]["truncated"]
     for rec in trace:
-        shaping = beta(rec["t_before"], cfg) * sum(rec["shaping"].values())
+        shaping = sum(rec["shaping"].values())
         terminal_component = rec["reward"] - shaping
         if rec is trace[-1]:
             assert terminal_component == pytest.approx(TERMINAL_LOSS_REWARD)
@@ -461,7 +459,7 @@ def test_reference_driver_wins_full_run_end_to_end() -> None:
     driver = _ReferenceDriver()
     obs, info = env.reset(seed=FULL_WIN_SEED)
 
-    trace: list[tuple[int, float, dict[str, float]]] = []
+    trace: list[tuple[float, dict[str, float]]] = []
     terminated = truncated = False
     for _ in range(MAX_DRIVE_STEPS):
         # Every step is a genuine decision with a valid observation, and the
@@ -469,11 +467,10 @@ def test_reference_driver_wins_full_run_end_to_end() -> None:
         # never hits an unrepresentable decision.
         assert env.observation_space.contains(obs)
         assert info["action_mask"].any()
-        t_before = env._global_step
         idx = driver.action(env, info)
         assert idx is not None, "engine pick has no interface index on this decision"
         obs, reward, terminated, truncated, info = env.step(idx)
-        trace.append((t_before, reward, info["shaping_terms"]))
+        trace.append((reward, info["shaping_terms"]))
         if terminated or truncated:
             break
     else:
@@ -489,12 +486,12 @@ def test_reference_driver_wins_full_run_end_to_end() -> None:
     assert info["episode"]["l"] == len(trace)
     # Cumulative episode return equals the summed per-step rewards (guards the
     # env's _ep_return accumulation, not just the per-step reward formula).
-    assert info["episode"]["r"] == pytest.approx(sum(reward for _, reward, _ in trace))
+    assert info["episode"]["r"] == pytest.approx(sum(reward for reward, _ in trace))
     # The terminal +1 is credited exactly once, on the terminal step; every prior
-    # step's reward is pure annealed shaping (the win-side mirror of
+    # step's reward is pure potential shaping (the win-side mirror of
     # test_terminal_reward_added_once_on_terminal_step).
-    for k, (t_before, reward, shaping) in enumerate(trace):
-        terminal_component = reward - beta(t_before, cfg) * sum(shaping.values())
+    for k, (reward, shaping) in enumerate(trace):
+        terminal_component = reward - sum(shaping.values())
         expected = TERMINAL_WIN_REWARD if k == len(trace) - 1 else 0.0
         assert terminal_component == pytest.approx(expected)
     env.close()

@@ -82,9 +82,10 @@ class _StubRunEnv:
     serves the provenance ``info`` keys ``main()`` reads off the initial reset, so
     ``main()`` runs the whole warm-start wiring without a native engine build."""
 
-    def __init__(self, *, ascension: int, max_episode_steps: int) -> None:
+    def __init__(self, *, ascension: int, max_episode_steps: int, gamma: float) -> None:
         self.ascension = ascension
         self.max_episode_steps = max_episode_steps
+        self.gamma = gamma
 
     def reset(
         self, *, seed: int | None = None, options: object = None

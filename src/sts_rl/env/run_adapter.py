@@ -17,12 +17,12 @@ action space, and on combat end syncs the result back
 observation encoder serves both views: combat state when a battle is live,
 ``map_context`` otherwise (see :func:`sts_rl.env.observation.encode_observation`).
 
-Reward is the terminal run signal plus annealed per-step shaping:
-``reward = terminal + beta(t) * sum(shaping_terms)``, where ``terminal`` is
-``+1`` on run victory / ``-1`` on death and ``t`` is the cumulative step count.
-A combat step contributes combat shaping (enemy HP removed, damage taken); an
-overworld step contributes run shaping (floor progress, boss kill). See
-:mod:`sts_rl.env.reward`.
+Reward is the terminal run signal plus potential-based per-step shaping:
+``reward = terminal + (gamma * Phi(s') - Phi(s))``, where ``terminal`` is ``+1``
+on run victory / ``-1`` on death and ``gamma`` is the trainer's discount. The
+potential ``Phi`` combines a run-level part (player HP, floor, act - continuous
+across the whole episode) and a combat-local part (enemy HP - live only during a
+fight, so it cashes out at combat end). See :mod:`sts_rl.env.reward`.
 
 Two auto-advance behaviors keep the agent on genuine decisions and off states it
 cannot represent:
@@ -55,14 +55,13 @@ from sts_rl.env.actions import auto_resolve, build_mask, decode_action
 from sts_rl.env.engine import CombatSnapshot, engine_commit, read_combat
 from sts_rl.env.observation import encode_observation
 from sts_rl.env.reward import (
+    DEFAULT_SHAPING_GAMMA,
     RewardConfig,
-    combat_shaping_terms,
-    run_shaping_terms,
-    shaping_reward,
+    shaping_delta,
+    state_potentials,
     zero_shaping_terms,
 )
 from sts_rl.env.run import (
-    RunSnapshot,
     execute_overworld_action,
     is_run_over,
     overworld_actions,
@@ -113,8 +112,12 @@ class StsRunEnv(gym.Env):
         strict: if ``True``, an illegal action passed to :meth:`step` raises
             :class:`~sts_rl.interface.InterfaceError` instead of only flagging
             ``invalid_action`` in ``info`` and leaving the state unchanged.
-        reward_config: shaping coefficients and anneal schedule; defaults to
+        reward_config: potential weights for the shaping terms; defaults to
             :class:`~sts_rl.env.reward.RewardConfig`.
+        gamma: discount for the potential-based shaping term
+            ``gamma * Phi(s') - Phi(s)``. Pass the trainer's GAE discount so the
+            shaping telescopes against the same return; defaults to
+            :data:`~sts_rl.env.reward.DEFAULT_SHAPING_GAMMA`.
         render_mode: one of ``None``, ``"ansi"``, ``"human"``.
     """
 
@@ -127,6 +130,7 @@ class StsRunEnv(gym.Env):
         max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
         strict: bool = False,
         reward_config: RewardConfig | None = None,
+        gamma: float = DEFAULT_SHAPING_GAMMA,
         render_mode: str | None = None,
     ) -> None:
         if max_episode_steps < 1:
@@ -145,12 +149,13 @@ class StsRunEnv(gym.Env):
         self._max_episode_steps = max_episode_steps
         self._strict = strict
         self._reward_config = reward_config if reward_config is not None else RewardConfig()
+        self._gamma = float(gamma)
         # Cached once; the pinned commit does not change during a run.
         self._engine_commit = engine_commit()
 
-        # Cumulative env steps; drives the shaping anneal beta(t). Not reset
-        # between episodes (t is training progress, not within-episode time). See
-        # StsEnv.set_global_step for the parallel-worker rationale.
+        # Cumulative env-step counter, exposed via set_global_step for diagnostics
+        # and back-compat. Potential-based shaping is un-annealed, so it no longer
+        # affects reward. See StsEnv.set_global_step.
         self._global_step = 0
 
         # Per-episode state, populated by reset() before use.
@@ -161,12 +166,12 @@ class StsRunEnv(gym.Env):
         self._ep_return = 0.0
         self._episode_seed: int | None = None
         self._mask = np.zeros(ACTION_DIM, dtype=np.bool_)
-        # Baselines for per-step shaping deltas. The run snapshot persists across
-        # the whole episode and updates only on overworld steps, so run shaping
-        # spans any intervening combat; the combat snapshot is (re)set on each
-        # combat entry and updates on combat steps.
-        self._prev_run: RunSnapshot | None = None
-        self._prev_combat: CombatSnapshot | None = None
+        # Shaping potential Phi(s) of the state before the current step, per term,
+        # for the potential-based delta gamma * Phi(s') - Phi(s). One baseline for
+        # the whole episode: the run-level terms (player HP, floor, act) persist
+        # across combats, while the combat-local enemy term is present only while a
+        # fight is live and is 0 otherwise.
+        self._prev_potentials: dict[str, float] = zero_shaping_terms()
 
     # -- Gymnasium API ------------------------------------------------------
 
@@ -180,12 +185,10 @@ class StsRunEnv(gym.Env):
         self._mode = _MODE_OVERWORLD
         self._steps = 0
         self._ep_return = 0.0
-        # Combat baseline is (re)set on each combat entry; clear it so a fresh
-        # episode carries no stale snapshot from the previous run.
-        self._prev_combat = None
-        # Advance from the run's first raw state to the first genuine decision.
+        # Advance from the run's first raw state to the first genuine decision, then
+        # baseline the shaping potential at that state.
         self._settle()
-        self._prev_run = read_run(self._gc)
+        self._prev_potentials = self._current_potentials()
         return self._observation(), self._build_info(
             invalid_action=False, shaping_terms=zero_shaping_terms()
         )
@@ -213,8 +216,9 @@ class StsRunEnv(gym.Env):
         self._steps += 1
         if not legal:
             # Do not touch the engine: executing an invalid action is unsafe. The
-            # state is unchanged, so no shaping delta and no reward accrue, but the
-            # step still counts as one interaction and advances the anneal clock.
+            # state is unchanged, so Phi is unchanged and no shaping or reward
+            # accrues (the previous potential stays the baseline); the step still
+            # counts as one interaction.
             self._global_step += 1
             truncated = self._steps >= self._max_episode_steps
             info = self._build_info(invalid_action=True, shaping_terms=zero_shaping_terms())
@@ -223,12 +227,12 @@ class StsRunEnv(gym.Env):
             return self._observation(), 0.0, False, truncated, info
 
         assert engine_action is not None  # legal implies a mapped, valid action
-        # Route by the mode the action was taken in; the handlers settle to the
-        # next decision, which may change self._mode / self._bc.
+        # Route by the mode the action was taken in; the handlers execute the move
+        # and settle to the next decision, which may change self._mode / self._bc.
         if in_combat:
-            shaping_terms = self._step_combat(engine_action)
+            self._step_combat(engine_action)
         else:
-            shaping_terms = self._step_overworld(engine_action)
+            self._step_overworld(engine_action)
 
         terminated = is_run_over(self._gc)
         won = run_won(self._gc)
@@ -237,9 +241,19 @@ class StsRunEnv(gym.Env):
             terminal = TERMINAL_WIN_REWARD if won else TERMINAL_LOSS_REWARD
         truncated = (not terminated) and self._steps >= self._max_episode_steps
 
-        # beta is indexed by steps already taken, so the first-ever step sees
-        # beta(0); the clock advances after the reward is computed.
-        reward = terminal + shaping_reward(shaping_terms, self._global_step, self._reward_config)
+        # Potential-based shaping F = gamma * Phi(s') - Phi(s). Phi(s') := 0 on BOTH
+        # a terminated and a truncated step, so every episode's shaping telescopes to
+        # -Phi(s_0) regardless of where it ends - policy-invariant. Zeroing on
+        # truncation (rather than emitting the real gamma * Phi(s')) is deliberate: on
+        # truncation the collector bootstraps V of the post-reset observation, not the
+        # truncated state's true successor (see rollout_collector), and this matches
+        # the DeckEconomyShapingWrapper convention. Un-annealed.
+        curr_potentials = (
+            zero_shaping_terms() if terminated or truncated else self._current_potentials()
+        )
+        shaping_terms = shaping_delta(self._prev_potentials, curr_potentials, self._gamma)
+        reward = terminal + sum(shaping_terms.values())
+        self._prev_potentials = curr_potentials
         self._global_step += 1
         self._ep_return += reward
 
@@ -262,12 +276,13 @@ class StsRunEnv(gym.Env):
         return [actual_seed]
 
     def set_global_step(self, t: int) -> None:
-        """Set the shaping anneal clock to the true global env-step count.
+        """Set the cumulative env-step counter to the shared global step.
 
-        Mirrors :meth:`sts_rl.env.adapter.StsEnv.set_global_step`: under parallel
-        workers the training loop should broadcast the shared global step so the
-        anneal ``beta(t)`` stays on its intended horizon. Subsequent steps advance
-        from the value set here.
+        Mirrors :meth:`sts_rl.env.adapter.StsEnv.set_global_step`: potential-based
+        shaping is un-annealed, so this no longer affects reward. It is retained
+        for diagnostics and for the vectorized runner / shaping wrappers that
+        broadcast a shared step count. Subsequent steps advance from the value set
+        here; negative values are rejected.
         """
         if t < 0:
             raise InterfaceError(f"global_step must be >= 0, got {t}")
@@ -290,21 +305,17 @@ class StsRunEnv(gym.Env):
 
     # -- Internals ----------------------------------------------------------
 
-    def _step_combat(self, engine_action: Any) -> dict[str, float]:
+    def _step_combat(self, engine_action: Any) -> None:
         """Execute one combat action, resolve, and settle across a combat end.
 
-        Returns the combat shaping terms for this step. On combat end, syncs the
-        result back to the overworld and settles to the next decision or terminal;
-        otherwise refreshes the combat mask and advances the combat baseline.
+        On combat end, syncs the result back to the overworld and settles to the
+        next decision or terminal; otherwise refreshes the combat mask. The shaping
+        reward is computed by :meth:`step` from the settled state's potential.
         """
-        prev = self._prev_combat
-        assert prev is not None  # combat mode always has a combat baseline
         engine_action.execute(self._bc)
         # Advance past engine-driven states the agent cannot represent (e.g. a
         # multi-select confirm the played card triggered), then read the outcome.
         auto_resolve(self._bc)
-        curr = read_combat(self._bc)
-        terms = combat_shaping_terms(prev, curr, self._reward_config)
 
         if self._bc.outcome != sts.BattleOutcome.UNDECIDED:
             # Combat over: write HP / gold / deck / relics back and hand control to
@@ -317,24 +328,30 @@ class StsRunEnv(gym.Env):
             self._mode = _MODE_COMBAT
             self._mask = build_mask(self._bc)
             assert_valid_mask(self._mask)
-            self._prev_combat = curr
-        return terms
 
-    def _step_overworld(self, engine_action: Any) -> dict[str, float]:
-        """Execute one overworld action, settle, and return run shaping terms.
+    def _step_overworld(self, engine_action: Any) -> None:
+        """Execute one overworld action and settle to the next decision.
 
-        Run shaping compares against the persisted run baseline (last overworld
-        step), so floor / act progress is credited even when a combat intervened
-        between the two overworld decisions.
+        The shaping reward is computed by :meth:`step` from the settled state's
+        potential, which spans any combat that intervened between two overworld
+        decisions (the run-level terms persist across the whole episode).
         """
-        prev = self._prev_run
-        assert prev is not None  # reset() populates the run baseline before any step
         execute_overworld_action(self._gc, engine_action)
         self._settle()
-        curr = read_run(self._gc)
-        terms = run_shaping_terms(prev, curr, self._reward_config)
-        self._prev_run = curr
-        return terms
+
+    def _current_potentials(self) -> dict[str, float]:
+        """Per-term shaping potential Phi for the current settled decision state.
+
+        Uses the live combat view for the enemy and player-HP terms while a fight
+        is active (the run view's HP is stale until combat syncs back), and the run
+        view otherwise; floor / act always come from the run view.
+        """
+        run_snapshot = read_run(self._gc)
+        if self._mode == _MODE_COMBAT and self._bc is not None:
+            return state_potentials(
+                self._reward_config, combat=read_combat(self._bc), run=run_snapshot
+            )
+        return state_potentials(self._reward_config, run=run_snapshot)
 
     def _settle(self) -> None:
         """Advance the engine to the next agent decision, or a terminal outcome.
@@ -343,7 +360,7 @@ class StsRunEnv(gym.Env):
         continues (screens with exactly one legal engine action) and states with
         no representable move, until it reaches either a terminal run outcome or a
         decision point with a non-empty representable mask. Sets ``self._mode``,
-        ``self._bc``, ``self._mask``, and, on combat entry, the combat baseline.
+        ``self._bc``, and ``self._mask``.
         """
         for _ in range(_SETTLE_CAP):
             if is_run_over(self._gc):
@@ -365,7 +382,6 @@ class StsRunEnv(gym.Env):
                 self._mode = _MODE_COMBAT
                 self._mask = build_mask(self._bc)
                 assert_valid_mask(self._mask)
-                self._prev_combat = read_combat(self._bc)
                 return
 
             # Overworld: clear any stale combat handle, then advance past screens

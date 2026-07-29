@@ -268,15 +268,19 @@ def main() -> None:
     # instance for greedy holdout eval - both the in-loop periodic eval and the
     # final eval - so evaluate() resetting per seed never disturbs the training
     # collector's rollout stream.
+    # gamma is single-sourced from args.gamma (the same discount GAE uses) so the
+    # env's potential-based shaping telescopes against the return.
     env = StsEnv(
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
         encounters=encounters,
+        gamma=args.gamma,
     )
     eval_env = StsEnv(
         ascension=args.ascension,
         max_episode_steps=args.max_episode_steps,
         encounters=encounters,
+        gamma=args.gamma,
     )
 
     # Provenance for reproducibility: engine_commit and interface_version are
