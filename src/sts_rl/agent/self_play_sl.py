@@ -1,30 +1,39 @@
 """Outcome-regression supervised pretraining over self-play run-mode games.
 
-A pre-PPO bootstrap for the policy. It generates self-play full-run episodes with
-an existing (behavior-cloned) policy, labels each decision step by its episode's
-Act-1-clear outcome (reached Act 2 = 1, else 0), and fine-tunes the SAME net so
-each step's CHOSEN action logit regresses toward that 0/1 outcome under a
-``binary_cross_entropy_with_logits`` loss. The resulting checkpoint warm-starts
-PPO (it is saved in the same 3-key format the warm-start path reads).
+A pre-PPO bootstrap for the shared encoder. It generates self-play full-run
+episodes with an existing (behavior-cloned) policy, labels each decision step by
+its episode's Act-1-clear outcome (reached Act 2 = 1, else 0), and fine-tunes the
+SAME net with an AUXILIARY win-probability objective: the shared encoder and the
+value head are trained to predict that 0/1 outcome from the state (the value
+head's scalar output over the pooled CLS context, read as a win-probability logit
+under ``binary_cross_entropy_with_logits``), while the policy (pointer) head is
+FROZEN. The objective never touches the action logits directly; it shapes the
+shared features toward outcome-awareness and leaves the policy head's logit
+mapping intact. The resulting checkpoint warm-starts PPO (saved in the same 3-key
+format the warm-start path reads).
 
 Provides:
 - ``SelfPlaySLDataset``: container for (obs, chosen_action, full ACTION_DIM mask,
-  outcome) tuples with npz persistence and a provenance manifest.
+  outcome) tuples with npz persistence and a provenance manifest. The chosen
+  action and the mask are kept for provenance only; the objective reads neither.
 - ``collect_self_play_dataset``: run-mode episode loop that drives the policy
   STOCHASTICALLY (for action variety), logs every decision step, and backfills
   the per-episode Act-1-clear label onto all of that episode's steps.
-- ``outcome_regression_pretrain``: BCEWithLogits on the chosen-action logit, with
-  a train/val split and early stopping on validation loss.
+- ``outcome_regression_pretrain``: BCEWithLogits between the value head's win-prob
+  logit and the step outcome, training the encoder + value head with the policy
+  head frozen, plus a train/val split and early stopping on validation loss.
 
-Known approximation and degradation risk: BCE on individual chosen logits is a
-crude bootstrap, not a calibrated policy objective, and it can make the policy
-WORSE than the warm start rather than better. The label is the whole run's 0/1
-outcome shared across every decision, so per-decision signal-to-noise is low and
-the dominant gradient pulls chosen logits toward the dataset base rate (flattening
-the BC preferences); there is no baseline or credit assignment (a strong move in a
-lost run is pushed down and a blunder in a won run is pushed up); and only the
-chosen action's logit gets gradient, so un-chosen actions are never calibrated.
-Because a degraded checkpoint would hand PPO a worse start than the input, the
+Why the auxiliary head, not a per-logit regression: an earlier variant regressed
+each step's CHOSEN action logit toward the 0/1 outcome, which collapsed the policy
+(greedy Act-1 clear rate 0.06 -> 0.00). The shared whole-run label gave a low
+per-decision signal-to-noise ratio whose dominant gradient pulled the chosen
+logits toward the dataset base rate, flattening the behavior-cloned preferences.
+Predicting the outcome through a SEPARATE value head instead shapes the shared
+encoder without pinning the action logits, so the policy head's decisions are not
+flattened toward the base rate.
+
+Degradation is still possible - the shared encoder feeds the (frozen) policy head,
+so reshaping its features can still move the greedy action - so the
 ``scripts/train_sl.py`` entry point does NOT save unconditionally: it runs a
 matched-seed paired eval of the fine-tuned net against the input warm-start and
 saves only when the Act-1 clear rate did not regress. PPO refines the surviving
@@ -86,9 +95,10 @@ class SelfPlaySLDataset:
 
     Each sample is (obs_dict, chosen_action, full ACTION_DIM action mask,
     outcome). Stored as stacked numpy arrays for persistence and yielded as torch
-    tensors for training. The mask is the full-space legality at that step; it is
-    kept for provenance and is NOT part of the loss (the outcome-regression loss
-    reads only the chosen action's logit).
+    tensors for training. The chosen action and the mask are kept for provenance
+    and are NOT part of the loss: the auxiliary win-probability objective predicts
+    the outcome from the state (via the value head), so neither the chosen action
+    nor the mask participates.
     """
 
     def __init__(
@@ -310,9 +320,11 @@ def collect_self_play_dataset(
 class _SelfPlaySLTorchDataset(Dataset):
     """Wraps a SelfPlaySLDataset for a DataLoader, yielding (obs, action, outcome).
 
-    The mask is deliberately NOT yielded: the outcome-regression loss reads only
-    the chosen action's logit, so the stored mask (provenance) plays no part in
-    training.
+    The mask is deliberately NOT yielded, and the yielded action is unused by the
+    loss: the auxiliary win-probability objective predicts the outcome from the
+    state alone (via the value head), so neither the mask nor the chosen action
+    plays any part in training. The action is carried only for provenance/symmetry
+    with the stored dataset.
     """
 
     def __init__(self, ds: SelfPlaySLDataset, indices: list[int] | np.ndarray) -> None:
@@ -377,30 +389,39 @@ def outcome_regression_pretrain(
     device: torch.device | str = "cpu",
     patience: int = 8,
 ) -> tuple[Any, SelfPlaySLStats]:
-    """Fine-tune ``model`` so each chosen action's logit regresses toward its outcome.
+    """Fine-tune ``model`` to predict each step's outcome via an auxiliary win-prob head.
 
-    Loss: ``binary_cross_entropy_with_logits`` between the CHOSEN action's raw
-    (pre-mask) logit and that step's 0/1 Act-1-clear outcome. Only the chosen
-    logit participates - the full-space mask is not applied here, since the target
-    is a single logit, not a distribution.
+    Loss: ``binary_cross_entropy_with_logits`` between the VALUE head's scalar
+    output (read as a win-probability logit) over the pooled ``CLS`` context and
+    that step's 0/1 Act-1-clear outcome. The objective never touches the policy
+    (pointer) head: before training, every ``model.policy`` parameter is frozen
+    (``requires_grad = False``) and the optimizer is built over the still-trainable
+    params (the shared encoder + the value head), so the action-logit mapping is
+    left intact. The chosen action and the full-space mask are not used here (kept
+    in the dataset for provenance only).
 
-    Known approximation and degradation risk (see the module docstring): this
-    per-logit BCE is a crude bootstrap, not a calibrated policy objective, and it
-    CAN degrade the warm-started policy rather than improve it - the shared
-    whole-run label gives a low per-decision signal-to-noise ratio that pulls
-    chosen logits toward the base rate, there is no credit assignment, and only
-    the chosen action's logit receives gradient (un-chosen actions are never
-    calibrated). This function only runs the fine-tune; guarding against a
-    regression is the caller's job. ``scripts/train_sl.py`` gates the saved
-    checkpoint on a matched-seed paired eval showing no Act-1-clear regression vs
-    the input warm-start. PPO refines the surviving checkpoint afterward.
+    Why the auxiliary head (see the module docstring): an earlier variant regressed
+    each CHOSEN action logit toward the outcome and collapsed the policy (greedy
+    Act-1 clear 0.06 -> 0.00), because the shared whole-run label pulled the chosen
+    logits toward the dataset base rate and flattened the behavior-cloned
+    preferences. Predicting the outcome through a separate value head instead shapes
+    the shared encoder without pinning the action logits. Degradation is still
+    possible - the (frozen) policy head reads the shared encoder, so reshaping its
+    features can still move the greedy action - so guarding against a regression is
+    the caller's job: ``scripts/train_sl.py`` gates the saved checkpoint on a
+    matched-seed paired eval showing no Act-1-clear regression vs the input
+    warm-start. PPO refines the surviving checkpoint afterward.
 
-    Trains end-to-end (encoder + policy head) from the warm-started weights with a
-    modest LR, mirroring ``bc_pretrain``'s recipe. Early stops on validation loss
-    and restores the best-val-loss weights before returning.
+    Trains the encoder + value head (policy head frozen) from the warm-started
+    weights with a modest LR, mirroring ``bc_pretrain``'s recipe. Early stops on
+    validation loss and restores the best-val-loss weights before returning; the
+    policy-head freeze is scoped to this call and released before returning.
 
     Args:
-        model: ActorCritic with ``encoder`` and ``policy.logits``.
+        model: ActorCritic exposing ``encoder`` (whose forward returns
+            ``(per_token, pooled_cls, key_padding_mask)``), ``value`` (the value
+            head, reused as the win-prob logit over the pooled context), and
+            ``policy`` (frozen here).
         dataset: SelfPlaySLDataset from collect_self_play_dataset.
         epochs: Maximum training epochs.
         lr: Learning rate (modest default to preserve the warm-started features).
@@ -441,9 +462,9 @@ def outcome_regression_pretrain(
         )
 
     # Degenerate-outcome guard: BCE toward a constant target has no discriminative
-    # signal - with every outcome equal, all chosen logits are pushed the same way
-    # and the "bias toward clear-correlated actions" bootstrap is meaningless.
-    # Require both a cleared (1.0) and a non-cleared (0.0) episode in the data.
+    # signal - with every outcome equal, the win-prob head is pushed the same way
+    # for every state and learns nothing separable. Require both a cleared (1.0)
+    # and a non-cleared (0.0) episode in the data.
     unique_outcomes = np.unique(dataset.outcomes)
     if unique_outcomes.size < 2:
         raise ValueError(
@@ -476,7 +497,15 @@ def outcome_regression_pretrain(
         drop_last=False,
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Freeze the policy (pointer) head so the outcome objective never updates the
+    # action-logit mapping: the auxiliary win-prob loss trains only the shared
+    # encoder + value head. requires_grad is restored before returning (the freeze
+    # is scoped to this fine-tune), mirroring bc_pretrain's freeze/unfreeze idiom.
+    for param in model.policy.parameters():
+        param.requires_grad = False
+
+    # Optimizer over the still-trainable params only (encoder + value head).
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
 
     stats = SelfPlaySLStats()
     # inf so epoch 0's val loss always improves on the initial best and captures
@@ -493,22 +522,22 @@ def outcome_regression_pretrain(
         model.train()
         epoch_loss = 0.0
         epoch_samples = 0
-        for obs_batch, action_batch, outcome_batch in train_loader:
+        for obs_batch, _action_batch, outcome_batch in train_loader:
             obs_batch = {k: v.to(device) for k, v in obs_batch.items()}
-            action_batch = action_batch.to(device)
             outcome_batch = outcome_batch.to(device)
 
-            features = model.encoder(obs_batch)
-            raw_logits = model.policy.logits(features)  # (B, ACTION_DIM), pre-mask
-            # Regress ONLY the chosen action's logit toward the episode outcome.
-            chosen_logits = raw_logits.gather(1, action_batch[:, None]).squeeze(1)  # (B,)
-            loss = F.binary_cross_entropy_with_logits(chosen_logits, outcome_batch)
+            # Encode once; the value head reads the pooled CLS context as a
+            # win-probability logit. The pointer head is frozen and never touched
+            # by this loss, so the chosen action / mask are unused here.
+            _per_token, pooled, _key_padding_mask = model.encoder(obs_batch)
+            win_logit = model.value(pooled)  # (B,) - ValueHead squeezes to (B,)
+            loss = F.binary_cross_entropy_with_logits(win_logit, outcome_batch)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            bs = action_batch.shape[0]
+            bs = outcome_batch.shape[0]
             epoch_loss += loss.item() * bs
             epoch_samples += bs
 
@@ -520,17 +549,15 @@ def outcome_regression_pretrain(
         val_loss = 0.0
         val_total = 0
         with torch.no_grad():
-            for obs_batch, action_batch, outcome_batch in val_loader:
+            for obs_batch, _action_batch, outcome_batch in val_loader:
                 obs_batch = {k: v.to(device) for k, v in obs_batch.items()}
-                action_batch = action_batch.to(device)
                 outcome_batch = outcome_batch.to(device)
 
-                features = model.encoder(obs_batch)
-                raw_logits = model.policy.logits(features)
-                chosen_logits = raw_logits.gather(1, action_batch[:, None]).squeeze(1)
-                loss = F.binary_cross_entropy_with_logits(chosen_logits, outcome_batch)
+                _per_token, pooled, _key_padding_mask = model.encoder(obs_batch)
+                win_logit = model.value(pooled)
+                loss = F.binary_cross_entropy_with_logits(win_logit, outcome_batch)
 
-                bs = action_batch.shape[0]
+                bs = outcome_batch.shape[0]
                 val_loss += loss.item() * bs
                 val_total += bs
 
@@ -571,5 +598,10 @@ def outcome_regression_pretrain(
     if best_state is not None:
         model.load_state_dict(best_state)
         model.to(device)
+
+    # Release the policy-head freeze so the returned model carries no lingering
+    # requires_grad side effect (the freeze was scoped to this fine-tune).
+    for param in model.policy.parameters():
+        param.requires_grad = True
 
     return model, stats

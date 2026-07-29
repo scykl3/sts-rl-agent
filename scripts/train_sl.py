@@ -2,9 +2,11 @@
 
 Loads a warm-start (behavior-cloned) policy, generates self-play full-run
 episodes with it, labels each decision step by its episode's Act-1-clear outcome,
-fine-tunes the SAME net with a BCEWithLogits loss on the chosen-action logit, and
-saves a checkpoint compatible with ``train_run.py --warm-start`` (no train_run
-change: its ``--warm-start`` already loads this 3-key format via load_checkpoint).
+fine-tunes the SAME net with an auxiliary win-probability BCEWithLogits loss (the
+value head predicts each step's outcome from the state; the policy head is
+frozen), and saves a checkpoint compatible with ``train_run.py --warm-start`` (no
+train_run change: its ``--warm-start`` already loads this 3-key format via
+load_checkpoint).
 
 Usage:
     python scripts/train_sl.py --warm-start <bc_checkpoint> --out sl_best.pt \

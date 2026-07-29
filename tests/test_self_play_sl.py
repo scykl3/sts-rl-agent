@@ -14,7 +14,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-import torch.nn.functional as F
 
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.checkpoint_migration import load_checkpoint
@@ -40,18 +39,13 @@ import train_sl  # noqa: E402  (imported after the sys.path insert above)
 
 # A genuinely legal action index used by the scripted env's mask and the stub
 # policy: the first MAP_SELECT slot (choosing the next map node) is a real, legal
-# overworld action. Distinct from _A_LOSE (END_TURN, 0) so the winner and loser
-# differ in the perfect-predictor test below. PROCEED is deliberately NOT used:
-# interface.py reserves it as the tail slot no engine move maps to, so it is never
-# set legal in a mask - the opposite of "always legal".
+# overworld action. PROCEED is deliberately NOT used: interface.py reserves it as
+# the tail slot no engine move maps to, so it is never set legal in a mask - the
+# opposite of "always legal".
 _LEGAL_IDX: int = ACTION_BLOCK_BY_NAME["MAP_SELECT"].start
 # Two co-legal overworld actions (adjacent MAP_SELECT slots: a map screen offers a
 # choice among the next nodes) for the multi-legal collection-determinism test.
 _TWO_LEGAL: tuple[int, int] = (_LEGAL_IDX, _LEGAL_IDX + 1)
-# A losing action distinct from the "winner" (END_TURN, index 0) for the
-# perfect-predictor separation test.
-_A_WIN: int = _LEGAL_IDX
-_A_LOSE: int = 0
 # Terminal-act values for scripted episodes, derived from ACT2_INDEX so the test
 # tracks the clear threshold rather than a hardcoded 2: a run that stayed in Act 1
 # (did not clear) vs one that reached Act 2 (cleared).
@@ -178,21 +172,44 @@ def _synthetic_dataset(
     )
 
 
-def _perfect_predictor_dataset(n_per_class: int = 16) -> SelfPlaySLDataset:
-    """A dataset where action _A_WIN always -> outcome 1 and _A_LOSE always -> 0.
+def _class_obs(*, cleared: bool) -> dict[str, np.ndarray]:
+    """One obs whose float context fields encode its class, so the state is predictive.
 
-    All obs are identical (zeros), so the ONLY signal is the chosen action; a
-    trained net must raise the winner's chosen logit above the loser's.
+    A cleared-class state fills every non-id field with 1.0; a not-cleared state
+    leaves them at 0.0 (id fields are PAD/0 in both). The two states therefore
+    feed the CLS token a distinct input, so the value head over the pooled CLS
+    context can separate them after training.
+    """
+    fill = 1.0 if cleared else 0.0
+    obs: dict[str, np.ndarray] = {}
+    for f in OBS_FIELDS:
+        arr = np.zeros(f.shape, dtype=f.dtype)
+        if f.bounds != "id":
+            arr[...] = fill
+        obs[f.name] = arr
+    return obs
+
+
+def _state_predicts_outcome_dataset(n_per_class: int = 16) -> SelfPlaySLDataset:
+    """A dataset where the STATE predicts the outcome: a cleared obs pattern always
+    labels outcome 1 and a distinct not-cleared pattern always labels 0.
+
+    The two classes differ only in their float context fields, so the value head
+    over the pooled CLS context can separate them after training. Actions are a
+    single legal index across all rows (the aux-head loss ignores the action; it
+    is kept only for dataset provenance).
     """
     n = 2 * n_per_class
-    obs_arrays: dict[str, np.ndarray] = {
-        f.name: np.zeros((n, *f.shape), dtype=f.dtype) for f in OBS_FIELDS
-    }
-    actions = np.array([_A_WIN] * n_per_class + [_A_LOSE] * n_per_class, dtype=np.int64)
+    cleared = _class_obs(cleared=True)
+    not_cleared = _class_obs(cleared=False)
+    obs_arrays: dict[str, np.ndarray] = {}
+    for f in OBS_FIELDS:
+        rows = [cleared[f.name]] * n_per_class + [not_cleared[f.name]] * n_per_class
+        obs_arrays[f.name] = np.stack(rows, axis=0)
+    actions = np.full(n, _LEGAL_IDX, dtype=np.int64)
     outcomes = np.array([1.0] * n_per_class + [0.0] * n_per_class, dtype=np.float32)
     masks = np.zeros((n, ACTION_DIM), dtype=np.bool_)
-    for i, a in enumerate(actions):
-        masks[i, int(a)] = True
+    masks[:, _LEGAL_IDX] = True  # the single chosen action is legal in every row
     manifest = SelfPlaySLManifest(
         n_episodes=n,
         n_samples=n,
@@ -335,12 +352,21 @@ class TestCollectSelfPlayDataset:
 
 
 class TestOutcomeRegressionPretrain:
-    """outcome_regression_pretrain drives loss down and separates a predictive action."""
+    """outcome_regression_pretrain drives loss down, separates predictive states, and
+    trains only the encoder + value head (the policy head is frozen)."""
 
-    def test_loss_decreases_and_separates_winner(self) -> None:
+    def test_loss_decreases_and_value_head_separates_states(self) -> None:
+        """The value head's win-prob output separates cleared from not-cleared states.
+
+        On a dataset where the STATE predicts the outcome, the auxiliary win-prob
+        head (the value head over the pooled CLS context) must, after training,
+        score a cleared-class state above a not-cleared one, and the train loss
+        must fall. Replaces the old chosen-logit separation test: the aux head
+        predicts the outcome from the state, not from the chosen action.
+        """
         torch.manual_seed(0)
         model = ActorCritic()
-        ds = _perfect_predictor_dataset(n_per_class=16)
+        ds = _state_predicts_outcome_dataset(n_per_class=16)
         _model, stats = outcome_regression_pretrain(
             model,
             ds,
@@ -354,17 +380,25 @@ class TestOutcomeRegressionPretrain:
         # Loss decreases over training.
         assert stats.train_loss_history[-1] < stats.train_loss_history[0]
 
-        # On a zero obs, the winner's chosen logit exceeds the loser's.
+        # The value head's win-prob logit is higher on a cleared-class state than
+        # on a not-cleared one (forward the encoder's pooled CLS through the value
+        # head exactly as the loss does).
         model.eval()
         with torch.no_grad():
-            probe = observation_to_batched_tensors(_full_zero_obs(), torch.device("cpu"))
-            logits = model.policy.logits(model.encoder(probe))[0]
-        assert logits[_A_WIN].item() > logits[_A_LOSE].item()
+            cleared = observation_to_batched_tensors(_class_obs(cleared=True), torch.device("cpu"))
+            not_cleared = observation_to_batched_tensors(
+                _class_obs(cleared=False), torch.device("cpu")
+            )
+            _pt_c, pooled_c, _m_c = model.encoder(cleared)
+            _pt_n, pooled_n, _m_n = model.encoder(not_cleared)
+            win_cleared = model.value(pooled_c)
+            win_not_cleared = model.value(pooled_n)
+        assert win_cleared.item() > win_not_cleared.item()
 
     def test_returns_same_model_object(self) -> None:
         """The returned model is the SAME net, fine-tuned in place."""
         model = ActorCritic()
-        ds = _perfect_predictor_dataset(n_per_class=8)
+        ds = _state_predicts_outcome_dataset(n_per_class=8)
         returned, _stats = outcome_regression_pretrain(
             model, ds, epochs=2, lr=1e-3, batch_size=8, val_frac=0.25, seed=0
         )
@@ -373,7 +407,7 @@ class TestOutcomeRegressionPretrain:
     def test_determinism_under_fixed_seed(self) -> None:
         torch.manual_seed(0)
         base = ActorCritic()
-        ds = _perfect_predictor_dataset(n_per_class=8)
+        ds = _state_predicts_outcome_dataset(n_per_class=8)
         m1 = copy.deepcopy(base)
         m2 = copy.deepcopy(base)
         _r1, s1 = outcome_regression_pretrain(
@@ -389,51 +423,69 @@ class TestOutcomeRegressionPretrain:
                 m1.state_dict()[key], m2.state_dict()[key], msg=f"mismatch at key {key}"
             )
 
-    def test_gradient_flows_only_to_chosen_head_row(self) -> None:
-        """One outcome-regression step grads ONLY the chosen action's logit row.
+    def test_freezes_policy_head_and_trains_encoder_value(self) -> None:
+        """One aux-head fine-tune grads the encoder + value head but NOT the policy.
 
-        The loss gathers a single logit per sample (self_play_sl:
-        raw_logits.gather on the chosen action), so only
-        policy.logits.weight[chosen] and its bias entry can receive gradient;
-        every other action's head row stays exactly zero. Locks the documented
-        "only chosen logits get gradient" limitation of the objective.
+        The auxiliary win-prob loss is BCEWithLogits over the value head's output
+        on the pooled CLS context; the pointer (policy) head is frozen
+        (requires_grad=False) before training and is absent from that loss graph,
+        so no gradient reaches it and its action-logit weights are left bitwise
+        intact - the property that prevents the policy collapse the earlier
+        per-chosen-logit objective caused. The shared encoder and the value head DO
+        receive finite gradient and their weights change. Replaces the old
+        per-chosen-logit-row gradient test (the pointer head has no per-action
+        logit row to isolate). The freeze is scoped: requires_grad is restored on
+        return.
         """
         torch.manual_seed(0)
         model = ActorCritic()
-        model.train()
-        chosen = _LEGAL_IDX
+        # Snapshot each param group before the fine-tune, to prove the policy is
+        # left intact while the encoder + value head change.
+        policy_before = {k: v.detach().clone() for k, v in model.policy.state_dict().items()}
+        value_before = {k: v.detach().clone() for k, v in model.value.state_dict().items()}
+        encoder_before = {k: v.detach().clone() for k, v in model.encoder.state_dict().items()}
 
-        # One random (nonzero) obs so encoder features - and thus the chosen row's
-        # gradient - are genuinely nonzero (not a vacuous all-zero pass).
-        ds = _synthetic_dataset(
-            n_samples=1,
-            actions=np.array([chosen], dtype=np.int64),
-            outcomes=np.array([1.0], dtype=np.float32),
-            seed=0,
+        # n_per_class=6 -> n=12, val_frac=0.25 -> n_train=9 <= batch_size, so exactly
+        # one train batch and one backward run: the post-call .grad state is
+        # deterministic (encoder + value populated; policy None).
+        ds = _state_predicts_outcome_dataset(n_per_class=6)
+        outcome_regression_pretrain(
+            model, ds, epochs=1, lr=1e-2, batch_size=64, val_frac=0.25, seed=0, patience=100
         )
-        obs = {f.name: ds.obs_arrays[f.name][0] for f in OBS_FIELDS}
-        obs_batched = observation_to_batched_tensors(obs, torch.device("cpu"))
-        action_batch = torch.tensor([chosen], dtype=torch.long)
-        outcome_batch = torch.tensor([1.0], dtype=torch.float32)
 
-        # Mirror outcome_regression_pretrain's exact forward + BCE-on-chosen-logit.
-        features = model.encoder(obs_batched)
-        raw_logits = model.policy.logits(features)
-        chosen_logits = raw_logits.gather(1, action_batch[:, None]).squeeze(1)
-        loss = F.binary_cross_entropy_with_logits(chosen_logits, outcome_batch)
-        loss.backward()
+        # No gradient reached ANY policy (pointer head) param: it is both frozen and
+        # graph-disjoint from the value-head loss.
+        for name, p in model.policy.named_parameters():
+            assert p.grad is None, f"policy param {name} received a gradient"
+        # ...and every policy weight is bitwise unchanged (action logits intact).
+        for k, v in model.policy.state_dict().items():
+            torch.testing.assert_close(
+                v, policy_before[k], rtol=0, atol=0, msg=f"policy param {k} changed"
+            )
+        # The freeze is scoped to the call: requires_grad is restored on return.
+        assert all(p.requires_grad for p in model.policy.parameters())
 
-        weight_grad = model.policy.logits.weight.grad
-        bias_grad = model.policy.logits.bias.grad
-        assert weight_grad is not None and bias_grad is not None
-        # The chosen action's head row (and bias) receive gradient...
-        assert weight_grad[chosen].abs().sum().item() > 0.0
-        assert bias_grad[chosen].abs().item() > 0.0
-        # ...and every other action row is untouched (exactly zero).
-        others = torch.ones(ACTION_DIM, dtype=torch.bool)
-        others[chosen] = False
-        assert int(torch.count_nonzero(weight_grad[others])) == 0
-        assert int(torch.count_nonzero(bias_grad[others])) == 0
+        # The value head received finite, nonzero gradient and its weights changed.
+        value_grad = 0.0
+        for p in model.value.parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all()
+            value_grad += float(p.grad.abs().sum())
+        assert value_grad > 0.0
+        assert any(
+            not torch.equal(model.value.state_dict()[k], value_before[k]) for k in value_before
+        )
+        # The shared encoder also received finite gradient and its weights changed
+        # (its features are shaped toward outcome-awareness).
+        encoder_grad = 0.0
+        for p in model.encoder.parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all()
+                encoder_grad += float(p.grad.abs().sum())
+        assert encoder_grad > 0.0
+        assert any(
+            not torch.equal(model.encoder.state_dict()[k], encoder_before[k])
+            for k in encoder_before
+        )
 
 
 class TestOutcomeRegressionDegenerateGuards:
@@ -441,7 +493,7 @@ class TestOutcomeRegressionDegenerateGuards:
 
     def test_raises_on_all_same_outcome(self) -> None:
         model = ActorCritic()
-        ds = _perfect_predictor_dataset(n_per_class=8)
+        ds = _state_predicts_outcome_dataset(n_per_class=8)
         ds.outcomes[:] = 1.0  # every episode "cleared" -> no discriminative signal
         with pytest.raises(ValueError, match="both cleared"):
             outcome_regression_pretrain(model, ds, epochs=5, val_frac=0.25)
