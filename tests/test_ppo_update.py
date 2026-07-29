@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.ppo_update import PPOConfig, PPOStats, ppo_update
 from sts_rl.agent.rollout_buffer import RolloutBuffer
+from sts_rl.agent.running_moments import RunningMoments
 from sts_rl.interface import ACTION_DIM
 from conftest import sample_observation_batch
 
@@ -122,6 +124,121 @@ def test_both_normalization_paths_run():
         assert math.isfinite(stats.total_loss)
 
 
+def test_normalize_advantages_standardizes_against_full_batch():
+    """decay=1.0 folds the whole rollout, so the tracker standardizes that batch.
+
+    With adv_norm_decay=1.0 the running moments equal the full rollout's
+    population mean/std, so normalizing that same rollout yields ~0 mean / ~1
+    std - the observable that the running-stats path replaced the old
+    per-minibatch mean/std.
+    """
+    torch.manual_seed(0)
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    adv = buffer.advantages.detach().clone()
+    moments = RunningMoments(decay=1.0)
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    config = PPOConfig(
+        n_epochs=1, minibatch_size=MINIBATCH, normalize_advantages=True, adv_norm_decay=1.0
+    )
+
+    ppo_update(ac, buffer, optimizer, config, adv_moments=moments)
+
+    normalized = moments.normalize(adv)
+    assert normalized.mean().item() == pytest.approx(0.0, abs=1e-4)
+    assert normalized.std(unbiased=False).item() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_running_moments_persist_across_calls():
+    """A shared RunningMoments carries the EWMA forward across two update calls.
+
+    The tracker is folded once per call with that call's full rollout, so after
+    two calls its running mean equals the hand-computed two-batch EWMA (first
+    call seeds, second blends with per-item retain) and differs from a fresh
+    tracker that saw only the second rollout - proving persistence, not a reset.
+    """
+    torch.manual_seed(0)
+    ac = ActorCritic()
+    buffer1 = _fill_buffer(ac)
+    buffer2 = _fill_buffer(ac)
+    adv1 = buffer1.advantages.detach().clone()
+    adv2 = buffer2.advantages.detach().clone()
+    decay = 0.1
+    shared = RunningMoments(decay=decay)
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    config = PPOConfig(
+        n_epochs=1, minibatch_size=MINIBATCH, normalize_advantages=True, adv_norm_decay=decay
+    )
+
+    ppo_update(ac, buffer1, optimizer, config, adv_moments=shared)
+    ppo_update(ac, buffer2, optimizer, config, adv_moments=shared)
+
+    # Reference: call 1 seeds from buffer1, call 2 blends buffer2 with retain.
+    expected = float(adv1.mean())
+    retain = (1.0 - decay) ** adv2.numel()
+    expected = retain * expected + (1.0 - retain) * float(adv2.mean())
+    assert shared.mean == pytest.approx(expected)
+
+    # A fresh tracker over only the second rollout differs -> the shared one
+    # genuinely carried buffer1's contribution forward.
+    fresh = RunningMoments(decay=decay)
+    fresh.update(adv2)
+    assert shared.mean != pytest.approx(fresh.mean)
+
+
+def test_advantage_fold_is_once_per_call_not_per_epoch():
+    """The rollout's advantages are folded into the tracker ONCE per call, not per epoch.
+
+    Pre-seed a shared tracker with a distinct batch (a known prior mean), then run
+    a single ppo_update with n_epochs=4. The rollout is folded once before the
+    epochs, so the tracker's mean is a SINGLE EWMA blend of the prior and this
+    rollout's mean with retain = (1 - decay) ** len(buffer). Folding once per
+    epoch would compound retain n_epochs times (geometric), a materially different
+    mean - so this pins the fold-once placement.
+
+    Revert-verify: move ``moments.update(adv_batch.advantages)`` inside the epoch
+    loop and the mean picks up retain ** n_epochs, failing the equality below.
+    """
+    torch.manual_seed(0)
+    ac = ActorCritic()
+    buffer = _fill_buffer(ac)
+    decay = 0.1
+    shared = RunningMoments(decay=decay)
+    # Seed with a distinct batch so the prior mean is known and non-degenerate;
+    # only that the tracker is initialized matters, not the exact values.
+    shared.update(torch.tensor([2.0, -1.0, 4.0, 0.5]))
+    prior_mean = shared.mean
+
+    n_epochs = 4
+    config = PPOConfig(
+        n_epochs=n_epochs,
+        minibatch_size=MINIBATCH,
+        normalize_advantages=True,
+        adv_norm_decay=decay,
+    )
+    optimizer = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    ppo_update(ac, buffer, optimizer, config, adv_moments=shared)
+
+    # adv_mean over the SAME full-width unshuffled pass ppo_update folds; the
+    # update only reads advantages, so recomputing here reproduces its fold input.
+    (adv_batch,) = buffer.iter_minibatches(len(buffer), shuffle=False)
+    adv_mean = float(adv_batch.advantages.mean())
+    retain = (1.0 - decay) ** len(buffer)
+    expected_once = retain * prior_mean + (1.0 - retain) * adv_mean
+
+    # What a per-epoch fold would produce: the same rollout folded n_epochs times
+    # compounds the retain geometrically.
+    retain_per_epoch = retain**n_epochs
+    expected_per_epoch = retain_per_epoch * prior_mean + (1.0 - retain_per_epoch) * adv_mean
+
+    # The two hypotheses must be distinguishable or the test has no teeth.
+    assert expected_once != pytest.approx(expected_per_epoch)
+    # Folded once per call: the mean matches the single-blend reference, and NOT
+    # the per-epoch reference (which is what the fold-in-loop bug would yield).
+    assert shared.mean == pytest.approx(expected_once)
+    assert shared.mean != pytest.approx(expected_per_epoch)
+
+
 def test_empty_buffer_returns_zeroed_stats():
     """A buffer yielding zero minibatches returns zeroed stats, not a ZeroDivisionError.
 
@@ -165,9 +282,11 @@ def test_update_is_deterministic_under_fixed_seed():
 def test_singleton_tail_minibatch_does_not_nan():
     """A size-1 remainder minibatch must not NaN advantage normalization.
 
-    With T % minibatch_size == 1 the final minibatch holds one transition;
-    torch.std applies Bessel's correction (N-1) and returns NaN for N=1, which
-    without a guard would poison the update. length=9, mb=4 -> sizes [4,4,1].
+    With T % minibatch_size == 1 the final minibatch holds one transition. The
+    numel() > 0 guard normalizes that singleton against the persistent running
+    stats (population moments, N=1-safe: no Bessel term to divide by N-1), so it
+    is standardized like its peers and the update stays finite. length=9, mb=4 ->
+    sizes [4, 4, 1].
     """
     ac = ActorCritic()
     buffer = _fill_buffer(ac, length=9)
