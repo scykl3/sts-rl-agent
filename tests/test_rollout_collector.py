@@ -184,11 +184,14 @@ def test_tail_bootstrap_matches_independent_gae() -> None:
     collector.collect(buffer, N_STEPS)
 
     # Recompute exactly as compute_advantages does, bootstrapping from V of the
-    # collector's post-collect cursor obs. No update ran and get_value is
-    # deterministic, so this reproduces the collect-time tail value.
+    # collector's post-collect cursor obs. The collector collects under eval()
+    # (fused-attention path), so recompute in eval() too: get_value is otherwise
+    # deterministic, but eval vs train take different attention kernels that
+    # differ at the float32 epsilon, which GAE would amplify past allclose.
     rewards = torch.tensor(buffer._rewards, dtype=torch.float32)
     dones = torch.tensor(buffer._dones, dtype=torch.float32)
     values = torch.stack(buffer._values).to(torch.float32)
+    ac.eval()
     with torch.no_grad():
         last_value = ac.get_value(observation_to_batched_tensors(collector._obs, device)).squeeze(0)
     expected_adv, expected_ret = compute_gae(rewards, values, dones, last_value)
@@ -225,10 +228,13 @@ def test_collect_forwards_gamma_and_gae_lambda() -> None:
     collector.collect(buffer, N_STEPS)
 
     # Rebuild compute_gae's inputs from the buffer's stored fields, bootstrapping
-    # from V of the post-collect cursor obs (deterministic: no update ran).
+    # from V of the post-collect cursor obs. Recompute under eval() to match the
+    # collector's collect-time mode (the fused vs unfused attention kernels differ
+    # at the float32 epsilon, which GAE would amplify past allclose).
     rewards = torch.tensor(buffer._rewards, dtype=torch.float32)
     dones = torch.tensor(buffer._dones, dtype=torch.float32)
     values = torch.stack(buffer._values).to(torch.float32)
+    ac.eval()
     with torch.no_grad():
         last_value = ac.get_value(observation_to_batched_tensors(collector._obs, device)).squeeze(0)
 

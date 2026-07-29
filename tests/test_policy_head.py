@@ -23,9 +23,10 @@ BATCH = 3
 
 
 def _features(batch: int = BATCH) -> torch.Tensor:
-    """Trunk features for a sampled batch (detached from the encoder graph)."""
+    """Pooled CLS context for a sampled batch (detached from the encoder graph)."""
     enc = ObsFeatureEncoder()
-    return enc(sample_observation_batch(batch)).detach()
+    _per_token, pooled_cls, _mask = enc(sample_observation_batch(batch))
+    return pooled_cls.detach()
 
 
 def _random_valid_mask(batch: int, seed: int = 0) -> torch.Tensor:
@@ -60,7 +61,7 @@ def test_forward_shape_and_finite():
 
 
 def test_input_dim_defaults_to_encoder_output():
-    """Head's default input width tracks the encoder trunk, not a literal."""
+    """Head's default input width tracks the encoder output width, not a literal."""
     enc = ObsFeatureEncoder()
     head = MaskedPolicyHead()
     assert head.input_dim == enc.output_dim == HIDDEN_DIM
