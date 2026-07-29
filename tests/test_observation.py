@@ -1182,8 +1182,9 @@ def test_event_phase_populated_from_live_run() -> None:
 def test_event_phase_onehot_reflects_event_data_through_full_encode() -> None:
     # Drives the full encode_observation path on a live start_run gc at a mid-range event_data
     # value (6) and asserts the one-hot mirrors it end to end. The engine's reset-on-entry
-    # semantics (event_data is reset on entering events that do not maintain it) are engine
-    # behavior, tolerated here because the field is always paired with event_onehot.
+    # semantics (event_data is reset on entry only for the events that maintain it, e.g.
+    # COLOSSEUM and CURSED_TOME; other events leave a leftover value) are engine behavior,
+    # tolerated here because the field is always paired with event_onehot.
     gc = start_run(seed=REGRESSION_SEED)
     assert gc.screen_state == sts.ScreenState.EVENT_SCREEN
     stale = 6  # a leftover phase counter from a prior maintaining event (e.g. COLOSSEUM)
