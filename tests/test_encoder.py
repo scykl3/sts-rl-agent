@@ -1,9 +1,9 @@
-"""Tests for the shared observation encoder.
+"""Tests for the transformer observation encoder.
 
 Observations are generated from the interface's own space
 (:func:`sts_rl.env.spaces.build_observation_space`) so the tests exercise real
-interface-shaped data and the feature width is locked to the interface constants
-rather than a hardcoded literal.
+interface-shaped data and every token count / width is locked to the interface
+constants rather than a hardcoded literal.
 """
 
 from __future__ import annotations
@@ -15,197 +15,145 @@ from sts_rl import interface
 from sts_rl.agent.encoder import (
     CARD_EMBED_DIM,
     ENEMY_EMBED_DIM,
+    FFN_DIM,
+    HIDDEN_DIM,
     MOVE_EMBED_DIM,
+    N_ATTENTION_HEADS,
+    N_TRANSFORMER_LAYERS,
     POTION_EMBED_DIM,
+    RELIC_EMBED_DIM,
     ObsFeatureEncoder,
-    _N_PILES,
+    _CLS_INPUT_DIM,
+    _ENTITY_SPECS,
+    _OFFER_INPUT_DIM,
     _PILE_POOLS,
+    _PILE_SPECS,
 )
 from conftest import ID_FIELDS, sample_observation_batch
 
 BATCH = 2
 
+# The relic-backed entity id fields whose empty marker is the relic INVALID
+# sentinel (N_RELIC_IDS), not PAD_ID: RelicId 0 (AKABEKO) is a real relic.
+_RELIC_ID_FIELDS = frozenset(spec.id_field for spec in _ENTITY_SPECS if spec.pad_is_relic_invalid)
 
-def _expected_feature_dim() -> int:
-    """Recompute the concat width straight from the interface constants.
 
-    Mirrors the encoder's own derivation; asserting equality locks the feature
-    width to the interface constants (if the interface sizes change, both this
-    test and the encoder must move together).
+def _expected_seq_len() -> int:
+    """Recompute the token-sequence length straight from the interface caps.
+
+    S = every per-slot entity token + the six never-PAD context tokens (CLS, the
+    four pile summaries, OFFER_CONTEXT). Derived symbolically so an interface cap
+    change moves this test and the encoder together.
     """
-    hand = interface.HAND_MAX * (CARD_EMBED_DIM + interface.HAND_FEAT_DIM)
-    enemy = interface.MAX_ENEMIES * (
-        ENEMY_EMBED_DIM
-        + interface.ENEMY_SCALAR_DIM
-        + MOVE_EMBED_DIM
-        + 1  # enemy_intent_hidden
-        + interface.N_MONSTER_POWER_IDS
-        + 1  # enemy_alive
+    entity = (
+        interface.HAND_MAX
+        + interface.MAX_ENEMIES
+        + interface.POTION_SLOTS
+        + interface.CHOICE_MAX
+        + interface.MAX_REWARD_CARD_SLOTS
+        + interface.MAX_REWARD_POTIONS
+        + interface.MAX_REWARD_RELICS
+        + interface.MAX_SHOP_CARDS
+        + interface.MAX_SHOP_RELICS
+        + interface.MAX_SHOP_POTIONS
+        + interface.MAX_BOSS_RELICS
     )
-    piles = _N_PILES * (_PILE_POOLS * CARD_EMBED_DIM)
-    potion = interface.POTION_SLOTS * POTION_EMBED_DIM + interface.POTION_SLOTS
-    passthrough = (
-        interface.N_RELIC_IDS
-        + interface.N_PLAYER_POWER_IDS
-        + interface.PLAYER_SCALAR_DIM
-        + interface.N_SCREENS
-        + interface.MAP_CONTEXT_DIM
-    )
-    reward = interface.MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
-    reward_relic = interface.N_RELIC_IDS
-    reward_potion = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
-    card_select = interface.CHOICE_MAX * CARD_EMBED_DIM
-    deck = _PILE_POOLS * CARD_EMBED_DIM  # pooled mean+max, like one pile
-    keys_act = interface.KEYS_ACT_DIM
-    # Shop screen: cards / potions embedded per slot, relics a multihot, each id block
-    # followed by its raw price columns, plus the scalar remove cost; then the boss
-    # relic multihot. All appended last.
-    shop_cards = interface.MAX_SHOP_CARDS * CARD_EMBED_DIM
-    shop_card_prices = interface.MAX_SHOP_CARDS
-    shop_relics = interface.N_RELIC_IDS
-    shop_relic_prices = interface.MAX_SHOP_RELICS
-    shop_potions = interface.MAX_SHOP_POTIONS * POTION_EMBED_DIM
-    shop_potion_prices = interface.MAX_SHOP_POTIONS
-    shop_remove_cost = 1
-    boss_relics = interface.N_RELIC_IDS
-    # Neow-event one-hots, appended last: the current event id, then per-option
-    # NeowBonus / NeowDrawback one-hot spans.
-    event_onehot = interface.N_EVENT_IDS
-    neow_bonus = interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS
-    neow_drawback = interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK
-    return (
-        hand
-        + enemy
-        + piles
-        + potion
-        + passthrough
-        + reward
-        + reward_relic
-        + reward_potion
-        + card_select
-        + deck
-        + keys_act
-        + shop_cards
-        + shop_card_prices
-        + shop_relics
-        + shop_relic_prices
-        + shop_potions
-        + shop_potion_prices
-        + shop_remove_cost
-        + boss_relics
-        + event_onehot
-        + neow_bonus
-        + neow_drawback
-    )
+    context = 1 + len(_PILE_SPECS) + 1  # CLS + piles + OFFER
+    return entity + context
 
 
-def _shop_boss_tail_width() -> int:
-    """Total width of the shop / boss-relic blocks appended after keys_act.
+def _all_pad_obs(batch: int) -> dict[str, torch.Tensor]:
+    """Every entity slot empty and every float field zero.
 
-    The reward / card-select / deck / keys_act blocks are no longer the concat tail;
-    end-relative slices below step back past this suffix to reach them. Derived from
-    the interface / encoder constants, mirroring the encoder's append.
+    id fields hold their empty marker (the relic INVALID sentinel for the relic
+    fields, else PAD_ID); float fields are zero. So every entity token is PAD and
+    only the six context tokens are valid.
     """
-    return (
-        interface.MAX_SHOP_CARDS * CARD_EMBED_DIM  # shop cards embedded
-        + interface.MAX_SHOP_CARDS  # shop card prices
-        + interface.N_RELIC_IDS  # shop relic multihot
-        + interface.MAX_SHOP_RELICS  # shop relic prices
-        + interface.MAX_SHOP_POTIONS * POTION_EMBED_DIM  # shop potions embedded
-        + interface.MAX_SHOP_POTIONS  # shop potion prices
-        + 1  # shop remove cost
-        + interface.N_RELIC_IDS  # boss relic multihot
-    )
+    obs: dict[str, torch.Tensor] = {}
+    for field in interface.OBS_FIELDS:
+        if field.bounds == "id":
+            pad = interface.N_RELIC_IDS if field.name in _RELIC_ID_FIELDS else interface.PAD_ID
+            obs[field.name] = torch.full((batch, *field.shape), pad, dtype=torch.long)
+        else:
+            obs[field.name] = torch.zeros((batch, *field.shape), dtype=torch.float32)
+    return obs
 
 
-def _neow_event_tail_width() -> int:
-    """Total width of the Neow-event one-hot blocks appended after the boss-relic block.
+def _all_live_obs(batch: int) -> dict[str, torch.Tensor]:
+    """Every entity slot occupied by a real id and every float field zero.
 
-    These are now the concat tail, so every end-relative slice below steps back past
-    BOTH this and the shop / boss-relic suffix to reach the earlier blocks. Derived
-    from the interface constants, mirroring the encoder's append.
+    So every entity token is non-PAD (unmasked) and each obs field feeds a live
+    token. Real ids: 5 for the relic fields (a real, non-AKABEKO relic), 1 for the
+    other id fields (a real, non-PAD id).
     """
-    return (
-        interface.N_EVENT_IDS  # event_onehot
-        + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS  # neow bonus one-hots
-        + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK  # neow drawback one-hots
-    )
+    obs: dict[str, torch.Tensor] = {}
+    for field in interface.OBS_FIELDS:
+        if field.bounds == "id":
+            live = 5 if field.name in _RELIC_ID_FIELDS else 1
+            obs[field.name] = torch.full((batch, *field.shape), live, dtype=torch.long)
+        else:
+            obs[field.name] = torch.zeros((batch, *field.shape), dtype=torch.float32)
+    return obs
 
 
-def _relic_block_start(enc: ObsFeatureEncoder) -> int:
-    """Start column of the reward-relic block in the pre-trunk concat.
+def _perturb_field(field: interface.ObsField, batch: int, live: bool) -> torch.Tensor:
+    """One field changed away from the baseline, staying in the field's bounds.
 
-    The relic block precedes the reward-potion, card-select, deck, keys/act, and the
-    appended shop / boss-relic blocks; derived from the interface widths (no literal),
-    mirroring the encoder's own append order.
+    Against the all-live baseline, an id field takes a distinct real id and a
+    float field a nonzero in-bounds constant.
     """
-    card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
-    potion_width = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
-    deck_width = _PILE_POOLS * CARD_EMBED_DIM
-    keys_act_width = interface.KEYS_ACT_DIM
-    return (
-        enc.feature_dim
-        - _neow_event_tail_width()
-        - _shop_boss_tail_width()
-        - keys_act_width
-        - deck_width
-        - card_select_width
-        - potion_width
-        - interface.N_RELIC_IDS
-    )
+    if field.bounds == "id":
+        base = (5 if field.name in _RELIC_ID_FIELDS else 1) if live else interface.PAD_ID
+        return torch.full((batch, *field.shape), base + 1, dtype=torch.long)
+    value = 0.5 if field.bounds == "unit" else 1.0
+    return torch.full((batch, *field.shape), value, dtype=torch.float32)
 
 
-def _shop_relic_block_start(enc: ObsFeatureEncoder) -> int:
-    """Start column of the shop-relic multihot block in the pre-trunk concat.
-
-    The shop-relic block is followed by shop_relic_prices, shop_potions,
-    shop_potion_prices, shop_remove_cost, and the boss-relic block; derived from the
-    interface widths (no literal), mirroring the encoder's append order.
-    """
-    return (
-        enc.feature_dim
-        - _neow_event_tail_width()  # the Neow-event blocks (the current concat tail)
-        - interface.N_RELIC_IDS  # boss_relic block
-        - 1  # shop_remove_cost
-        - interface.MAX_SHOP_POTIONS  # shop_potion_prices
-        - interface.MAX_SHOP_POTIONS * POTION_EMBED_DIM  # shop_potions
-        - interface.MAX_SHOP_RELICS  # shop_relic_prices
-        - interface.N_RELIC_IDS  # the shop-relic block itself
-    )
-
-
-def _boss_relic_block_start(enc: ObsFeatureEncoder) -> int:
-    """Start column of the boss-relic multihot block (now followed by the Neow-event tail)."""
-    return enc.feature_dim - _neow_event_tail_width() - interface.N_RELIC_IDS
-
-
-def test_forward_output_shape():
+def test_forward_output_shapes():
+    """forward -> (per_token (B,S,d), pooled (B,d), key_padding_mask (B,S) bool)."""
     enc = ObsFeatureEncoder()
-    out = enc(sample_observation_batch(BATCH))
-    assert out.shape == (BATCH, enc.output_dim)
+    per_token, pooled, mask = enc(sample_observation_batch(BATCH))
+    assert per_token.shape == (BATCH, enc.seq_len, enc.output_dim)
+    assert pooled.shape == (BATCH, enc.output_dim)
+    # Output lands on the model's device (CPU-safe: both sides are CPU here).
+    assert pooled.device == enc.cls_mlp[0].weight.device
+    assert mask.shape == (BATCH, enc.seq_len)
+    assert mask.dtype == torch.bool
 
 
-def test_feature_dim_matches_interface():
+def test_seq_len_and_cls_index_match_interface_constants():
+    """seq_len / n_entity_tokens / cls_index are the interface-derived counts."""
     enc = ObsFeatureEncoder()
-    expected = _expected_feature_dim()
-    assert enc.feature_dim == expected
-    # And the actual concat produced at runtime has that width.
-    feats = enc.encode_features(sample_observation_batch(BATCH))
-    assert feats.shape == (BATCH, expected)
+    assert enc.seq_len == _expected_seq_len()
+    # Entity tokens come first, so the first context token (CLS) sits at the
+    # entity-token count, and that count is S minus the six context tokens.
+    expected_entity = _expected_seq_len() - (1 + len(_PILE_SPECS) + 1)
+    assert enc.n_entity_tokens == expected_entity
+    assert enc.cls_index == expected_entity
 
 
 def test_output_is_finite():
     enc = ObsFeatureEncoder()
-    out = enc(sample_observation_batch(BATCH))
-    assert torch.isfinite(out).all()
+    per_token, pooled, _ = enc(sample_observation_batch(BATCH))
+    assert torch.isfinite(per_token).all()
+    assert torch.isfinite(pooled).all()
+
+
+def test_pooled_is_the_cls_token_row():
+    """The pooled context is exactly the CLS token's per-token output row."""
+    enc = ObsFeatureEncoder()
+    enc.eval()
+    with torch.no_grad():
+        per_token, pooled, _ = enc(sample_observation_batch(BATCH))
+    assert torch.equal(pooled, per_token[:, enc.cls_index])
 
 
 def test_accepts_float64_observations():
-    """Float64 obs (the common numpy default) must not break the trunk Linear.
+    """Float64 obs (the common numpy default) must not promote the network.
 
-    Regression: without internal float32 coercion the concat promotes to double
-    and ``nn.Linear`` raises "mat1 and mat2 must have the same dtype". Ids stay
-    integer; every float field is recast to double to mimic
+    Regression: without internal float32 coercion the token features promote to
+    double and ``nn.Linear`` raises "mat1 and mat2 must have the same dtype". Ids
+    stay integer; every float field is recast to double to mimic
     ``torch.as_tensor(numpy_float64_array)``.
     """
     enc = ObsFeatureEncoder()
@@ -213,408 +161,206 @@ def test_accepts_float64_observations():
         name: (t if name in ID_FIELDS else t.double())
         for name, t in sample_observation_batch(BATCH).items()
     }
-    out = enc(obs64)
-    assert out.shape == (BATCH, enc.output_dim)
-    assert out.dtype == torch.float32
-    assert torch.isfinite(out).all()
+    per_token, pooled, _ = enc(obs64)
+    assert pooled.shape == (BATCH, enc.output_dim)
+    assert per_token.dtype == torch.float32
+    assert pooled.dtype == torch.float32
+    assert torch.isfinite(pooled).all()
 
 
 def test_padding_rows_are_zero():
+    """Each id table's empty-marker row is the permanent zero vector."""
     enc = ObsFeatureEncoder()
-    assert torch.equal(
-        enc.card_embed.weight[interface.PAD_ID],
-        torch.zeros(CARD_EMBED_DIM),
-    )
-    assert torch.equal(
-        enc.enemy_embed.weight[interface.PAD_ID],
-        torch.zeros(ENEMY_EMBED_DIM),
-    )
-    assert torch.equal(
-        enc.potion_embed.weight[interface.PAD_ID],
-        torch.zeros(POTION_EMBED_DIM),
-    )
+    assert torch.equal(enc.card_embed.weight[interface.PAD_ID], torch.zeros(CARD_EMBED_DIM))
+    assert torch.equal(enc.enemy_embed.weight[interface.PAD_ID], torch.zeros(ENEMY_EMBED_DIM))
+    assert torch.equal(enc.move_embed.weight[interface.PAD_ID], torch.zeros(MOVE_EMBED_DIM))
+    assert torch.equal(enc.potion_embed.weight[interface.PAD_ID], torch.zeros(POTION_EMBED_DIM))
+    # relic_embed pads at the INVALID sentinel (N_RELIC_IDS), not PAD_ID.
+    assert enc.relic_embed.num_embeddings == interface.N_RELIC_IDS + 1
+    assert enc.relic_embed.padding_idx == interface.N_RELIC_IDS
+    assert torch.equal(enc.relic_embed.weight[interface.N_RELIC_IDS], torch.zeros(RELIC_EMBED_DIM))
 
 
-def test_all_pad_id_fields_contribute_zero_embedding():
-    """All-PAD id slots must map to zero embeddings (padding_idx row 0)."""
-    enc = ObsFeatureEncoder()
-    zeros = torch.zeros(1, interface.PILE_MAX, dtype=torch.long)
-    pooled = enc._pool_pile(zeros)  # mean+max over all-PAD pile
-    assert torch.equal(pooled, torch.zeros(1, 2 * CARD_EMBED_DIM))
+def test_init_matches_nanogpt_reference():
+    """Weights follow the nanoGPT/minGPT init the encoder docstring cites.
 
-
-def test_reward_block_is_zero_when_all_pad():
-    """All-PAD reward_card_ids -> the reward-card block is exactly zero.
-
-    Relies on card_embed's padding_idx row (no masking added): empty reward slots
-    contribute a zero vector, so the reward-card columns vanish. Slicing the card
-    block at its interface-derived offset (now followed by the relic and potion
-    blocks) also locks its placement in the concat.
-    """
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    obs["reward_card_ids"] = torch.full_like(obs["reward_card_ids"], interface.PAD_ID)
-    feats = enc.encode_features(obs)
-    reward_width = interface.MAX_REWARD_CARD_SLOTS * CARD_EMBED_DIM
-    relic_width = interface.N_RELIC_IDS
-    potion_width = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
-    card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
-    deck_width = _PILE_POOLS * CARD_EMBED_DIM
-    keys_act_width = interface.KEYS_ACT_DIM
-    # The card block sits before the appended relic, potion, card-select, deck,
-    # keys/act, and shop / boss-relic blocks.
-    card_start = (
-        enc.feature_dim
-        - _neow_event_tail_width()
-        - _shop_boss_tail_width()
-        - keys_act_width
-        - deck_width
-        - card_select_width
-        - potion_width
-        - relic_width
-        - reward_width
-    )
-    card_block = feats[:, card_start : card_start + reward_width]
-    assert torch.equal(card_block, torch.zeros(BATCH, reward_width))
-
-
-def test_reward_relic_and_potion_blocks_zero_when_empty():
-    """Empty reward_relic_ids / reward_potion_ids -> their appended blocks are zero.
-
-    Empty offer: the relic slots carry the INVALID sentinel (N_RELIC_IDS), which
-    scatters into the encoder's dropped final column so no kept relic column is set,
-    and PAD potion slots embed to the padding_idx zero vector. Both appended blocks
-    vanish. Relics use INVALID (not PAD 0) for "empty" because RelicId 0 (AKABEKO) is
-    a real relic whose column must stay usable. Slicing them at their interface-derived
-    offsets (now before the final card-select block) locks their placement in the concat.
-    """
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    obs["reward_relic_ids"] = torch.full_like(obs["reward_relic_ids"], interface.N_RELIC_IDS)
-    obs["reward_potion_ids"] = torch.full_like(obs["reward_potion_ids"], interface.PAD_ID)
-    feats = enc.encode_features(obs)
-    relic_width = interface.N_RELIC_IDS
-    potion_width = interface.MAX_REWARD_POTIONS * POTION_EMBED_DIM
-    card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
-    deck_width = _PILE_POOLS * CARD_EMBED_DIM
-    keys_act_width = interface.KEYS_ACT_DIM
-    # Appended after the potion block, in order: card_select, deck, keys/act, then the
-    # shop / boss-relic blocks (the current concat tail).
-    tail = (
-        _neow_event_tail_width()
-        + _shop_boss_tail_width()
-        + card_select_width
-        + deck_width
-        + keys_act_width
-    )
-    potion_block = feats[:, -(tail + potion_width) : -tail]
-    assert torch.equal(potion_block, torch.zeros(BATCH, potion_width))
-    relic_block = feats[:, -(tail + potion_width + relic_width) : -(tail + potion_width)]
-    assert torch.equal(relic_block, torch.zeros(BATCH, relic_width))
-
-
-def test_card_select_block_is_zero_when_all_pad():
-    """All-PAD card_select_ids -> the card-select block is exactly zero.
-
-    Relies on card_embed's padding_idx row (no masking): empty card-select slots
-    contribute a zero vector, so the card-select columns vanish. The block sits
-    before the appended deck and keys/act blocks.
-    """
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    obs["card_select_ids"] = torch.full_like(obs["card_select_ids"], interface.PAD_ID)
-    feats = enc.encode_features(obs)
-    card_select_width = interface.CHOICE_MAX * CARD_EMBED_DIM
-    deck_width = _PILE_POOLS * CARD_EMBED_DIM
-    keys_act_width = interface.KEYS_ACT_DIM
-    tail = _neow_event_tail_width() + _shop_boss_tail_width() + deck_width + keys_act_width
-    card_select_block = feats[:, -(tail + card_select_width) : -tail]
-    assert torch.equal(card_select_block, torch.zeros(BATCH, card_select_width))
-
-
-def test_deck_block_is_zero_when_all_pad():
-    """All-PAD deck_ids -> the pooled deck block is exactly zero (empty-deck safe).
-
-    The deck is pooled mean+max through card_embed's padding_idx row, so an all-PAD
-    (empty) deck contributes a zero block. The deck block sits before the keys/act and
-    the appended shop / boss-relic blocks.
-    """
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    obs["deck_ids"] = torch.full_like(obs["deck_ids"], interface.PAD_ID)
-    feats = enc.encode_features(obs)
-    keys_act_width = interface.KEYS_ACT_DIM
-    deck_width = _PILE_POOLS * CARD_EMBED_DIM
-    tail = _neow_event_tail_width() + _shop_boss_tail_width() + keys_act_width
-    deck_block = feats[:, -(tail + deck_width) : -tail]
-    assert torch.equal(deck_block, torch.zeros(BATCH, deck_width))
-
-
-def test_keys_act_is_passthrough_block():
-    """keys_act is a raw passthrough occupying its KEYS_ACT_DIM columns unchanged.
-
-    Not embedded: the encoder concatenates the coerced keys_act vector as-is, so the
-    concat slice at keys_act's offset (just before the appended shop / boss-relic
-    blocks) equals the input keys_act exactly.
-    """
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    known = torch.arange(BATCH * interface.KEYS_ACT_DIM, dtype=torch.float32).reshape(
-        BATCH, interface.KEYS_ACT_DIM
-    )
-    obs["keys_act"] = known
-    feats = enc.encode_features(obs)
-    tail = _neow_event_tail_width() + _shop_boss_tail_width()
-    assert torch.equal(feats[:, -(tail + interface.KEYS_ACT_DIM) : -tail], known)
-
-
-def test_gradient_flows_through_deck_path():
-    """A real card in deck_ids (all other card fields PAD) reaches card_embed.
-
-    Isolates the deck path: every other card-id field is PAD (padding_idx row 0
-    receives no gradient), so a nonzero card_embed gradient can only come from the
-    pooled deck block, proving encode_features wires deck_ids into the shared table.
-    The seed keeps the sparse-input ReLU liveness deterministic.
+    A plain Linear initializes near std 0.02; every id embedding's padding row is
+    exactly zero after construction (re-zeroed post-init, the load-bearing
+    PAD=zero invariant); and each block's residual out_proj is scaled by
+    1/sqrt(2 * N_TRANSFORMER_LAYERS), so its std is materially below 0.02.
     """
     torch.manual_seed(0)
     enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    for name in (
-        "hand_ids",
-        "draw_ids",
-        "discard_ids",
-        "exhaust_ids",
-        "reward_card_ids",
-        "card_select_ids",
-        "deck_ids",
+
+    # A representative non-residual Linear sits near the 0.02 target.
+    sample_std = enc.cls_mlp[0].weight.std().item()
+    assert 0.005 < sample_std < 0.05
+
+    # Every id embedding's padding row stays exactly zero after construction.
+    for emb in (
+        enc.card_embed,
+        enc.enemy_embed,
+        enc.move_embed,
+        enc.potion_embed,
+        enc.relic_embed,
     ):
-        obs[name] = torch.full_like(obs[name], interface.PAD_ID)
-    real_id = interface.PAD_ID + 1  # any non-PAD card id
-    obs["deck_ids"][:, 0] = real_id
-    enc(obs).sum().backward()
-    grad = enc.card_embed.weight.grad
-    assert grad is not None
-    # Only the deck slot's id can carry gradient; the PAD row must stay zero.
-    assert torch.count_nonzero(grad[real_id]) > 0
-    assert torch.equal(grad[interface.PAD_ID], torch.zeros(CARD_EMBED_DIM))
+        assert torch.equal(emb.weight[emb.padding_idx], torch.zeros(emb.embedding_dim))
+
+    # Residual out_proj is scaled by 1/sqrt(2N), so materially below 0.02.
+    residual_std = enc.blocks[0].attn.out_proj.weight.std().item()
+    assert 0.0 < residual_std < 0.02 / 2
 
 
-def test_keys_act_influences_trunk():
-    """The keys/act columns feed the first trunk Linear (nonzero -> gradient there).
+def test_key_padding_mask_true_exactly_at_pad_slots():
+    """The mask is True on every entity PAD slot and False on the context tokens.
 
-    keys_act has no embedding table, so its learning signal shows up as gradient on
-    the first trunk Linear's keys/act input columns (just before the appended shop /
-    boss-relic columns); a nonzero keys_act input drives gradient into exactly those
-    columns. The seed keeps the sparse-input ReLU liveness deterministic.
+    Table-driven over the entity types: an all-PAD obs masks every entity slot;
+    setting one slot per type to a real id clears exactly that slot. Context
+    tokens (the sequence tail) are never masked.
+    """
+    enc = ObsFeatureEncoder()
+    obs = _all_pad_obs(BATCH)
+    _, _, mask = enc(obs)
+    # Entity portion all True, context portion all False.
+    assert bool(mask[:, : enc.n_entity_tokens].all())
+    assert bool((~mask[:, enc.n_entity_tokens :]).all())
+
+    for spec in _ENTITY_SPECS:
+        obs_one = {k: v.clone() for k, v in obs.items()}
+        real = 0 if spec.pad_is_relic_invalid else interface.PAD_ID + 1  # AKABEKO(0) for relics
+        obs_one[spec.id_field][:, 0] = real
+        _, _, mask_one = enc(obs_one)
+        start, count = enc.token_layout[spec.name]
+        block = mask_one[:, start : start + count]
+        assert bool((~block[:, 0]).all()), f"{spec.name}: slot 0 should be unmasked"
+        if count > 1:
+            assert bool(block[:, 1:].all()), f"{spec.name}: slots 1.. should stay masked"
+
+
+def test_no_all_pad_attention_row():
+    """Even an all-PAD-entity obs leaves every row with the six valid context keys.
+
+    This is the attention-side analogue of the action-side all-illegal guard: no
+    attention row is all-`-inf`, so the softmax never NaNs.
+    """
+    enc = ObsFeatureEncoder()
+    _, _, mask = enc(_all_pad_obs(BATCH))
+    valid_per_row = (~mask).sum(dim=1)
+    assert bool((valid_per_row >= 1).all())
+    # Exactly the six context tokens are valid when every entity slot is PAD.
+    assert bool((valid_per_row == (1 + len(_PILE_SPECS) + 1)).all())
+
+
+def test_pad_slot_perturbation_does_not_leak_and_revert_confirms_mask():
+    """Perturbing a PAD slot's raw features leaves the pooled context unchanged.
+
+    Revert-verify: with the mask removed, CLS attends to the PAD token and the
+    pooled context DOES change - proving the mask is what suppresses PAD-token
+    influence, not a coincidence. The never-PAD context-token rows of per_token
+    are checked the same way: masked they are unchanged, unmasked they leak.
+    """
+    enc = ObsFeatureEncoder()
+    enc.eval()
+    obs = _all_pad_obs(BATCH)  # hand slots are PAD, so hand_feats sit on PAD tokens
+    perturbed = {k: v.clone() for k, v in obs.items()}
+    perturbed["hand_feats"][:, 0, :] = 5.0  # a PAD hand slot's raw feature
+
+    with torch.no_grad():
+        tok_base, pooled_base, _ = enc(obs)
+        tok_pert, pooled_pert, _ = enc(perturbed)
+        tok_base_nomask, pooled_base_nomask, _ = enc(obs, apply_padding_mask=False)
+        tok_pert_nomask, pooled_pert_nomask, _ = enc(perturbed, apply_padding_mask=False)
+
+    assert torch.allclose(pooled_base, pooled_pert, atol=1e-6)
+    assert not torch.allclose(pooled_base_nomask, pooled_pert_nomask, atol=1e-6)
+    # Same guarantee for the never-PAD context-token rows (the sequence tail):
+    # masked they cannot attend to the perturbed PAD slot, unmasked they do.
+    ctx = slice(enc.n_entity_tokens, None)
+    assert torch.allclose(tok_base[:, ctx], tok_pert[:, ctx], atol=1e-6)
+    assert not torch.allclose(tok_base_nomask[:, ctx], tok_pert_nomask[:, ctx], atol=1e-6)
+
+
+def test_pooled_pile_is_permutation_invariant():
+    """Permuting an order-agnostic pooled pile leaves the output unchanged.
+
+    Piles (draw/discard/exhaust/deck) are mean+max pooled, so reordering their
+    slots must not move the pooled context. Slotted types are covered by the
+    slot-stability test below.
+    """
+    enc = ObsFeatureEncoder()
+    enc.eval()
+    obs = _all_pad_obs(BATCH)
+    obs["draw_ids"][:, 0] = 3
+    obs["draw_ids"][:, 1] = 7
+    permuted = {k: v.clone() for k, v in obs.items()}
+    permuted["draw_ids"] = obs["draw_ids"].flip(dims=[1])
+    with torch.no_grad():
+        _, pooled, _ = enc(obs)
+        _, pooled_perm, _ = enc(permuted)
+    assert torch.allclose(pooled, pooled_perm, atol=1e-6)
+
+
+def test_hand_slot_order_matters():
+    """Swapping two live HAND slots' ids changes the output (slot stability).
+
+    Unlike the pooled piles, slotted types carry a slot-id embedding, so slot
+    order is significant: a later per-entity head maps action slots to token
+    slots, so the encoder must not be permutation-invariant over them.
+    """
+    enc = ObsFeatureEncoder()
+    enc.eval()
+    obs = _all_pad_obs(BATCH)
+    obs["hand_ids"][:, 0] = 3
+    obs["hand_ids"][:, 1] = 7
+    swapped = {k: v.clone() for k, v in obs.items()}
+    swapped["hand_ids"][:, 0] = 7
+    swapped["hand_ids"][:, 1] = 3
+    with torch.no_grad():
+        _, pooled, _ = enc(obs)
+        _, pooled_swapped, _ = enc(swapped)
+    assert not torch.allclose(pooled, pooled_swapped, atol=1e-6)
+
+
+def test_gradient_flows_to_every_parameter():
+    """One backward reaches every encoder parameter with a finite gradient.
+
+    Uses an all-live obs so every token type is non-PAD, activating every
+    embedding table (card/enemy/move/potion/relic), per-type projection, the type
+    and slot-id embeddings, every transformer block parameter, and the CLS / pile
+    / OFFER context projections.
     """
     torch.manual_seed(0)
     enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    obs["keys_act"] = torch.ones_like(obs["keys_act"])
-    enc(obs).sum().backward()
-    grad = enc.trunk[0].weight.grad
-    assert grad is not None
-    tail = _neow_event_tail_width() + _shop_boss_tail_width()
-    assert torch.count_nonzero(grad[:, -(tail + interface.KEYS_ACT_DIM) : -tail]) > 0
+    per_token, _, _ = enc(_all_live_obs(BATCH))
+    per_token.sum().backward()
+    missing = [name for name, p in enc.named_parameters() if p.grad is None]
+    nonfinite = [
+        name
+        for name, p in enc.named_parameters()
+        if p.grad is not None and not torch.isfinite(p.grad).all()
+    ]
+    assert not missing, f"parameters with no gradient: {missing}"
+    assert not nonfinite, f"parameters with non-finite gradient: {nonfinite}"
 
 
-def test_gradient_flows_to_embeddings():
-    enc = ObsFeatureEncoder()
-    out = enc(sample_observation_batch(BATCH))
-    out.sum().backward()
-    assert enc.card_embed.weight.grad is not None
-    assert enc.enemy_embed.weight.grad is not None
-    assert enc.potion_embed.weight.grad is not None
+def test_id_embedding_pad_row_gets_no_gradient():
+    """A real relic drives gradient into its row; the INVALID pad row stays zero.
 
-
-def test_gradient_flows_through_reward_path():
-    """A real card in reward_card_ids (all other card fields PAD) reaches card_embed.
-
-    Isolates the reward path: every other card-id field is PAD (padding_idx row 0
-    receives no gradient), so a nonzero card_embed gradient can only come from the
-    reward block, proving encode_features wires reward_card_ids into the shared
-    table. The seed keeps the sparse-input ReLU liveness deterministic.
+    Isolates the relic path: with every relic slot INVALID except one real relic,
+    only that relic's embedding row may carry gradient, and relic_embed's
+    padding_idx (INVALID) row must stay exactly zero.
     """
     torch.manual_seed(0)
     enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    for name in ("hand_ids", "draw_ids", "discard_ids", "exhaust_ids", "reward_card_ids"):
-        obs[name] = torch.full_like(obs[name], interface.PAD_ID)
-    real_id = interface.PAD_ID + 1  # any non-PAD card id
-    obs["reward_card_ids"][:, 0] = real_id
-    enc(obs).sum().backward()
-    grad = enc.card_embed.weight.grad
+    obs = _all_pad_obs(BATCH)
+    real_relic = 5
+    obs["reward_relic_ids"][:, 0] = real_relic
+    per_token, _, _ = enc(obs)
+    per_token.sum().backward()
+    grad = enc.relic_embed.weight.grad
     assert grad is not None
-    # Only the reward slot's id can carry gradient; the PAD row must stay zero.
-    assert torch.count_nonzero(grad[real_id]) > 0
-    assert torch.equal(grad[interface.PAD_ID], torch.zeros(CARD_EMBED_DIM))
-
-
-def test_gradient_flows_through_reward_potion_path():
-    """A real potion in reward_potion_ids (all other potion fields PAD) reaches potion_embed.
-
-    Isolates the reward-potion path: every other potion-id field is PAD
-    (padding_idx row 0 receives no gradient), so a nonzero potion_embed gradient
-    can only come from the reward-potion block, proving encode_features wires
-    reward_potion_ids into the shared table. The seed keeps the sparse-input ReLU
-    liveness deterministic.
-    """
-    torch.manual_seed(0)
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    for name in ("potion_ids", "reward_potion_ids"):
-        obs[name] = torch.full_like(obs[name], interface.PAD_ID)
-    real_id = interface.PAD_ID + 1  # any non-PAD potion id
-    obs["reward_potion_ids"][:, 0] = real_id
-    enc(obs).sum().backward()
-    grad = enc.potion_embed.weight.grad
-    assert grad is not None
-    # Only the reward-potion slot's id can carry gradient; the PAD row stays zero.
-    assert torch.count_nonzero(grad[real_id]) > 0
-    assert torch.equal(grad[interface.PAD_ID], torch.zeros(POTION_EMBED_DIM))
-
-
-def test_gradient_flows_through_card_select_path():
-    """A real card in card_select_ids (all other card fields PAD) reaches card_embed.
-
-    Isolates the card-select path: every other card-id field is PAD (padding_idx
-    row 0 receives no gradient), so a nonzero card_embed gradient can only come
-    from the card-select block, proving encode_features wires card_select_ids into
-    the shared table. The seed keeps the sparse-input ReLU liveness deterministic.
-    """
-    torch.manual_seed(0)
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    for name in (
-        "hand_ids",
-        "draw_ids",
-        "discard_ids",
-        "exhaust_ids",
-        "reward_card_ids",
-        "card_select_ids",
-    ):
-        obs[name] = torch.full_like(obs[name], interface.PAD_ID)
-    real_id = interface.PAD_ID + 1  # any non-PAD card id
-    obs["card_select_ids"][:, 0] = real_id
-    enc(obs).sum().backward()
-    grad = enc.card_embed.weight.grad
-    assert grad is not None
-    # Only the card-select slot's id can carry gradient; the PAD row must stay zero.
-    assert torch.count_nonzero(grad[real_id]) > 0
-    assert torch.equal(grad[interface.PAD_ID], torch.zeros(CARD_EMBED_DIM))
-
-
-def test_gradient_flows_to_trunk_relic_multihot_columns():
-    """A real offered relic drives gradient into the first trunk layer's relic columns.
-
-    The relic multihot has no embedding table, so its learning signal shows up as
-    gradient on the first trunk Linear's input columns rather than on an embedding
-    row. With exactly one offered relic (every other slot the INVALID empty marker),
-    only that relic's column in the relic block is a nonzero input, so only its
-    trunk-weight column may carry gradient; AKABEKO's column 0 (empties are INVALID,
-    not 0) and any unoffered relic column must stay exactly zero. The INVALID column is
-    dropped from the block, so an empty slot sets no kept column at all. The seed keeps
-    the sparse-input ReLU liveness deterministic.
-    """
-    torch.manual_seed(0)
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    # Every slot empty (INVALID sentinel), then offer one real, non-AKABEKO relic.
-    obs["reward_relic_ids"] = torch.full_like(obs["reward_relic_ids"], interface.N_RELIC_IDS)
-    real_id = 5  # any real relic id with 0 < real_id < N_RELIC_IDS
-    obs["reward_relic_ids"][:, 0] = real_id
-    enc(obs).sum().backward()
-
-    grad = enc.trunk[0].weight.grad
-    assert grad is not None
-    relic_start = _relic_block_start(enc)
-    # The offered relic's column carries gradient...
-    assert torch.count_nonzero(grad[:, relic_start + real_id]) > 0
-    # ...while AKABEKO's column 0 (unoffered here; empties are INVALID, not 0) and any
-    # other unoffered relic column stay exactly zero -- an empty slot sets no kept column.
-    assert torch.count_nonzero(grad[:, relic_start + 0]) == 0  # AKABEKO not offered
-    unoffered_id = 2
-    assert torch.count_nonzero(grad[:, relic_start + unoffered_id]) == 0
-
-
-def test_offered_akabeko_sets_its_relic_output_column():
-    """Offering AKABEKO (RelicId 0) sets relic-block column 0 - it is a real relic.
-
-    Regression for the empty-sentinel fix: AKABEKO must be distinguishable from an
-    empty slot. Under the earlier "clear column PAD_ID(0)" multihot, column 0 was
-    forced to zero, silently erasing an offered AKABEKO; the INVALID-as-empty design
-    keeps column 0 for AKABEKO and drops the INVALID column instead. FAILS if that
-    clear-column-0 behavior is reverted.
-    """
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    # Empty every slot (INVALID), then offer AKABEKO (id 0) in slot 0.
-    obs["reward_relic_ids"] = torch.full_like(obs["reward_relic_ids"], interface.N_RELIC_IDS)
-    akabeko = 0  # RelicId.AKABEKO
-    obs["reward_relic_ids"][:, 0] = akabeko
-    feats = enc.encode_features(obs)
-    relic_start = _relic_block_start(enc)
-    relic_block = feats[:, relic_start : relic_start + interface.N_RELIC_IDS]
-    # AKABEKO's column 0 is set; every other relic column stays zero (the other slots
-    # are INVALID empties, which land in the dropped column).
-    expected = torch.zeros(BATCH, interface.N_RELIC_IDS)
-    expected[:, akabeko] = 1.0
-    assert torch.equal(relic_block, expected)
-
-
-def test_reward_relic_block_zero_when_all_empty():
-    """All-INVALID (empty) reward_relic_ids -> the relic block is exactly zero.
-
-    Empty relic slots carry the INVALID sentinel (N_RELIC_IDS), which scatters into the
-    encoder's dropped final column, so no kept column is set. The relic counterpart to
-    the card / potion all-PAD-zero tests, keyed on INVALID rather than PAD 0 because
-    RelicId 0 (AKABEKO) is a real relic.
-    """
-    enc = ObsFeatureEncoder()
-    obs = sample_observation_batch(BATCH)
-    obs["reward_relic_ids"] = torch.full_like(obs["reward_relic_ids"], interface.N_RELIC_IDS)
-    feats = enc.encode_features(obs)
-    relic_start = _relic_block_start(enc)
-    relic_block = feats[:, relic_start : relic_start + interface.N_RELIC_IDS]
-    assert torch.equal(relic_block, torch.zeros(BATCH, interface.N_RELIC_IDS))
-
-
-# Shop / boss relic-offer multihot fields, each mapped to its concat block start. The
-# reward-relic field has its own dedicated tests above; these cover the new fields.
-_SHOP_BOSS_RELIC_BLOCKS = {
-    "shop_relic_ids": _shop_relic_block_start,
-    "boss_relic_ids": _boss_relic_block_start,
-}
-
-
-@pytest.mark.parametrize("field_name", sorted(_SHOP_BOSS_RELIC_BLOCKS))
-def test_offered_shop_boss_relic_distinguishable_from_empty_slot(field_name):
-    """A real offered relic in a shop / boss slot sets its own output column; an empty
-    slot (INVALID) sets none -- the AKABEKO-class guard for the new relic fields.
-
-    Regression for the empty-sentinel design (mirrors the reward-relic guard): offering
-    AKABEKO (RelicId 0) must set column 0, distinguishable from an empty slot. Under a
-    "clear column PAD_ID(0)" multihot, column 0 would be forced to zero, silently
-    erasing an offered AKABEKO; the INVALID-as-empty design keeps column 0 for AKABEKO
-    and drops the INVALID column instead. FAILS if that behavior is reverted.
-    """
-    enc = ObsFeatureEncoder()
-    block_start = _SHOP_BOSS_RELIC_BLOCKS[field_name](enc)
-    obs = sample_observation_batch(BATCH)
-
-    # Every slot empty (INVALID sentinel) -> no kept column set anywhere in the block.
-    obs[field_name] = torch.full_like(obs[field_name], interface.N_RELIC_IDS)
-    empty_block = enc.encode_features(obs)[:, block_start : block_start + interface.N_RELIC_IDS]
-    assert torch.equal(empty_block, torch.zeros(BATCH, interface.N_RELIC_IDS))
-
-    # Offer AKABEKO (id 0) in slot 0 -> exactly column 0 is set, distinguishable from
-    # the all-empty case above (an empty slot would have left column 0 zero).
-    akabeko = 0  # RelicId.AKABEKO
-    obs[field_name][:, 0] = akabeko
-    block = enc.encode_features(obs)[:, block_start : block_start + interface.N_RELIC_IDS]
-    expected = torch.zeros(BATCH, interface.N_RELIC_IDS)
-    expected[:, akabeko] = 1.0
-    assert torch.equal(block, expected)
+    assert torch.count_nonzero(grad[real_relic]) > 0
+    assert torch.equal(grad[interface.N_RELIC_IDS], torch.zeros(RELIC_EMBED_DIM))
 
 
 def test_deterministic_in_eval_mode():
@@ -622,71 +368,133 @@ def test_deterministic_in_eval_mode():
     enc.eval()
     obs = sample_observation_batch(BATCH)
     with torch.no_grad():
-        first = enc(obs)
-        second = enc(obs)
-    assert torch.equal(first, second)
+        first_tokens, first_pooled, _ = enc(obs)
+        second_tokens, second_pooled, _ = enc(obs)
+    assert torch.equal(first_tokens, second_tokens)
+    assert torch.equal(first_pooled, second_pooled)
 
 
-def _canonical_baseline_obs(batch: int) -> dict[str, torch.Tensor]:
-    """Zero/PAD baseline: every id field all-PAD, every float field all-zero.
+def test_every_obs_field_influences_output():
+    """Every declared OBS_FIELD must move the pooled context when perturbed alone.
 
-    A controlled constant baseline (not a random sample) so that a single-field
-    perturbation is the ONLY thing that can move the encoder output, isolating each
-    field's influence.
-    """
-    obs: dict[str, torch.Tensor] = {}
-    for f in interface.OBS_FIELDS:
-        if f.bounds == "id":
-            obs[f.name] = torch.full((batch, *f.shape), interface.PAD_ID, dtype=torch.long)
-        else:
-            obs[f.name] = torch.zeros((batch, *f.shape), dtype=torch.float32)
-    return obs
-
-
-def _perturb_field(field: interface.ObsField, batch: int) -> torch.Tensor:
-    """One field changed away from the baseline, staying in the field's declared bounds.
-
-    id fields flip PAD -> a distinct in-range non-PAD id; float fields take a nonzero
-    in-bounds constant (interior of the unit range for "unit", 1.0 for "real").
-    """
-    if field.bounds == "id":
-        return torch.full((batch, *field.shape), interface.PAD_ID + 1, dtype=torch.long)
-    value = 0.5 if field.bounds == "unit" else 1.0
-    return torch.full((batch, *field.shape), value, dtype=torch.float32)
-
-
-def test_every_obs_field_influences_encoder_output():
-    """Every declared OBS_FIELD must move the encoder output when perturbed alone.
-
-    The durable guard for the whole class of bug this observation-coverage work
-    addressed: a field the environment declares and populates but the encoder silently
-    ignores would leave the output unchanged here and fail CI. Sweeps the live
-    OBS_FIELDS registry (no hardcoded field list), perturbing exactly one field against
-    a zero/PAD baseline and asserting both the pre-trunk concat and the eval-mode trunk
-    output change. Skips nothing: a field that cannot influence the output is surfaced
-    as a failure, not skipped.
+    The durable guard against a field the environment declares and populates but
+    the encoder silently drops: it would leave the output unchanged here and fail.
+    Sweeps the live OBS_FIELDS registry (no hardcoded field list) against an
+    all-live baseline (so no perturbation is hidden behind a PAD mask), asserting
+    both the per-token embeddings and the pooled context change. Skips nothing.
     """
     torch.manual_seed(0)
     enc = ObsFeatureEncoder()
     enc.eval()
-    baseline = _canonical_baseline_obs(BATCH)
+    baseline = _all_live_obs(BATCH)
     with torch.no_grad():
-        base_feats = enc.encode_features(baseline)
-        base_out = enc(baseline)
+        base_tokens, base_pooled, _ = enc(baseline)
 
     ignored: list[str] = []
     for field in interface.OBS_FIELDS:
         obs = {name: t.clone() for name, t in baseline.items()}
-        obs[field.name] = _perturb_field(field, BATCH)
+        obs[field.name] = _perturb_field(field, BATCH, live=True)
         with torch.no_grad():
-            feats = enc.encode_features(obs)
-            out = enc(obs)
-        # encode_features changing proves the field enters the concat (the encoder
-        # consumes it); the trunk output changing confirms it reaches the actual output.
-        if torch.equal(feats, base_feats) or torch.equal(out, base_out):
+            tokens, pooled, _ = enc(obs)
+        if torch.equal(tokens, base_tokens) or torch.equal(pooled, base_pooled):
             ignored.append(field.name)
 
     assert not ignored, (
-        "OBS_FIELDS declared/populated by the env but ignored by the encoder "
-        f"(no output change when perturbed alone): {ignored}"
+        "OBS_FIELDS declared/populated by the env but not reflected in the encoder "
+        f"output when perturbed alone: {ignored}"
     )
+
+
+# The three per-slot relic token types, whose empty marker is the relic INVALID
+# sentinel; each has its own tests here for the AKABEKO-distinguishable guard.
+_RELIC_ENTITY_SPECS = [spec for spec in _ENTITY_SPECS if spec.pad_is_relic_invalid]
+
+
+@pytest.mark.parametrize("spec", _RELIC_ENTITY_SPECS, ids=lambda s: s.name)
+def test_offered_relic_distinguishable_from_empty_slot(spec):
+    """A real offered relic (incl. AKABEKO, id 0) is unmasked; an empty slot is masked.
+
+    Regression for the INVALID-as-empty design: RelicId 0 (AKABEKO) is a real
+    relic that must be distinguishable from an empty slot. An empty relic slot is
+    the INVALID sentinel (N_RELIC_IDS) -> masked; AKABEKO in slot 0 -> unmasked.
+    """
+    enc = ObsFeatureEncoder()
+    obs = _all_pad_obs(BATCH)  # every relic slot INVALID (masked)
+    start, count = enc.token_layout[spec.name]
+    _, _, mask_empty = enc(obs)
+    assert bool(mask_empty[:, start : start + count].all())  # all empty -> all masked
+
+    obs[spec.id_field][:, 0] = 0  # AKABEKO, a real relic
+    _, _, mask_akabeko = enc(obs)
+    assert bool((~mask_akabeko[:, start]).all())  # AKABEKO slot unmasked
+    if count > 1:
+        assert bool(mask_akabeko[:, start + 1 : start + count].all())  # others still masked
+
+
+def test_token_widths_derive_from_interface_constants():
+    """Every projection input width is the interface-derived feature width, no literal."""
+    enc = ObsFeatureEncoder()
+    _scalar = 1
+    expected_feat_dim = {
+        "HAND": CARD_EMBED_DIM + interface.HAND_FEAT_DIM,
+        "ENEMY": (
+            ENEMY_EMBED_DIM
+            + interface.ENEMY_SCALAR_DIM
+            + MOVE_EMBED_DIM
+            + _scalar
+            + interface.N_MONSTER_POWER_IDS
+            + _scalar
+        ),
+        "POTION": POTION_EMBED_DIM + _scalar,
+        "CARD_SELECT": CARD_EMBED_DIM,
+        "REWARD_CARD": CARD_EMBED_DIM,
+        "REWARD_POTION": POTION_EMBED_DIM,
+        "REWARD_RELIC": RELIC_EMBED_DIM,
+        "SHOP_CARD": CARD_EMBED_DIM + _scalar,
+        "SHOP_RELIC": RELIC_EMBED_DIM + _scalar,
+        "SHOP_POTION": POTION_EMBED_DIM + _scalar,
+        "BOSS_RELIC": RELIC_EMBED_DIM,
+    }
+    for spec in _ENTITY_SPECS:
+        assert enc.entity_proj[spec.name].in_features == expected_feat_dim[spec.name]
+        assert enc.entity_proj[spec.name].out_features == HIDDEN_DIM
+
+    assert enc.pile_proj.in_features == _PILE_POOLS * CARD_EMBED_DIM
+    # CLS folds the six global blocks; OFFER folds the map / event / Neow blocks.
+    expected_cls = (
+        interface.PLAYER_SCALAR_DIM
+        + interface.N_PLAYER_POWER_IDS
+        + interface.N_RELIC_IDS
+        + interface.N_SCREENS
+        + interface.KEYS_ACT_DIM
+        + _scalar
+    )
+    expected_offer = (
+        interface.MAP_CONTEXT_DIM
+        + interface.N_EVENT_IDS
+        + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_BONUS
+        + interface.MAX_NEOW_OPTIONS * interface.N_NEOW_DRAWBACK
+    )
+    assert _CLS_INPUT_DIM == expected_cls
+    assert _OFFER_INPUT_DIM == expected_offer
+    assert enc.cls_mlp[0].in_features == expected_cls
+    assert enc.offer_mlp[0].in_features == expected_offer
+    # Type embedding covers every token type; slot-id table is sized to the widest.
+    assert enc.type_embed.num_embeddings == len(_ENTITY_SPECS) + 1 + len(_PILE_SPECS) + 1
+    assert enc.slot_id_embed.num_embeddings == max(spec.count for spec in _ENTITY_SPECS)
+
+
+def test_transformer_shape_constants_match_design():
+    """The transformer runs at the design's d_model / layers / heads / d_ff."""
+    enc = ObsFeatureEncoder()
+    assert enc.d_model == HIDDEN_DIM == 128
+    assert len(enc.blocks) == N_TRANSFORMER_LAYERS == 3
+    assert N_ATTENTION_HEADS == 4
+    assert HIDDEN_DIM % N_ATTENTION_HEADS == 0
+    assert FFN_DIM == 4 * HIDDEN_DIM
+
+
+def test_non_divisible_d_model_raises():
+    """A d_model not divisible by the head count fails with a clear error."""
+    with pytest.raises(ValueError, match="divisible by"):
+        ObsFeatureEncoder(d_model=HIDDEN_DIM + 1)

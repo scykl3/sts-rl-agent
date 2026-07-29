@@ -385,10 +385,10 @@ def bc_pretrain(
     sub-slice (not the full ACTION_DIM), so only card + skip logits participate.
 
     Default trains end-to-end from a combat warm-start. The freeze_encoder
-    option is exposed but NOT recommended: the card-vision encoder's suffix
-    columns in trunk.0 are zero-initialized, so a frozen trunk cannot propagate
-    card identity to the head. End-to-end training with a modest LR is the
-    intended recipe.
+    option is exposed but NOT recommended: a frozen encoder cannot adapt its
+    entity-token representations (the card / relic embeddings and the attention)
+    to the card-selection objective, so the head would learn over fixed features.
+    End-to-end training with a modest LR is the intended recipe.
 
     Args:
         model: ActorCritic with encoder, policy head.
@@ -413,9 +413,9 @@ def bc_pretrain(
 
     if freeze_encoder:
         logger.warning(
-            "freeze_encoder=True: card-vision suffix columns in trunk.0 are "
-            "zero-initialized, so a frozen trunk cannot propagate card identity. "
-            "This is NOT recommended for BC pretraining."
+            "freeze_encoder=True: a frozen encoder cannot adapt its entity-token "
+            "representations to the card-selection objective, so only the policy "
+            "head learns. This is NOT recommended for BC pretraining."
         )
         for param in model.encoder.parameters():
             param.requires_grad = False
@@ -481,9 +481,11 @@ def bc_pretrain(
             action_batch = action_batch.to(device)
             mask_batch = mask_batch.to(device)
 
-            # Forward: get raw logits from the policy head's linear layer
-            features = model.encoder(obs_batch)
-            raw_logits = model.policy.logits(features)  # (B, ACTION_DIM)
+            # Forward: the encoder returns (per_token, pooled_cls, mask); BC reads
+            # the per-token embeddings + padding mask, then the pointer head's raw
+            # (pre-mask) logits over the full action space.
+            per_token, _features, key_padding_mask = model.encoder(obs_batch)
+            raw_logits = model.policy.raw_logits(per_token, key_padding_mask)  # (B, ACTION_DIM)
 
             # Extract the card sub-slice logits
             subslice_logits = raw_logits[:, _CARD_SUBSLICE_INDICES]  # (B, 9)
@@ -515,8 +517,8 @@ def bc_pretrain(
                 action_batch = action_batch.to(device)
                 mask_batch = mask_batch.to(device)
 
-                features = model.encoder(obs_batch)
-                raw_logits = model.policy.logits(features)
+                per_token, _features, key_padding_mask = model.encoder(obs_batch)
+                raw_logits = model.policy.raw_logits(per_token, key_padding_mask)
                 subslice_logits = raw_logits[:, _CARD_SUBSLICE_INDICES]
                 subslice_logits = subslice_logits.masked_fill(~mask_batch, MASKED_LOGIT)
 

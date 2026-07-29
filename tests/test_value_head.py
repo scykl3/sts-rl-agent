@@ -18,9 +18,10 @@ BATCH = 4
 
 
 def _features(batch: int = BATCH) -> torch.Tensor:
-    """Trunk features for a sampled batch (detached from the encoder graph)."""
+    """Pooled CLS context for a sampled batch (detached from the encoder graph)."""
     enc = ObsFeatureEncoder()
-    return enc(sample_observation_batch(batch)).detach()
+    _per_token, pooled_cls, _mask = enc(sample_observation_batch(batch))
+    return pooled_cls.detach()
 
 
 def test_forward_shape_is_flat_and_finite():
@@ -49,7 +50,7 @@ def test_singleton_batch_stays_one_dim():
 
 
 def test_input_dim_defaults_to_encoder_output():
-    """Head's default input width tracks the encoder trunk, not a literal."""
+    """Head's default input width tracks the encoder output width, not a literal."""
     enc = ObsFeatureEncoder()
     head = ValueHead()
     assert head.input_dim == enc.output_dim == HIDDEN_DIM

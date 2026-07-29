@@ -374,8 +374,8 @@ class TestBCPretrain:
                 arr = synthetic_dataset.obs_arrays[f.name]
                 dtype = torch.long if f.name in id_fields else torch.float32
                 obs_batch[f.name] = torch.as_tensor(arr, dtype=dtype)
-            features = model.encoder(obs_batch)
-            logits = model.policy.logits(features)
+            per_token, _pooled_cls, kpm = model.encoder(obs_batch)
+            logits = model.policy.raw_logits(per_token, kpm)
             subslice_logits = logits[:, _CARD_SUBSLICE_INDICES]
             mask_t = torch.as_tensor(synthetic_dataset.masks, dtype=torch.bool)
             subslice_logits = subslice_logits.masked_fill(~mask_t, -1e9)
