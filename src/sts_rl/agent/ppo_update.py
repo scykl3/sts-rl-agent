@@ -19,6 +19,7 @@ import torch
 from sts_rl.agent.actor_critic import ActorCritic
 from sts_rl.agent.ppo import DEFAULT_CLIP_COEF, clipped_policy_loss, clipped_value_loss
 from sts_rl.agent.rollout_buffer import SupportsMinibatches
+from sts_rl.agent.running_moments import RunningMoments
 
 # Standard PPO objective weights and update schedule. Named so a tuning change
 # propagates instead of being buried as literals in PPOConfig's signature.
@@ -27,8 +28,16 @@ DEFAULT_ENT_COEF: float = 0.01
 DEFAULT_N_EPOCHS: int = 4
 DEFAULT_MINIBATCH_SIZE: int = 64
 DEFAULT_MAX_GRAD_NORM: float = 0.5
-# Denominator floor for per-minibatch advantage normalization; avoids a blow-up
-# when a minibatch has near-zero advantage spread.
+# EWMA decay for advantage normalization, applied per item to the running
+# moments (see RunningMoments). decay=1.0 gives retain 0, so every minibatch is
+# normalized against the whole rollout's population stats; that differs from the
+# prior per-minibatch normalization whenever there is more than one minibatch.
+# Effective smoothing depends on rollout size via the per-item exponent,
+# retain = (1 - decay) ** n, so at 5e-4 a ~2048-step rollout retains ~0.36 of
+# the prior estimate.
+DEFAULT_ADV_NORM_DECAY: float = 5e-4
+# Denominator floor for advantage normalization; avoids a blow-up when the
+# running advantage spread is near zero (all-equal or still-cold stream).
 ADV_NORM_EPS: float = 1e-8
 # Return-variance floor below which explained variance is ill-conditioned; we
 # return a finite 0.0 rather than SB3/CleanRL's nan (see _explained_variance).
@@ -41,11 +50,15 @@ class PPOConfig:
 
     ``clip_coef`` is shared with the surrogate/value clipping in
     :mod:`sts_rl.agent.ppo`, so its default is imported from there rather than
-    re-declared. The two booleans toggle the per-minibatch advantage
-    normalization and the PPO2 clipped value loss respectively. ``target_kl``
-    is the approximate-KL threshold above which the update stops early (``None``
-    disables it): a standard PPO guard against moving the policy too far from
-    the data-collection policy in one update.
+    re-declared. The two booleans toggle advantage normalization and the PPO2
+    clipped value loss respectively. ``adv_norm_decay`` is the per-item EWMA
+    decay for that advantage normalization (see :class:`RunningMoments`); 1.0
+    gives retain 0, normalizing every minibatch against the whole rollout's
+    population stats, which differs from the prior per-minibatch normalization
+    when there is more than one minibatch. ``target_kl`` is the approximate-KL
+    threshold above which the update stops early (``None`` disables it): a
+    standard PPO guard against moving the policy too far from the
+    data-collection policy in one update.
     """
 
     clip_coef: float = DEFAULT_CLIP_COEF
@@ -55,6 +68,7 @@ class PPOConfig:
     minibatch_size: int = DEFAULT_MINIBATCH_SIZE
     max_grad_norm: float = DEFAULT_MAX_GRAD_NORM
     normalize_advantages: bool = True
+    adv_norm_decay: float = DEFAULT_ADV_NORM_DECAY
     clip_value_loss: bool = True
     target_kl: float | None = None
 
@@ -79,6 +93,12 @@ class PPOStats:
     # perfect, 0.0 is no better than predicting the mean, and it can be negative.
     explained_variance: float
     n_updates: int
+    # Running advantage-normalization scale from the shared/transient
+    # RunningMoments (its std and mean) as of this update; 0.0 when advantage
+    # normalization is off. Observability only. Defaulted and placed last so
+    # existing PPOStats(...) call sites are unaffected.
+    adv_norm_std: float = 0.0
+    adv_norm_mean: float = 0.0
 
 
 def _explained_variance(y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
@@ -104,6 +124,7 @@ def ppo_update(
     buffer: SupportsMinibatches,
     optimizer: torch.optim.Optimizer,
     config: PPOConfig = PPOConfig(),
+    adv_moments: RunningMoments | None = None,
 ) -> PPOStats:
     """Run ``config.n_epochs`` PPO epochs over ``buffer``; return mean diagnostics.
 
@@ -114,6 +135,14 @@ def ppo_update(
     steps the optimizer. Returns the mean of each scalar stat over every
     minibatch update; an empty buffer (zero minibatches) yields zeroed stats
     with ``n_updates == 0`` rather than dividing by zero.
+
+    When ``config.normalize_advantages`` is set, advantages are standardized
+    against a :class:`RunningMoments` EWMA rather than each minibatch's own
+    spread: the whole rollout's advantages are folded into the tracker ONCE per
+    call (before the epochs), then every minibatch is normalized against those
+    running stats. Pass ``adv_moments`` to share one tracker across calls so the
+    EWMA persists over training; when it is ``None`` a transient tracker is used
+    so a standalone call still normalizes (against just this rollout).
     """
     policy_loss_sum = 0.0
     value_loss_sum = 0.0
@@ -124,18 +153,38 @@ def ppo_update(
     grad_norm_sum = 0.0
     n_updates = 0
 
+    # Advantage normalization tracker. A shared instance passed by the caller
+    # makes the EWMA persist across calls; a None arg falls back to a transient
+    # tracker so standalone/test calls still normalize (against just this
+    # rollout). Built ONLY under normalize_advantages, so a normalization-disabled
+    # call never constructs (or validates) a tracker it will not read.
+    moments = adv_moments
+    if config.normalize_advantages:
+        if moments is None:
+            moments = RunningMoments(decay=config.adv_norm_decay, eps=ADV_NORM_EPS)
+        if len(buffer) > 0:
+            # Fold the WHOLE rollout's advantages into the running moments ONCE, before
+            # the epochs. A full-width unshuffled pass yields them in a single MiniBatch
+            # (the same buffer idiom as the explained-variance pass below), so this
+            # never depends on a buffer-specific advantages accessor - it works for
+            # both the single-env and the flattened vec buffer.
+            (adv_batch,) = buffer.iter_minibatches(len(buffer), shuffle=False)
+            moments.update(adv_batch.advantages)
+
     for _ in range(config.n_epochs):
         epoch_approx_kl_sum = 0.0
         epoch_minibatches = 0
         for mb in buffer.iter_minibatches(config.minibatch_size, shuffle=True):
             advantages = mb.advantages
-            if config.normalize_advantages and advantages.numel() > 1:
-                # Normalize per minibatch: the buffer stores RAW advantages, so
-                # each minibatch is standardized against its own mean/std here.
-                # Skip a singleton minibatch: torch.std applies Bessel's
-                # correction (N-1), which is NaN for N=1 and would silently
-                # poison the update; one advantage has nothing to standardize.
-                advantages = (advantages - advantages.mean()) / (advantages.std() + ADV_NORM_EPS)
+            if config.normalize_advantages and advantages.numel() > 0:
+                # Standardize against the PERSISTENT running stats (folded once
+                # above), not this minibatch's own mean/std, so the normalization
+                # scale stays stable across updates. Every non-empty minibatch is
+                # standardized against those running stats, which are N=1-safe
+                # (population moments, no Bessel term), so no singleton is skipped;
+                # the > 0 guard only skips a (degenerate) empty minibatch.
+                assert moments is not None  # built above whenever normalize_advantages
+                advantages = moments.normalize(advantages)
 
             log_prob, entropy, value = actor_critic.evaluate_actions(mb.obs, mb.masks, mb.actions)
 
@@ -209,6 +258,8 @@ def ppo_update(
             grad_norm=0.0,
             explained_variance=0.0,
             n_updates=0,
+            adv_norm_std=moments.std if moments is not None else 0.0,
+            adv_norm_mean=moments.mean if moments is not None else 0.0,
         )
 
     # Explained variance is a property of the collection-time values vs the GAE
@@ -228,4 +279,6 @@ def ppo_update(
         grad_norm=grad_norm_sum / n_updates,
         explained_variance=explained_variance,
         n_updates=n_updates,
+        adv_norm_std=moments.std if moments is not None else 0.0,
+        adv_norm_mean=moments.mean if moments is not None else 0.0,
     )
