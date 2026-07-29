@@ -176,6 +176,38 @@ def test_set_global_step_does_not_change_reward() -> None:
     env.close()
 
 
+def test_truncation_cashes_out_potential_not_true_successor() -> None:
+    # Regression: on a truncated step Phi(s') := 0, so the per-term shaping is
+    # exactly -Phi(s_t) (the accumulated potential cashed out), NOT the true
+    # gamma*Phi(s'_true) - Phi(s_t). Reverting the adapter's `terminated or
+    # truncated` back to `terminated` would emit the latter; this test then fails.
+    from sts_rl.env.reward import RewardConfig, state_potentials
+
+    cfg = RewardConfig()
+    # A small step cap so the fight truncates before it ends: playing a few cards
+    # dents the enemy (nonzero enemy potential) but cannot kill it in this many steps.
+    env = StsEnv(encounters=(GREMLIN_NOB,), max_episode_steps=5, reward_config=cfg)
+    _, info = env.reset(seed=REGRESSION_SEED)
+    prev_snapshot = info["combat"]  # the state before the eventual truncating step
+    terminated = truncated = False
+    for _ in range(MAX_SCRIPTED_STEPS):
+        _, reward, terminated, truncated, info = env.step(_first_playable_action(info))
+        if terminated or truncated:
+            break
+        prev_snapshot = info["combat"]
+
+    assert truncated and not terminated
+    prev_phi = state_potentials(cfg, combat=prev_snapshot)
+    # Non-vacuous: the pre-truncation potential is not all-zero (the enemy took
+    # damage), so -Phi(s_t) genuinely differs from gamma*Phi(s'_true) - Phi(s_t).
+    assert any(v != 0.0 for v in prev_phi.values())
+    for name in SHAPING_TERMS:
+        assert info["shaping_terms"][name] == pytest.approx(-prev_phi[name])
+    # A truncation carries no terminal component, so the whole reward is that shaping.
+    assert reward == pytest.approx(sum(info["shaping_terms"].values()))
+    env.close()
+
+
 def test_set_global_step_rejects_negative() -> None:
     from sts_rl.interface import InterfaceError
 

@@ -420,6 +420,37 @@ def test_run_potential_shaping_telescopes_per_term() -> None:
     env.close()
 
 
+def test_truncation_cashes_out_potential_not_true_successor() -> None:
+    # Regression (mirror of the combat-env test): on a truncated step Phi(s') := 0,
+    # so the per-term shaping is -Phi(s_t), NOT gamma*Phi(s'_true) - Phi(s_t).
+    # Reverting `terminated or truncated` to `terminated` in the run adapter would
+    # emit the latter and fail this test.
+    cfg = RewardConfig()
+    # A small step cap so the run truncates a few decisions in; a full run is
+    # hundreds of decisions, so it cannot terminate this fast.
+    env = StsRunEnv(max_episode_steps=5, reward_config=cfg)  # gamma defaults to 1.0
+    _, info = env.reset(seed=REGRESSION_SEED)
+    pre_trunc_info = info
+    terminated = truncated = False
+    for _ in range(MAX_DRIVE_STEPS):
+        pre_trunc_info = info  # the decision (s_t) we are about to act on
+        _, reward, terminated, truncated, info = env.step(_greedy_action(info))
+        if terminated or truncated:
+            break
+
+    assert truncated and not terminated
+    # Reconstruct Phi(s_t) from the pre-truncation decision's snapshots (combat when a
+    # fight is live, else the run view) - the same source the adapter's baseline uses.
+    prev_phi = state_potentials(cfg, combat=pre_trunc_info.get("combat"), run=pre_trunc_info["run"])
+    # Non-vacuous: act >= 1 at any run state, so the boss potential is nonzero and
+    # -Phi(s_t) genuinely differs from the buggy gamma*Phi(s'_true) - Phi(s_t).
+    assert prev_phi["boss_kill"] != 0.0
+    for name in SHAPING_TERMS:
+        assert info["shaping_terms"][name] == pytest.approx(-prev_phi[name])
+    assert reward == pytest.approx(sum(info["shaping_terms"].values()))
+    env.close()
+
+
 def test_terminal_reward_added_once_on_terminal_step() -> None:
     """The terminal -1 is applied exactly once, only on the terminal step.
 

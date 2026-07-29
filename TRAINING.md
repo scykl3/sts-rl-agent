@@ -63,7 +63,7 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_combat.py \
 
 #### Reward shaping
 
-Coefficients for the per-step shaping terms; defaults match the built-in `RewardConfig`. The shaping sum is scaled by an annealed weight that decays toward zero over training, so these set the initial (pre-anneal) magnitude, not a constant bonus. `--floor-progress-coef` and `--boss-kill-coef` are run-mode signals and stay `0.0` in single-combat (exposed here only for parity with `train_run.py`).
+Potential weights for the per-step shaping terms; defaults match the built-in `RewardConfig`. Shaping is potential-based (`gamma * Phi(s') - Phi(s)`), so over an episode it telescopes to `-Phi(s_0)` and is policy-invariant, with no anneal; each coefficient scales its term's potential. `--floor-progress-coef` and `--boss-kill-coef` are run-mode signals and stay `0.0` in single-combat (exposed here only for parity with `train_run.py`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -131,7 +131,7 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_run.py \
 
 #### Reward shaping
 
-Coefficients for the per-step shaping terms; defaults match the built-in `RewardConfig`. The shaping sum is scaled by an annealed weight that decays toward zero over training, so these set the initial (pre-anneal) magnitude, not a constant bonus. `--boss-kill-coef` fires once per act boss defeated (Act 1 -> 2, Act 2 -> 3), so raising it emphasizes act progress; note it still decays under the anneal.
+Potential weights for the per-step shaping terms; defaults match the built-in `RewardConfig`. Shaping is potential-based (`gamma * Phi(s') - Phi(s)`), so over an episode it telescopes to `-Phi(s_0)` and is policy-invariant, with no anneal; each coefficient scales its term's potential. `--boss-kill-coef` weights the act potential (`w * act`), so raising it emphasizes act progress.
 
 | Flag | Default | Description |
 |------|---------|-------------|
