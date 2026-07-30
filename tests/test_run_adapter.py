@@ -635,6 +635,35 @@ def test_stop_after_act_preserves_shaping_telescoping() -> None:
     env.close()
 
 
+def test_stop_after_act_truncation_forfeits_terminal_bonus() -> None:
+    """A step-cap truncation before the Act 1 clear credits no act-clear terminal bonus.
+
+    stop_after_act=1 awards the +1 terminal win reward when Act 1 clears, but that
+    bonus is gated inside `if terminated:` and truncation is mutually exclusive with
+    termination. With a step cap far below the decisions an act takes, the episode
+    truncates while still in Act 1: terminated is False, truncated is True, and the
+    truncated step's reward is pure shaping - no terminal bonus is credited. Reverting
+    the gate to also fire on truncation would add a spurious +1 here and fail this test.
+    """
+    # Far fewer decisions than clearing an act takes, so truncation fires first.
+    cap = 4
+    env = StsRunEnv(stop_after_act=1, max_episode_steps=cap)
+    _, info0 = env.reset(seed=REGRESSION_SEED)
+    trace = _drive(env, info0, _greedy_action)
+
+    last = trace[-1]
+    # Non-vacuous: the episode actually ended by truncation (not termination), and it
+    # did so while still in Act 1 - before the act-clear terminal could fire.
+    assert last["truncated"] and not last["terminated"]
+    assert last["info"]["act"] < _ACT2  # Act 1 boss not defeated
+    assert last["info"]["episode"]["l"] == cap  # ended exactly at the step cap
+    # reward - sum(shaping) isolates the terminal component; on a truncated step it is
+    # 0 (neither the +1 act-clear win nor the -1 loss is credited).
+    terminal_component = last["reward"] - sum(last["shaping"].values())
+    assert terminal_component == pytest.approx(0.0)
+    env.close()
+
+
 @pytest.mark.parametrize("bad", [0, -1])
 def test_stop_after_act_rejects_nonpositive(bad: int) -> None:
     """stop_after_act must be a 1-based act index when set; <= 0 fails at construction."""

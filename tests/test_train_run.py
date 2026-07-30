@@ -512,7 +512,7 @@ def test_main_builds_vec_env_for_multi_env(monkeypatch: pytest.MonkeyPatch) -> N
     assert config.num_envs == num_envs
     # The factory builds a run env (the stub), proving the vec path wires a run-env
     # factory rather than the combat env.
-    worker = env.make_env(0)  # type: ignore[attr-defined]
+    worker = env.make_env(0)  # type: ignore[operator]
     assert isinstance(worker, _StubRunEnv)
 
 
