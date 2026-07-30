@@ -556,7 +556,10 @@ def bc_pretrain(
             per_token, _features, key_padding_mask = model.encoder(obs_batch)
             logits = model.policy(per_token, key_padding_mask, mask_batch)  # (B, ACTION_DIM)
 
-            # Cross-entropy over the full masked action space.
+            # Cross-entropy over the full masked action space. On a reward screen
+            # this spans every simultaneously-legal reward action (gold / potion /
+            # relic), not just card + skip - intended and deployment-consistent: the
+            # same masked head chooses among all legal reward actions at inference.
             loss = F.cross_entropy(logits, action_batch)
 
             optimizer.zero_grad()
