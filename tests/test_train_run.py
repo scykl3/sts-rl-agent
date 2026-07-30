@@ -84,8 +84,9 @@ class _StubRunEnv:
     serves the provenance ``info`` keys ``main()`` reads off the initial reset, so
     ``main()`` runs the whole warm-start wiring without a native engine build.
 
-    ``reward_config`` and ``gamma`` mirror the real ``StsRunEnv`` signature
-    (``main()`` now passes both); they are stored but otherwise unused by the stub.
+    ``reward_config``, ``gamma``, and ``stop_after_act`` mirror the real
+    ``StsRunEnv`` signature (``main()`` passes all three); they are stored but
+    otherwise unused by the stub.
     """
 
     def __init__(
@@ -95,11 +96,13 @@ class _StubRunEnv:
         max_episode_steps: int,
         reward_config: RewardConfig | None = None,
         gamma: float = 1.0,
+        stop_after_act: int | None = None,
     ) -> None:
         self.ascension = ascension
         self.max_episode_steps = max_episode_steps
         self.reward_config = reward_config
         self.gamma = gamma
+        self.stop_after_act = stop_after_act
 
     def reset(
         self, *, seed: int | None = None, options: object = None
@@ -289,6 +292,13 @@ def test_arg_parser_run_scale_defaults() -> None:
     assert args.warm_start is None
     assert args.eval_every is None
     assert args.checkpoint_dir is None
+    assert args.stop_after_act is None  # full three-act episode by default
+
+
+def test_arg_parser_stop_after_act_parses_int() -> None:
+    """--stop-after-act captures the 1-based act index for StsRunEnv's early terminal."""
+    args = train_run.build_arg_parser().parse_args(["--stop-after-act", "1"])
+    assert args.stop_after_act == 1
 
 
 def test_arg_parser_accepts_warm_start_path() -> None:
@@ -681,12 +691,14 @@ def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> 
             max_episode_steps: int,
             reward_config: RewardConfig | None = None,
             gamma: float = 1.0,
+            stop_after_act: int | None = None,
         ) -> None:
             super().__init__(
                 ascension=ascension,
                 max_episode_steps=max_episode_steps,
                 reward_config=reward_config,
                 gamma=gamma,
+                stop_after_act=stop_after_act,
             )
             captured_reward_configs.append(reward_config)
 
@@ -721,6 +733,71 @@ def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> 
     # Both the training env and the eval env received the overridden shaping config.
     assert len(captured_reward_configs) == 2
     assert all(rc is not None and rc.boss_kill == 1.0 for rc in captured_reward_configs)
+
+
+def test_main_wires_stop_after_act_into_envs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() threads --stop-after-act into every constructed StsRunEnv (train + eval).
+
+    Engine-free: train and StsRunEnv are stubbed; the stub records its stop_after_act
+    kwarg, so the CLI -> env wire is checked without a native build. With num_envs == 1
+    both the eval env and the single training env are constructed via _make_run_env, so
+    both must carry the flag.
+
+    Revert-verify: drop stop_after_act=args.stop_after_act from _make_run_env in main()
+    and the recorded value falls back to None, failing this.
+    """
+    captured_stop: list[int | None] = []
+
+    class _StopStubRunEnv(_StubRunEnv):
+        def __init__(
+            self,
+            *,
+            ascension: int,
+            max_episode_steps: int,
+            reward_config: RewardConfig | None = None,
+            gamma: float = 1.0,
+            stop_after_act: int | None = None,
+        ) -> None:
+            super().__init__(
+                ascension=ascension,
+                max_episode_steps=max_episode_steps,
+                reward_config=reward_config,
+                gamma=gamma,
+                stop_after_act=stop_after_act,
+            )
+            captured_stop.append(stop_after_act)
+
+    def _fake_train(
+        _env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _StopStubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+    monkeypatch.setattr(sys, "argv", ["train_run", "--stop-after-act", "1"])
+
+    train_run.main()
+
+    # Both envs built via _make_run_env (eval + single training env) carry the flag.
+    assert len(captured_stop) == 2
+    assert all(stop == 1 for stop in captured_stop)
 
 
 @pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")

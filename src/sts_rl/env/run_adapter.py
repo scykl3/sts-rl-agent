@@ -119,14 +119,16 @@ class StsRunEnv(gym.Env):
             shaping telescopes against the same return; defaults to
             :data:`~sts_rl.env.reward.DEFAULT_SHAPING_GAMMA`.
         stop_after_act: if set, end the episode (``terminated=True``, not
-            ``truncated``) as soon as this act's boss is defeated - i.e. once the
-            run advances past the act - crediting the ``+1`` terminal win reward.
-            This turns "clear act N" into a frequent terminal signal instead of a
-            rare event inside a long three-act run. A value at or above the final
-            act only ends on a full-run victory, i.e. today's behavior. Default
-            ``None`` keeps the full-run episode (end only on run win/loss or
-            truncation). Potential-based shaping still telescopes to ``-Phi(s_0)``:
-            an earlier terminal only cashes the same potential out sooner.
+            ``truncated``) on the step where the run advances past this act (its
+            ``gc.act`` increments) - i.e. when the act transition completes, which is
+            a few reward-screen decisions after the boss's killing blow, not on the
+            blow itself - crediting the ``+1`` terminal win reward. This turns "clear
+            act N" into a frequent terminal signal instead of a rare event inside a
+            long three-act run. A value at or above the final act only ends on a
+            full-run victory, i.e. today's behavior. Default ``None`` keeps the
+            full-run episode (end only on run win/loss or truncation). Potential-based
+            shaping still telescopes to ``-Phi(s_0)``: an earlier terminal only cashes
+            the same potential out sooner.
         render_mode: one of ``None``, ``"ansi"``, ``"human"``.
     """
 
@@ -253,7 +255,8 @@ class StsRunEnv(gym.Env):
         # Optional early terminal: end the episode once the configured act's boss is
         # cleared, so "clear act N" is a frequent terminal signal instead of a rare
         # event late in a full three-act run. The engine advances gc.act past an act
-        # when its boss falls (the same signal the act-clear eval metric keys on), so
+        # when the act transition completes - a few reward-screen decisions after the
+        # boss's killing blow (the same signal the act-clear eval metric keys on) - so
         # the act is cleared exactly when gc.act > stop_after_act. Winning the final
         # act ends the run via is_run_over (there is no act beyond the last), so that
         # victory is folded into `won` through run_won, not an act increment.

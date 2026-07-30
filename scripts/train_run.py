@@ -255,6 +255,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="parallel training envs (1 = single-env; > 1 runs a SubprocVecEnv of workers)",
     )
     parser.add_argument(
+        "--stop-after-act",
+        type=int,
+        default=None,
+        help="end each episode as soon as that act's boss is cleared, turning "
+        "'clear act N' into a frequent terminal signal instead of a rare event late in a "
+        "full three-act run; default None keeps the full three-act episode",
+    )
+    parser.add_argument(
         "--warm-start",
         type=str,
         default=None,
@@ -398,13 +406,17 @@ def main() -> None:
     # reward_config carries the CLI-overridable shaping coefficients; gamma is
     # single-sourced from args.gamma (the same discount TrainConfig/GAE use) so the
     # env's potential-based shaping telescopes against the return. A single builder so
-    # the training env(s) and the eval env are configured identically.
+    # the training env(s) and the eval env share one episode definition, including
+    # --stop-after-act: when set, both training and eval episodes end at that act's
+    # clear, so the agent trains and is scored on the same scoped task (act1_clear_rate
+    # stays the headline metric either way). Default None keeps the full three-act run.
     def _make_run_env() -> StsRunEnv:
         return StsRunEnv(
             ascension=args.ascension,
             max_episode_steps=args.max_episode_steps,
             reward_config=reward_config,
             gamma=args.gamma,
+            stop_after_act=args.stop_after_act,
         )
 
     # eval_env is a SEPARATE single-env instance for greedy holdout eval (both the
@@ -433,8 +445,9 @@ def main() -> None:
         # the env through its collector, so this read has no lasting effect.
         _obs, reset_info = env.reset(seed=args.seed)
     else:
-        # Each worker builds its own StsRunEnv (deck-economy shaping applied per worker).
-        # The factory is shipped to workers via cloudpickle, so it may close over args.
+        # Each worker builds its own StsRunEnv via _make_run_env (so --stop-after-act is
+        # honored per worker too), with deck-economy shaping applied per worker. The
+        # factory is shipped to workers via cloudpickle, so it may close over args.
         def _make_worker_env(index: int) -> WorkerEnv:
             worker = _make_run_env()
             if args.deck_economy_shaping:
