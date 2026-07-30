@@ -55,6 +55,7 @@ import logging
 import gymnasium as gym
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.aux_heads import AUX_TARGETS
 from sts_rl.agent.checkpoint_migration import load_checkpoint
 from sts_rl.agent.deck_economy_wrapper import DeckEconomyShapingWrapper
 from sts_rl.agent.encoder import HIDDEN_DIM
@@ -205,6 +206,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=ppo_defaults.ent_coef,
         help="entropy-bonus weight in the PPO objective",
+    )
+    parser.add_argument(
+        "--aux-coef",
+        type=float,
+        default=ppo_defaults.aux_coef,
+        help="auxiliary-perception loss weight (0.0 = off, the default; > 0 builds "
+        "and trains the aux head, which backprops into the shared encoder the policy "
+        "reads - the mechanism that regressed the policy in the earlier "
+        "outcome-regression pretrain). Any > 0 run must be gated on a matched-seed "
+        "paired eval vs the aux-off baseline: do not save a checkpoint whose greedy "
+        "Act-1 clear rate regresses.",
     )
     parser.add_argument(
         "--n-epochs",
@@ -481,6 +493,7 @@ def main() -> None:
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
         adv_norm_decay=args.adv_norm_decay,
+        aux_coef=args.aux_coef,
     )
 
     config = TrainConfig(
@@ -508,6 +521,9 @@ def main() -> None:
         # Rank best.pt / best_eval on the Act 1 clear rate, not the default win_rate
         # (full-run win_rate is ~0 for a long time; see RUN_BEST_METRIC).
         best_metric=RUN_BEST_METRIC,
+        # Build the aux head only when the loss is on; a 0.0 coef keeps the net
+        # aux-free (byte-identical default).
+        aux_targets=AUX_TARGETS if args.aux_coef > 0.0 else (),
     )
 
     # Train (periodic eval + checkpoints run in-loop when enabled), warm-started

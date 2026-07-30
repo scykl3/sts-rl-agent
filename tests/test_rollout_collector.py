@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.aux_heads import PLAYER_CUR_HP_INDEX
 from sts_rl.agent.ppo import compute_gae
 from sts_rl.agent.rollout_buffer import RolloutBuffer
 from sts_rl.agent.rollout_collector import (
@@ -479,3 +480,121 @@ def test_malformed_mask_raises_interface_error() -> None:
     collector._mask = np.zeros(ACTION_DIM + 1, dtype=np.bool_)
     with pytest.raises(InterfaceError):
         collector.collect(RolloutBuffer(), 1)
+
+
+# --- end_combat_hp backfill (combat-span tracking) --------------------------
+
+
+class _ScriptedEnv:
+    """Emits a scripted enemy_alive / player-HP obs sequence with scripted done flags.
+
+    ``alive[k]`` / ``hp[k]`` define the observation at step index ``k`` (``k == 0`` is
+    the reset obs); ``term[k]`` / ``trunc[k]`` are the flags step ``k`` returns. A full
+    interface obs dict is produced from a sampled base with ``enemy_alive`` and the
+    player HP overridden, so the collector's combat-span backfill is assertable without
+    the engine. Terminal/truncated flags are only scripted on the final collected step
+    (reset restarts the sequence), so the multi-combat test keeps them all False.
+    """
+
+    def __init__(
+        self,
+        alive: list[bool],
+        hp: list[float],
+        term: list[bool] | None = None,
+        trunc: list[bool] | None = None,
+    ) -> None:
+        self._alive = alive
+        self._hp = hp
+        self._term = term if term is not None else [False] * (len(alive) - 1)
+        self._trunc = trunc if trunc is not None else [False] * (len(alive) - 1)
+        self._base, _ = _make_env().reset(seed=0)  # a full valid obs to overlay onto
+        self._legal = np.zeros(ACTION_DIM, dtype=np.bool_)
+        self._legal[0] = True
+        self._k = 0
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        self._k = 0
+        return self._obs(0), {"action_mask": self._legal.copy()}
+
+    def step(self, action: int):
+        terminated = self._term[self._k]
+        truncated = self._trunc[self._k]
+        self._k += 1
+        obs = self._obs(self._k)
+        info: dict = {"action_mask": self._legal.copy()}
+        if terminated or truncated:
+            info["episode"] = {"r": 0.0, "l": self._k}
+            info["won"] = False
+        return obs, 0.0, terminated, truncated, info
+
+    def _obs(self, k: int) -> dict:
+        obs = {key: np.array(value, copy=True) for key, value in self._base.items()}
+        enemy_alive = np.zeros_like(np.asarray(obs["enemy_alive"], dtype=np.float32))
+        if self._alive[k]:
+            enemy_alive[0] = 1.0
+        obs["enemy_alive"] = enemy_alive
+        player_scalars = np.asarray(obs["player_scalars"], dtype=np.float32).copy()
+        player_scalars[PLAYER_CUR_HP_INDEX] = self._hp[k]
+        obs["player_scalars"] = player_scalars
+        return obs
+
+
+def test_collector_backfills_end_combat_hp_over_combats() -> None:
+    """Multi-combat rollout: each combat's steps get that combat's end HP; an overworld
+    step and an unfinished trailing combat stay invalid.
+
+    obs index:      0     1     2      3      4     5     6
+    combat 1 spans steps 0,1 (alive), ends into the overworld at obs_2 (alive False)
+    with post-combat HP 41; step 3 is overworld; combat 2 spans steps 4,5 and is still
+    ongoing at the rollout cutoff (obs_6 alive), so it is unfinished.
+    """
+    alive = [True, True, False, False, True, True, True]
+    hp = [10.0, 11.0, 41.0, 13.0, 14.0, 15.0, 16.0]
+    collector = RolloutCollector(_ScriptedEnv(alive, hp), _make_ac(), seed=0)
+    buffer = RolloutBuffer()
+
+    collector.collect(buffer, 6)
+
+    # combat 1 (steps 0,1) -> end HP 41 (obs_2's player HP), both valid.
+    assert buffer._end_combat_hp_valid[0] is True
+    assert buffer._end_combat_hp_valid[1] is True
+    assert buffer._end_combat_hp[0] == 41.0
+    assert buffer._end_combat_hp[1] == 41.0
+    # overworld steps 2,3 -> invalid.
+    assert buffer._end_combat_hp_valid[2] is False
+    assert buffer._end_combat_hp_valid[3] is False
+    # combat 2 (steps 4,5) -> ongoing at cutoff -> unfinished -> invalid.
+    assert buffer._end_combat_hp_valid[4] is False
+    assert buffer._end_combat_hp_valid[5] is False
+    # The extra fields did not perturb the core stream: no reward/termination scripted.
+    assert buffer._dones == [0.0] * 6
+    assert buffer._rewards == [0.0] * 6
+
+
+def test_collector_backfills_end_combat_hp_on_terminal_combat() -> None:
+    """A run-terminal in-combat step captures the terminal obs HP as the combat's end HP.
+
+    On a single env step()'s next_obs IS the terminal observation, so its player HP is
+    the end-of-combat HP; the step is a done and valid.
+    """
+    env = _ScriptedEnv(alive=[True, False], hp=[20.0, 7.0], term=[True])
+    collector = RolloutCollector(env, _make_ac(), seed=0)
+    buffer = RolloutBuffer()
+
+    collector.collect(buffer, 1)
+
+    assert buffer._end_combat_hp_valid[0] is True
+    assert buffer._end_combat_hp[0] == 7.0
+    assert buffer._dones[0] == 1.0  # terminated -> done
+
+
+def test_collector_marks_truncated_combat_unfinished() -> None:
+    """A truncation mid-combat leaves the combat's steps invalid (unfinished, not a done)."""
+    env = _ScriptedEnv(alive=[True, True], hp=[30.0, 9.0], trunc=[True])
+    collector = RolloutCollector(env, _make_ac(), seed=0)
+    buffer = RolloutBuffer()
+
+    collector.collect(buffer, 1)
+
+    assert buffer._end_combat_hp_valid[0] is False  # truncation is not a combat end
+    assert buffer._dones[0] == 0.0  # truncation is not a done

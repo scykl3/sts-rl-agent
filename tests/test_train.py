@@ -1239,7 +1239,7 @@ def test_value_warmup_gradients_only_reach_value_head() -> None:
     mask = torch.zeros(batch, ACTION_DIM, dtype=torch.bool)
     mask[:, :legal_prefix] = True
     actions = torch.zeros(batch, dtype=torch.long)
-    log_prob, entropy, value = net.evaluate_actions(obs, mask, actions)
+    log_prob, entropy, value, _aux = net.evaluate_actions(obs, mask, actions)
     # Sum BOTH heads' outputs so a missing value-head grad would surface as a failure;
     # the frozen policy terms contribute no grad but must not error.
     (value.sum() + log_prob.sum() + entropy.sum()).backward()

@@ -13,6 +13,7 @@ lazily in :meth:`RolloutBuffer.iter_minibatches`.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
@@ -30,6 +31,9 @@ class MiniBatch:
     ``obs`` maps each field name to a ``(mb, *field_shape)`` tensor; ``masks`` is
     ``(mb, ACTION_DIM)``; the remaining vector fields are ``(mb,)``. ``mb`` is at
     most the requested minibatch size and may be smaller for the final batch.
+    ``end_combat_hp`` ``(mb,)`` float and ``end_combat_hp_valid`` ``(mb,)`` bool
+    carry the collector-backfilled end-of-combat HP aux target and its per-step
+    validity; the core PPO path ignores them and only the aux loss reads them.
     """
 
     obs: dict[str, Tensor]
@@ -39,6 +43,12 @@ class MiniBatch:
     old_values: Tensor
     advantages: Tensor
     returns: Tensor
+    # Per-step end-of-combat player HP (raw HP units) and its validity, backfilled by
+    # the collector: end_combat_hp is the HP at the end of the combat a step belongs
+    # to, valid only for combat steps whose combat completed within the rollout
+    # (overworld steps and an unfinished trailing combat are invalid).
+    end_combat_hp: Tensor
+    end_combat_hp_valid: Tensor
 
 
 class SupportsMinibatches(Protocol):
@@ -75,6 +85,12 @@ class RolloutBuffer:
         self._rewards: list[float] = []
         self._dones: list[float] = []
         self._masks: list[Tensor] = []
+        # Per-step end-of-combat HP aux target and its validity, backfilled by the
+        # collector once each combat ends (see backfill_end_combat_hp). add() appends
+        # a placeholder per step; a step never backfilled (overworld, or an unfinished
+        # trailing combat) keeps its invalid placeholder and is excluded from the loss.
+        self._end_combat_hp: list[float] = []
+        self._end_combat_hp_valid: list[bool] = []
         # Populated only by compute_advantages; None guards iter_minibatches.
         self.advantages: Tensor | None = None
         self.returns: Tensor | None = None
@@ -88,6 +104,8 @@ class RolloutBuffer:
         reward: float,
         done: float,
         mask: Tensor,
+        end_combat_hp: float = math.nan,
+        end_combat_hp_valid: bool = False,
     ) -> None:
         """Append one transition.
 
@@ -102,6 +120,12 @@ class RolloutBuffer:
         the episode truly ended at this step), NOT a time-limit truncation:
         :func:`compute_gae` zeroes the value bootstrap on a done, so a
         truncation flagged as done would wrongly discard the tail value.
+
+        ``end_combat_hp`` is a FUTURE value (the HP at the end of this step's
+        combat), unknown when the step is added; it defaults to a NaN placeholder
+        with ``end_combat_hp_valid=False`` and is filled in later by
+        :meth:`backfill_end_combat_hp` once the combat ends. It does not enter GAE
+        or any core PPO term.
         """
         self._obs.append({key: tensor.detach().clone() for key, tensor in obs.items()})
         self._actions.append(action.detach().clone())
@@ -110,6 +134,28 @@ class RolloutBuffer:
         self._rewards.append(reward)
         self._dones.append(done)
         self._masks.append(mask.detach().clone())
+        self._end_combat_hp.append(end_combat_hp)
+        self._end_combat_hp_valid.append(end_combat_hp_valid)
+
+    def backfill_end_combat_hp(self, start: int, stop: int, hp: float) -> None:
+        """Mark steps ``[start, stop)`` as a completed combat with end-of-combat HP ``hp``.
+
+        The collector calls this once a combat ends, backfilling the just-ended
+        combat's end-of-combat player HP (raw HP units) onto every step of that
+        combat's span and flagging them valid. ``end_combat_hp`` is unknown when
+        :meth:`add` stores a step (it is a future value), so each step is appended
+        with a NaN placeholder and this overwrites the span in place. Steps never
+        backfilled - overworld steps and an unfinished trailing combat at the rollout
+        cutoff - keep their invalid placeholder and are excluded from the aux loss.
+        """
+        if not 0 <= start < stop <= len(self._end_combat_hp):
+            raise ValueError(
+                f"backfill span [{start}, {stop}) is out of range for "
+                f"{len(self._end_combat_hp)} stored steps"
+            )
+        for i in range(start, stop):
+            self._end_combat_hp[i] = hp
+            self._end_combat_hp_valid[i] = True
 
     def __len__(self) -> int:
         return len(self._actions)
@@ -174,6 +220,13 @@ class RolloutBuffer:
         log_probs = torch.stack(self._log_probs)
         # Match the float32 of advantages/returns so the value loss sees one dtype.
         values = torch.stack(self._values).to(torch.float32)
+        # Per-step aux fields built once alongside the stacks, colocated on the
+        # values' device so the [idx] gather stays on-device on GPU. Invalid steps
+        # carry a NaN placeholder in end_combat_hp; end_combat_hp_valid gates them.
+        end_combat_hp = torch.tensor(self._end_combat_hp, dtype=torch.float32, device=values.device)
+        end_combat_hp_valid = torch.tensor(
+            self._end_combat_hp_valid, dtype=torch.bool, device=values.device
+        )
 
         # Co-locate the shuffle index with the data so the gather stays on-device on GPU.
         order = (
@@ -191,6 +244,8 @@ class RolloutBuffer:
                 old_values=values[idx],
                 advantages=self.advantages[idx],
                 returns=self.returns[idx],
+                end_combat_hp=end_combat_hp[idx],
+                end_combat_hp_valid=end_combat_hp_valid[idx],
             )
 
     def reset(self) -> None:
@@ -202,6 +257,8 @@ class RolloutBuffer:
         self._rewards.clear()
         self._dones.clear()
         self._masks.clear()
+        self._end_combat_hp.clear()
+        self._end_combat_hp_valid.clear()
         self.advantages = None
         self.returns = None
 
@@ -248,6 +305,8 @@ class VecRolloutBuffer:
         rewards: Tensor,
         dones: Tensor,
         masks: Tensor,
+        end_combat_hp: Tensor | None = None,
+        end_combat_hp_valid: Tensor | None = None,
     ) -> None:
         """Append one batched transition, scattering row ``i`` to env ``i``'s buffer.
 
@@ -257,6 +316,11 @@ class VecRolloutBuffer:
         ``(num_envs,)``. ``dones[i]`` is env ``i``'s TERMINAL flag only (never a
         truncation), matching :meth:`RolloutBuffer.add`; the per-step
         ``.detach().clone()`` ownership is inherited from the sub-buffers' ``add``.
+
+        ``end_combat_hp``/``end_combat_hp_valid`` are optional ``(num_envs,)`` aux
+        fields; when omitted each env stores the invalid NaN placeholder (the
+        collector backfills the real end-of-combat HP later via
+        :meth:`backfill_end_combat_hp`, since it is unknown at add-time).
         """
         # Assert the num_envs leading axis on EVERY batched field (not just
         # actions): a mismatch must fail loudly here rather than silently drop or
@@ -269,6 +333,10 @@ class VecRolloutBuffer:
         _assert_leading_dim(rewards, self.num_envs, "rewards")
         _assert_leading_dim(dones, self.num_envs, "dones")
         _assert_leading_dim(masks, self.num_envs, "masks")
+        if end_combat_hp is not None:
+            _assert_leading_dim(end_combat_hp, self.num_envs, "end_combat_hp")
+        if end_combat_hp_valid is not None:
+            _assert_leading_dim(end_combat_hp_valid, self.num_envs, "end_combat_hp_valid")
         for i, buffer in enumerate(self._buffers):
             buffer.add(
                 obs={name: tensor[i] for name, tensor in obs.items()},
@@ -278,7 +346,23 @@ class VecRolloutBuffer:
                 reward=float(rewards[i]),
                 done=float(dones[i]),
                 mask=masks[i],
+                end_combat_hp=(math.nan if end_combat_hp is None else float(end_combat_hp[i])),
+                end_combat_hp_valid=(
+                    False if end_combat_hp_valid is None else bool(end_combat_hp_valid[i])
+                ),
             )
+
+    def backfill_end_combat_hp(self, env_index: int, start: int, stop: int, hp: float) -> None:
+        """Backfill env ``env_index``'s completed-combat span ``[start, stop)`` with end HP ``hp``.
+
+        The vec sibling of :meth:`RolloutBuffer.backfill_end_combat_hp`: the vec
+        collector tracks each env's current combat span independently, so a combat
+        ending in one env backfills only that env's sub-buffer. See the single-env
+        method for the placeholder/backfill rationale.
+        """
+        if not 0 <= env_index < self.num_envs:
+            raise ValueError(f"env_index {env_index} out of range for {self.num_envs} envs")
+        self._buffers[env_index].backfill_end_combat_hp(start, stop, hp)
 
     def compute_advantages(
         self,
@@ -343,6 +427,8 @@ class VecRolloutBuffer:
         old_values = torch.cat([mb.old_values for mb in per_env])
         advantages = torch.cat([mb.advantages for mb in per_env])
         returns = torch.cat([mb.returns for mb in per_env])
+        end_combat_hp = torch.cat([mb.end_combat_hp for mb in per_env])
+        end_combat_hp_valid = torch.cat([mb.end_combat_hp_valid for mb in per_env])
 
         # Co-locate the shuffle index with the data so the gather stays on-device.
         order = (
@@ -360,4 +446,6 @@ class VecRolloutBuffer:
                 old_values=old_values[idx],
                 advantages=advantages[idx],
                 returns=returns[idx],
+                end_combat_hp=end_combat_hp[idx],
+                end_combat_hp_valid=end_combat_hp_valid[idx],
             )
