@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from sts_rl.agent.card_teacher import (
+    CARD_PICK_END,
     CARD_PICK_START,
     CARD_SKIP_IDX,
     TIER_A,
@@ -20,6 +21,7 @@ from sts_rl.agent.card_teacher import (
     TIER_D,
     TIER_S,
     CardRewardTeacher,
+    _has_legal_card_slot,
 )
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
@@ -160,7 +162,7 @@ class TestCardRewardTeacherLegality:
             assert mask[action], f"action {action} is illegal"
             # The teacher owns only the card-pick + skip sub-slice: it must never
             # return a gold / potion / relic action from the wider REWARD_SELECT
-            # block (those would break bc._action_to_subslice_idx).
+            # block (those are owned by the base policy / other teacher heuristics).
             is_card_or_skip = (
                 CARD_PICK_START <= action < CARD_PICK_START + MAX_REWARD_CARD_SLOTS
                 or action == CARD_SKIP_IDX
@@ -263,3 +265,21 @@ class TestCardRewardTeacherValidation:
                     tiers={"OFFERING": TIER_S, "BOGUS_CARD": TIER_A},
                     validate=True,
                 )
+
+
+class TestHasLegalCardSlot:
+    """_has_legal_card_slot is True iff some card-pick slot is legal."""
+
+    def test_true_when_a_card_slot_is_legal(self) -> None:
+        mask = np.zeros(ACTION_DIM, dtype=np.bool_)
+        assert not _has_legal_card_slot(mask)
+        mask[CARD_PICK_START] = True
+        assert _has_legal_card_slot(mask)
+
+    def test_false_for_skip_only(self) -> None:
+        # Skip sits just past the card-pick range, so a skip-only mask is not a
+        # "has a legal card slot" step.
+        mask = np.zeros(ACTION_DIM, dtype=np.bool_)
+        mask[CARD_SKIP_IDX] = True
+        assert CARD_SKIP_IDX >= CARD_PICK_END
+        assert not _has_legal_card_slot(mask)

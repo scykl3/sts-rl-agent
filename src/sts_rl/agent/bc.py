@@ -1,12 +1,16 @@
-"""Behavior-cloning pretraining for the reward-card-pick policy head.
+"""Behavior-cloning pretraining for the strategic decision heads.
 
 Provides:
 - ``BCDataset``: container for (obs, teacher_action, mask) tuples with
-  persistence (npz) and a provenance manifest.
-- ``collect_bc_dataset``: episode loop that drives non-card decisions with a
-  base policy and records teacher actions at card-reward steps.
-- ``bc_pretrain``: surgical cross-entropy loss over the card-pick + skip
-  sub-slice, with train/val split and early stopping.
+  persistence (npz) and a provenance manifest. The teacher action is a
+  full-space action index and the mask is the full ``(ACTION_DIM,)`` legality
+  mask, so a sample can teach ANY screen the teacher covers (card pick, campfire,
+  map, potion), not only the reward-card sub-slice.
+- ``collect_bc_dataset``: episode loop that asks the teacher on every step and
+  records a sample whenever the teacher acts (returns an action), driving the
+  remaining decisions with a base policy (the teacher defers with ``None``).
+- ``bc_pretrain``: cross-entropy of the teacher action under the masked policy
+  distribution over the full action space, with train/val split and early stopping.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -28,9 +32,7 @@ from sts_rl.agent.card_teacher import (
     CARD_PICK_END,
     CARD_PICK_START,
     CARD_SKIP_IDX,
-    CardRewardTeacher,
 )
-from sts_rl.agent.policy_head import MASKED_LOGIT
 from sts_rl.agent.train import (
     CHECKPOINT_HIDDEN_DIM_KEY,
     CHECKPOINT_INTERFACE_VERSION_KEY,
@@ -38,38 +40,61 @@ from sts_rl.agent.train import (
 )
 from sts_rl.interface import (
     ACTION_BLOCK_BY_NAME,
+    ACTION_DIM,
     INTERFACE_VERSION,
-    MAX_REWARD_CARD_SLOTS,
+    MAX_REWARD_POTIONS,
     OBS_FIELDS,
+    REWARD_POTION_OFFSET,
 )
 
 logger = logging.getLogger(__name__)
 
-# The surgical sub-slice: card pick slots + skip.
-_RS = ACTION_BLOCK_BY_NAME["REWARD_SELECT"]
-# Indices into the full ACTION_DIM mask for the card+skip sub-slice.
-_CARD_SUBSLICE_INDICES: list[int] = list(range(CARD_PICK_START, CARD_PICK_END)) + [CARD_SKIP_IDX]
-_SUBSLICE_SIZE: int = len(_CARD_SUBSLICE_INDICES)  # MAX_REWARD_CARD_SLOTS + 1
 
+class BCTeacher(Protocol):
+    """A teacher the collector can consult on every step.
 
-def _action_to_subslice_idx(action: int) -> int:
-    """Map a full-space action index to the local sub-slice index (0..8).
-
-    Card slot k -> index k; skip -> index MAX_REWARD_CARD_SLOTS.
+    ``select_action`` returns a full-space action index to teach on a recognized
+    screen, or ``None`` to defer to the base policy (see
+    :class:`~sts_rl.agent.strategic_teacher.StrategicTeacher`).
     """
+
+    def select_action(self, obs: dict[str, np.ndarray], mask: np.ndarray) -> int | None: ...
+
+
+# --- Decision-type classification (for provenance / coverage stats) ---------
+# Every teacher action is labeled by the action block / offset it falls in, so a
+# collected dataset carries a histogram of which decision types it spans. Derived
+# from the interface layout, never hardcoded indices.
+_RS = ACTION_BLOCK_BY_NAME["REWARD_SELECT"]
+_REST = ACTION_BLOCK_BY_NAME["REST_SELECT"]
+_MAP = ACTION_BLOCK_BY_NAME["MAP_SELECT"]
+_USE_POTION_UNTARGETED = ACTION_BLOCK_BY_NAME["USE_POTION_UNTARGETED"]
+_REWARD_POTION_START = _RS.start + REWARD_POTION_OFFSET
+
+DT_CARD_PICK = "card_pick"
+DT_CARD_SKIP = "card_skip"
+DT_CAMPFIRE = "campfire"
+DT_MAP = "map"
+DT_REWARD_POTION = "reward_potion"
+DT_COMBAT_POTION = "combat_potion"
+DT_OTHER = "other"
+
+
+def _decision_type_of(action: int) -> str:
+    """Label a full-space teacher action by the decision it represents."""
     if CARD_PICK_START <= action < CARD_PICK_END:
-        return action - CARD_PICK_START
+        return DT_CARD_PICK
     if action == CARD_SKIP_IDX:
-        return MAX_REWARD_CARD_SLOTS
-    raise ValueError(
-        f"action {action} is outside the card-pick+skip sub-slice "
-        f"[{CARD_PICK_START}..{CARD_PICK_END}) or {{{CARD_SKIP_IDX}}}"
-    )
-
-
-def _has_legal_card_slot(mask: np.ndarray) -> bool:
-    """True if at least one card-pick slot is legal in the full-space mask."""
-    return bool(mask[CARD_PICK_START:CARD_PICK_END].any())
+        return DT_CARD_SKIP
+    if _REST.contains(action):
+        return DT_CAMPFIRE
+    if _MAP.contains(action):
+        return DT_MAP
+    if _REWARD_POTION_START <= action < _REWARD_POTION_START + MAX_REWARD_POTIONS:
+        return DT_REWARD_POTION
+    if _USE_POTION_UNTARGETED.contains(action):
+        return DT_COMBAT_POTION
+    return DT_OTHER
 
 
 # --- Dataset ----------------------------------------------------------------
@@ -83,16 +108,18 @@ class BCManifest:
     interface_version: str
     seed: int | None
     teacher_config: dict[str, Any]
-    tier_histogram: dict[str, int]  # tier_name -> count of teacher picks at that tier
-    skip_rate: float  # fraction of samples where teacher chose skip
+    tier_histogram: dict[str, int]  # tier_name -> count of teacher CARD picks at that tier
+    decision_type_histogram: dict[str, int]  # decision_type -> count of teacher decisions
+    skip_rate: float  # fraction of CARD-reward decisions where the teacher chose skip
 
 
 class BCDataset:
     """Container for behavior-cloning samples.
 
-    Each sample is (obs_dict, teacher_action_subslice_idx, card_subslice_mask).
-    Stored as stacked numpy arrays for persistence, and yields torch tensors for
-    training.
+    Each sample is (obs_dict, teacher_action, mask), where ``teacher_action`` is a
+    full-space action index and ``mask`` is the full ``(ACTION_DIM,)`` legality
+    mask for that step. Stored as stacked numpy arrays for persistence, and yields
+    torch tensors for training.
     """
 
     def __init__(
@@ -103,8 +130,8 @@ class BCDataset:
         manifest: BCManifest,
     ) -> None:
         self.obs_arrays = obs_arrays  # {field_name: (N, *field_shape)}
-        self.actions = actions  # (N,) int64, sub-slice indices [0..8]
-        self.masks = masks  # (N, _SUBSLICE_SIZE) bool
+        self.actions = actions  # (N,) int64, full-space action indices [0..ACTION_DIM)
+        self.masks = masks  # (N, ACTION_DIM) bool
         self.manifest = manifest
 
     def __len__(self) -> int:
@@ -128,11 +155,14 @@ class BCDataset:
         arrays["manifest_interface_version"] = np.array(
             [self.manifest.interface_version], dtype="U32"
         )
-        # teacher_config / tier_histogram are variable-size dicts; serialize to
-        # JSON and store as auto-sized unicode scalar arrays so they round-trip
-        # under allow_pickle=False (a fixed "U32" would truncate).
+        # teacher_config / tier_histogram / decision_type_histogram are variable-size
+        # dicts; serialize to JSON and store as auto-sized unicode scalar arrays so
+        # they round-trip under allow_pickle=False (a fixed "U32" would truncate).
         arrays["manifest_teacher_config"] = np.array(json.dumps(self.manifest.teacher_config))
         arrays["manifest_tier_histogram"] = np.array(json.dumps(self.manifest.tier_histogram))
+        arrays["manifest_decision_type_histogram"] = np.array(
+            json.dumps(self.manifest.decision_type_histogram)
+        )
         np.savez(str(path), **arrays)
         logger.info("BC dataset saved to %s (%d samples)", path, len(self))
 
@@ -153,12 +183,19 @@ class BCDataset:
         iface_version = str(data["manifest_interface_version"][0])
         teacher_config = json.loads(str(data["manifest_teacher_config"]))
         tier_histogram = json.loads(str(data["manifest_tier_histogram"]))
+        # decision_type_histogram was added after the initial (card-only) format;
+        # tolerate its absence so older datasets still load.
+        if "manifest_decision_type_histogram" in data.files:
+            decision_type_histogram = json.loads(str(data["manifest_decision_type_histogram"]))
+        else:
+            decision_type_histogram = {}
         manifest = BCManifest(
             n_samples=n_samples,
             interface_version=iface_version,
             seed=seed,
             teacher_config=teacher_config,
             tier_histogram=tier_histogram,
+            decision_type_histogram=decision_type_histogram,
             skip_rate=skip_rate,
         )
         return cls(obs_arrays, actions, masks, manifest)
@@ -167,37 +204,59 @@ class BCDataset:
 # --- Collection -------------------------------------------------------------
 
 
+def _teacher_config(teacher: Any) -> dict[str, Any]:
+    """Best-effort provenance of the teacher's tuning knobs (card + strategic)."""
+    card_teacher = getattr(teacher, "card_teacher", teacher)
+    config: dict[str, Any] = {}
+    for attr in ("min_keep_tier", "default_tier"):
+        if hasattr(card_teacher, attr):
+            config[attr] = getattr(card_teacher, attr)
+    for attr in ("rest_hp_fraction", "map_low_hp_fraction", "potion_emergency_hp_fraction"):
+        if hasattr(teacher, attr):
+            config[attr] = getattr(teacher, attr)
+    return config
+
+
 def collect_bc_dataset(
     env: Any,
     policy: Any,
-    teacher: CardRewardTeacher,
+    teacher: BCTeacher,
     *,
     n_episodes: int,
     seed: int | None = None,
     deterministic: bool = True,
 ) -> BCDataset:
-    """Run episodes collecting teacher actions at card-reward decision steps.
+    """Run episodes recording teacher actions at every decision the teacher owns.
 
-    The base ``policy`` drives all non-card decisions. At steps where at least one
-    card-pick slot is legal, the teacher's action is executed AND logged.
+    On each step the teacher is consulted first. If it returns an action, that
+    action is executed AND logged as a sample; if it defers (``None``), the base
+    ``policy`` decides and no sample is logged. This generalizes the original
+    card-only flow to any screen the teacher covers (card pick, campfire, map,
+    potion), classified into the manifest's decision-type histogram.
 
     Args:
         env: A Gymnasium env implementing the STS RL interface (reset/step).
         policy: An ActorCritic with .act(obs_batched, mask_batched, deterministic).
-        teacher: CardRewardTeacher that provides select_action.
+        teacher: A teacher with ``select_action(obs, mask) -> int | None``.
         n_episodes: Number of full episodes to collect.
         seed: Optional base seed for env resets (incremented per episode).
         deterministic: Whether the base policy acts greedily.
 
     Returns:
-        A BCDataset with all collected card-reward samples.
+        A BCDataset with all collected teacher-decision samples.
     """
     obs_buffers: dict[str, list[np.ndarray]] = {f.name: [] for f in OBS_FIELDS}
     action_buffer: list[int] = []
     mask_buffer: list[np.ndarray] = []
+    decision_counts: Counter[str] = Counter()
     tier_counts: Counter[int] = Counter()
+    card_decisions = 0
     skip_count = 0
     total_steps = 0
+
+    # A composite teacher exposes its card sub-teacher; a bare card teacher is its
+    # own card teacher. Used only to attribute card-pick tier stats.
+    card_teacher: Any = getattr(teacher, "card_teacher", teacher)
 
     device = next(policy.parameters()).device
 
@@ -210,34 +269,33 @@ def collect_bc_dataset(
 
         while not (terminated or truncated):
             total_steps += 1
-            is_card_step = _has_legal_card_slot(mask)
+            teacher_action = teacher.select_action(obs, mask)
 
-            if is_card_step:
-                # Teacher decides; log the sample
-                teacher_action = teacher.select_action(obs, mask)
-                # Record sub-slice mask and sub-slice action
-                subslice_mask = np.array(
-                    [bool(mask[i]) for i in _CARD_SUBSLICE_INDICES], dtype=np.bool_
-                )
-                subslice_action = _action_to_subslice_idx(teacher_action)
+            if teacher_action is not None:
+                # Teacher owns this decision: log the full-space sample and execute.
+                teacher_action = int(teacher_action)
                 for f in OBS_FIELDS:
                     obs_buffers[f.name].append(obs[f.name].copy())
-                action_buffer.append(subslice_action)
-                mask_buffer.append(subslice_mask)
-                # Track tier stats
-                if teacher_action == CARD_SKIP_IDX:
-                    skip_count += 1
-                else:
-                    slot = teacher_action - CARD_PICK_START
-                    card_id = int(obs["reward_card_ids"][slot])
-                    card_name = teacher._card_id_to_name(card_id)
-                    tier = teacher._resolve_tier(card_name)
-                    if tier is not None:
-                        tier_counts[tier] += 1
-                # Execute teacher action
+                action_buffer.append(teacher_action)
+                mask_buffer.append(np.asarray(mask, dtype=np.bool_).copy())
+
+                label = _decision_type_of(teacher_action)
+                decision_counts[label] += 1
+                if label in (DT_CARD_PICK, DT_CARD_SKIP):
+                    card_decisions += 1
+                    if label == DT_CARD_SKIP:
+                        skip_count += 1
+                    elif card_teacher is not None:
+                        slot = teacher_action - CARD_PICK_START
+                        card_id = int(obs["reward_card_ids"][slot])
+                        card_name = card_teacher._card_id_to_name(card_id)
+                        tier = card_teacher._resolve_tier(card_name)
+                        if tier is not None:
+                            tier_counts[tier] += 1
+
                 obs, _reward, terminated, truncated, info = env.step(teacher_action)
             else:
-                # Base policy decides
+                # Teacher deferred: the base policy decides (no sample logged).
                 obs_batched = _obs_to_batched(obs, device)
                 mask_batched = torch.as_tensor(mask, device=device).unsqueeze(0)
                 with torch.no_grad():
@@ -259,25 +317,26 @@ def collect_bc_dataset(
             )
 
     n_samples = len(action_buffer)
-    total_card_decisions = n_samples
-    skip_rate = skip_count / max(1, total_card_decisions)
+    skip_rate = skip_count / max(1, card_decisions)
     tier_hist = {str(k): v for k, v in sorted(tier_counts.items())}
+    decision_hist = {k: v for k, v in sorted(decision_counts.items())}
 
     logger.info(
-        "BC collection done: %d episodes, %d steps, %d card-decision samples, "
-        "skip_rate=%.3f, tier_hist=%s",
+        "BC collection done: %d episodes, %d steps, %d teacher-decision samples, "
+        "skip_rate=%.3f, decisions=%s, tier_hist=%s",
         n_episodes,
         total_steps,
         n_samples,
         skip_rate,
+        decision_hist,
         tier_hist,
     )
 
     # Stack arrays
     if n_samples == 0:
         raise ValueError(
-            "collect_bc_dataset collected no card-reward decisions "
-            "(n_samples == 0); increase n_episodes"
+            "collect_bc_dataset collected no teacher decisions (n_samples == 0); "
+            "increase n_episodes or broaden the teacher's coverage"
         )
     obs_arrays = {name: np.stack(arrs, axis=0) for name, arrs in obs_buffers.items()}
     actions = np.array(action_buffer, dtype=np.int64)
@@ -287,11 +346,9 @@ def collect_bc_dataset(
         n_samples=n_samples,
         interface_version=INTERFACE_VERSION,
         seed=seed,
-        teacher_config={
-            "min_keep_tier": teacher.min_keep_tier,
-            "default_tier": teacher.default_tier,
-        },
+        teacher_config=_teacher_config(teacher),
         tier_histogram=tier_hist,
+        decision_type_histogram=decision_hist,
         skip_rate=skip_rate,
     )
     return BCDataset(obs_arrays, actions, masks, manifest)
@@ -378,16 +435,20 @@ def bc_pretrain(
     freeze_encoder: bool = False,
     patience: int = 8,
 ) -> BCStats:
-    """Run BC pretraining on the card-pick + skip sub-slice.
+    """Run BC pretraining over the full masked action space.
 
     Loss: negative log-prob of the teacher action under the masked policy
-    distribution restricted to the card sub-slice. Masking is applied within the
-    sub-slice (not the full ACTION_DIM), so only card + skip logits participate.
+    distribution over all ``ACTION_DIM`` actions. Because illegal logits are
+    driven to the finite floor, only the legal actions of each sample's screen
+    participate in the softmax and receive gradient - so a card-pick sample
+    updates only the card / skip logits (and the encoder through them), a campfire
+    sample only the rest / smith logits, and so on. Each screen is thus supervised
+    surgically without a per-screen sub-slice.
 
     Default trains end-to-end from a combat warm-start. The freeze_encoder
     option is exposed but NOT recommended: a frozen encoder cannot adapt its
     entity-token representations (the card / relic embeddings and the attention)
-    to the card-selection objective, so the head would learn over fixed features.
+    to the strategic objectives, so the heads would learn over fixed features.
     End-to-end training with a modest LR is the intended recipe.
 
     Args:
@@ -407,6 +468,15 @@ def bc_pretrain(
     Returns:
         BCStats with loss/accuracy histories.
     """
+    # Full-space masks are required: each sample teaches over all ACTION_DIM logits.
+    # A card-only (sub-slice-width) dataset from an older format would silently
+    # mis-align, so reject it with a clear message rather than deep in the head.
+    if dataset.masks.ndim != 2 or dataset.masks.shape[1] != ACTION_DIM:
+        raise ValueError(
+            f"BC dataset masks must be full-space (N, {ACTION_DIM}); got "
+            f"{dataset.masks.shape}. Re-collect with the current collect_bc_dataset."
+        )
+
     device = torch.device(device) if isinstance(device, str) else device
     model = model.to(device)
     model.train()
@@ -414,8 +484,8 @@ def bc_pretrain(
     if freeze_encoder:
         logger.warning(
             "freeze_encoder=True: a frozen encoder cannot adapt its entity-token "
-            "representations to the card-selection objective, so only the policy "
-            "head learns. This is NOT recommended for BC pretraining."
+            "representations to the strategic objectives, so only the policy head "
+            "learns. This is NOT recommended for BC pretraining."
         )
         for param in model.encoder.parameters():
             param.requires_grad = False
@@ -481,19 +551,13 @@ def bc_pretrain(
             action_batch = action_batch.to(device)
             mask_batch = mask_batch.to(device)
 
-            # Forward: the encoder returns (per_token, pooled_cls, mask); BC reads
-            # the per-token embeddings + padding mask, then the pointer head's raw
-            # (pre-mask) logits over the full action space.
+            # Forward: the encoder returns (per_token, pooled_cls, mask); the pointer
+            # head scores + masks over the full action space (same masking as rollout).
             per_token, _features, key_padding_mask = model.encoder(obs_batch)
-            raw_logits = model.policy.raw_logits(per_token, key_padding_mask)  # (B, ACTION_DIM)
+            logits = model.policy(per_token, key_padding_mask, mask_batch)  # (B, ACTION_DIM)
 
-            # Extract the card sub-slice logits
-            subslice_logits = raw_logits[:, _CARD_SUBSLICE_INDICES]  # (B, 9)
-            # Apply sub-slice mask
-            subslice_logits = subslice_logits.masked_fill(~mask_batch, MASKED_LOGIT)
-
-            # Cross-entropy over the sub-slice
-            loss = F.cross_entropy(subslice_logits, action_batch)
+            # Cross-entropy over the full masked action space.
+            loss = F.cross_entropy(logits, action_batch)
 
             optimizer.zero_grad()
             loss.backward()
@@ -518,12 +582,10 @@ def bc_pretrain(
                 mask_batch = mask_batch.to(device)
 
                 per_token, _features, key_padding_mask = model.encoder(obs_batch)
-                raw_logits = model.policy.raw_logits(per_token, key_padding_mask)
-                subslice_logits = raw_logits[:, _CARD_SUBSLICE_INDICES]
-                subslice_logits = subslice_logits.masked_fill(~mask_batch, MASKED_LOGIT)
+                logits = model.policy(per_token, key_padding_mask, mask_batch)
 
-                loss = F.cross_entropy(subslice_logits, action_batch)
-                preds = subslice_logits.argmax(dim=-1)
+                loss = F.cross_entropy(logits, action_batch)
+                preds = logits.argmax(dim=-1)
 
                 bs = action_batch.shape[0]
                 val_loss += loss.item() * bs

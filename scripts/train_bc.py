@@ -1,8 +1,9 @@
-"""CLI: Train the card-reward-pick head via behavior cloning.
+"""CLI: Train the strategic decision heads via behavior cloning.
 
 Loads a pre-collected BC dataset and a warm-start checkpoint, runs supervised
-pretraining on the card-pick + skip sub-slice, and saves a checkpoint compatible
-with ``train_run.py --warm-start``.
+pretraining over the full masked action space (each sample teaches only its
+screen's legal actions), and saves a checkpoint compatible with
+``train_run.py --warm-start``.
 
 Usage:
     python scripts/train_bc.py --dataset bc_dataset.npz \
@@ -25,7 +26,9 @@ DEFAULT_OUTPUT = "bc_best.pt"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the card-pick head via behavior cloning.")
+    parser = argparse.ArgumentParser(
+        description="Train the strategic decision heads via behavior cloning."
+    )
     parser.add_argument(
         "--dataset",
         type=str,
@@ -84,7 +87,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--freeze-encoder",
         action="store_true",
         default=False,
-        help="Freeze the encoder (NOT recommended for card-vision BC).",
+        help="Freeze the encoder (NOT recommended for strategic BC).",
     )
     parser.add_argument(
         "--device",
