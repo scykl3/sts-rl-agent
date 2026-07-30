@@ -28,7 +28,14 @@ from gymnasium.utils import seeding
 
 from sts_rl.env._engine import slaythespire as sts
 from sts_rl.env.actions import auto_resolve, build_mask, decode_action
-from sts_rl.env.engine import CombatSnapshot, engine_commit, read_combat, start_combat
+from sts_rl.env.combat_state import StateSpec
+from sts_rl.env.engine import (
+    CombatSnapshot,
+    engine_commit,
+    read_combat,
+    start_combat,
+    start_combat_from_state,
+)
 from sts_rl.env.observation import encode_observation
 from sts_rl.env.reward import (
     DEFAULT_SHAPING_GAMMA,
@@ -77,6 +84,14 @@ class StsEnv(gym.Env):
             The chosen battle is built on a fresh run state (floor 0): starting
             deck, full HP, no act-earned relics, i.e. a single-combat training
             setup, not a mid-act state.
+        state_spec: optional :class:`~sts_rl.env.combat_state.StateSpec` describing
+            a realistic mid-run state (evolved deck with upgrades, relics, HP,
+            ascension) and the encounter to fight. When given, every :meth:`reset`
+            builds that combat, so hard fights (elites, act bosses) can be drilled
+            from a plausible deck rather than the 10-card starter. The spec carries
+            its own encounter and ascension, so it is mutually exclusive with
+            ``encounters`` and takes precedence over the ``ascension`` argument.
+            ``None`` (the default) keeps the fresh-start behavior unchanged.
     """
 
     metadata = {"render_modes": ["ansi", "human"]}
@@ -91,6 +106,7 @@ class StsEnv(gym.Env):
         gamma: float = DEFAULT_SHAPING_GAMMA,
         render_mode: str | None = None,
         encounters: Sequence[Any] | None = None,  # sts.MonsterEncounter values | None
+        state_spec: StateSpec | None = None,
     ) -> None:
         if max_episode_steps < 1:
             raise InterfaceError(f"max_episode_steps must be >= 1, got {max_episode_steps}")
@@ -101,12 +117,19 @@ class StsEnv(gym.Env):
             )
         if encounters is not None and len(encounters) == 0:
             raise InterfaceError("encounters, when provided, must be non-empty")
+        if encounters is not None and state_spec is not None:
+            raise InterfaceError(
+                "pass at most one of encounters / state_spec; a state_spec carries its "
+                "own encounter"
+            )
 
         self.observation_space, self.action_space = build_spaces()
         self.interface_version = INTERFACE_VERSION
         self.render_mode = render_mode
 
-        self._ascension = ascension
+        # A state_spec is authoritative for ascension (it scales enemy HP/behavior),
+        # so it overrides the ascension argument and is what info reports.
+        self._ascension = state_spec.ascension if state_spec is not None else ascension
         self._max_episode_steps = max_episode_steps
         self._strict = strict
         self._reward_config = reward_config if reward_config is not None else RewardConfig()
@@ -114,6 +137,9 @@ class StsEnv(gym.Env):
         # Fixed pool of chosen encounters sampled once per reset; None keeps the
         # default navigate-to-first-combat behavior.
         self._encounters = tuple(encounters) if encounters is not None else None
+        # Optional mid-run state to build every combat from; None keeps the
+        # fresh-start behavior. Mutually exclusive with _encounters (guarded above).
+        self._state_spec = state_spec
         # Cached once; the pinned commit does not change during a run.
         self._engine_commit = engine_commit()
 
@@ -133,6 +159,18 @@ class StsEnv(gym.Env):
         # for the potential-based delta gamma * Phi(s') - Phi(s).
         self._prev_potentials: dict[str, float] = zero_shaping_terms()
 
+    @classmethod
+    def from_state(cls, spec: StateSpec, **kwargs: Any) -> StsEnv:
+        """Construct an env whose every combat is built from ``spec``.
+
+        Convenience wrapper for ``StsEnv(state_spec=spec, ...)``; other keyword
+        arguments (``max_episode_steps``, ``reward_config``, ``gamma``,
+        ``render_mode``, ``strict``) are forwarded. Passing ``encounters`` or
+        ``ascension`` here is redundant with the spec and (for ``encounters``)
+        rejected by the constructor.
+        """
+        return cls(state_spec=spec, **kwargs)
+
     # -- Gymnasium API ------------------------------------------------------
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> tuple[Obs, Info]:
@@ -140,7 +178,11 @@ class StsEnv(gym.Env):
         if seed is None:
             seed = int(self.np_random.integers(0, _MAX_SEED))
         self._episode_seed = seed
-        if self._encounters is not None:
+        if self._state_spec is not None:
+            # Build the mid-run state directly; the seed drives the battle RNG so
+            # the encounter is reproducible given the reset seed.
+            self._gc, self._bc = start_combat_from_state(self._state_spec, seed=seed)
+        elif self._encounters is not None:
             # Sample from self.np_random (seeded by super().reset above) so the
             # chosen encounter is deterministic given the reset seed.
             chosen = self._encounters[int(self.np_random.integers(len(self._encounters)))]

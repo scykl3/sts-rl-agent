@@ -81,6 +81,9 @@ commit adds:
   auto-detect the active SDK.
 - **Read-only `BattleContext` bindings** exposing the potion belt and the
   card-select selected bits for observation encoding.
+- **`GameContext` write bindings** exposing `clear_deck`, `obtain_card`,
+  `obtain_relic`, `set_relic_value`, and the `cur_hp` / `max_hp` setters, so a
+  caller can build a chosen mid-run state (deck, relics, HP) before a combat.
 - **Optional encounter selection.** `create_battle_context` accepts an optional
   `MonsterEncounter`, so a caller can spawn a chosen combat by reusing the
   engine's existing `BattleContext::init(gc, encounter)` path. It defaults to the
