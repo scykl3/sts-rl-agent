@@ -84,8 +84,9 @@ class _StubRunEnv:
     serves the provenance ``info`` keys ``main()`` reads off the initial reset, so
     ``main()`` runs the whole warm-start wiring without a native engine build.
 
-    ``reward_config`` and ``gamma`` mirror the real ``StsRunEnv`` signature
-    (``main()`` now passes both); they are stored but otherwise unused by the stub.
+    ``reward_config``, ``gamma``, and ``stop_after_act`` mirror the real
+    ``StsRunEnv`` signature (``main()`` passes all three); they are stored but
+    otherwise unused by the stub.
     """
 
     def __init__(
@@ -95,11 +96,13 @@ class _StubRunEnv:
         max_episode_steps: int,
         reward_config: RewardConfig | None = None,
         gamma: float = 1.0,
+        stop_after_act: int | None = None,
     ) -> None:
         self.ascension = ascension
         self.max_episode_steps = max_episode_steps
         self.reward_config = reward_config
         self.gamma = gamma
+        self.stop_after_act = stop_after_act
 
     def reset(
         self, *, seed: int | None = None, options: object = None
@@ -109,6 +112,20 @@ class _StubRunEnv:
 
     def close(self) -> None:
         pass
+
+
+class _StubVecEnv:
+    """Engine-free stand-in for ``SubprocVecEnv``: records the worker factory and
+    ``num_envs`` main() passed, and is closeable, so the vec wiring can be checked
+    without spawning workers or a native engine."""
+
+    def __init__(self, make_env: object, num_envs: int, *, start_method: str = "spawn") -> None:
+        self.make_env = make_env
+        self.num_envs = num_envs
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_final_eval_report_reuses_periodic_eval(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -245,19 +262,20 @@ def test_final_eval_report_recomputes_on_band_mismatch(
 
 
 def test_validate_num_envs_accepts_single_env() -> None:
-    """Single-env is the supported path, so num_envs == 1 does not raise."""
+    """Single-env is a valid path, so num_envs == 1 does not raise."""
     train_run._validate_num_envs(1)  # no raise
 
 
 @pytest.mark.parametrize("num_envs", [2, 8, 16])
-def test_validate_num_envs_rejects_vectorized(num_envs: int) -> None:
-    """num_envs > 1 is not supported yet and fails fast with a clear pointer.
+def test_validate_num_envs_accepts_vectorized(num_envs: int) -> None:
+    """num_envs > 1 selects the vectorized path and is accepted (no raise)."""
+    train_run._validate_num_envs(num_envs)  # no raise
 
-    The vectorized StsRunEnv path is blocked on an env-owner widening of
-    SubprocVecEnv.make_env's type hint; the driver rejects it rather than reaching
-    for a cast.
-    """
-    with pytest.raises(NotImplementedError, match="single-env"):
+
+@pytest.mark.parametrize("num_envs", [0, -1])
+def test_validate_num_envs_rejects_nonpositive(num_envs: int) -> None:
+    """A count below 1 is degenerate and fails fast before the engine loads."""
+    with pytest.raises(ValueError, match="num-envs"):
         train_run._validate_num_envs(num_envs)
 
 
@@ -274,6 +292,13 @@ def test_arg_parser_run_scale_defaults() -> None:
     assert args.warm_start is None
     assert args.eval_every is None
     assert args.checkpoint_dir is None
+    assert args.stop_after_act is None  # full three-act episode by default
+
+
+def test_arg_parser_stop_after_act_parses_int() -> None:
+    """--stop-after-act captures the 1-based act index for StsRunEnv's early terminal."""
+    args = train_run.build_arg_parser().parse_args(["--stop-after-act", "1"])
+    assert args.stop_after_act == 1
 
 
 def test_arg_parser_accepts_warm_start_path() -> None:
@@ -433,6 +458,62 @@ def test_main_builds_config_with_run_best_metric(monkeypatch: pytest.MonkeyPatch
 
     config = cast(TrainConfig, captured["config"])
     assert config.best_metric == train_run.RUN_BEST_METRIC == "act1_clear_rate"
+
+
+def test_main_builds_vec_env_for_multi_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--num-envs > 1 makes main() drive a SubprocVecEnv and set config.num_envs to match.
+
+    Engine-free: SubprocVecEnv, StsRunEnv, and train are stubbed. Asserts main() (a) hands
+    train() the vec env with the requested num_envs, (b) sets config.num_envs to it (so
+    train() takes its vectorized path), and (c) wires a run-env factory (calling it builds
+    an StsRunEnv), i.e. a SubprocVecEnv of StsRunEnv workers.
+
+    Revert-verify: drop the num_envs > 1 branch in main() and it builds a single StsRunEnv
+    instead of a _StubVecEnv, failing the isinstance assertion.
+    """
+    num_envs = 4
+    captured: dict[str, object] = {}
+
+    def _fake_train(
+        env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        captured["env"] = env
+        captured["config"] = config
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+    monkeypatch.setattr(train_run, "SubprocVecEnv", _StubVecEnv)
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _StubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+    monkeypatch.setattr(sys, "argv", ["train_run", "--num-envs", str(num_envs)])
+
+    train_run.main()
+
+    env = captured["env"]
+    assert isinstance(env, _StubVecEnv)
+    assert env.num_envs == num_envs
+    config = cast(TrainConfig, captured["config"])
+    assert config.num_envs == num_envs
+    # The factory builds a run env (the stub), proving the vec path wires a run-env
+    # factory rather than the combat env.
+    worker = env.make_env(0)  # type: ignore[operator]
+    assert isinstance(worker, _StubRunEnv)
 
 
 def test_arg_parser_warmup_and_early_stop_defaults() -> None:
@@ -610,12 +691,14 @@ def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> 
             max_episode_steps: int,
             reward_config: RewardConfig | None = None,
             gamma: float = 1.0,
+            stop_after_act: int | None = None,
         ) -> None:
             super().__init__(
                 ascension=ascension,
                 max_episode_steps=max_episode_steps,
                 reward_config=reward_config,
                 gamma=gamma,
+                stop_after_act=stop_after_act,
             )
             captured_reward_configs.append(reward_config)
 
@@ -650,6 +733,71 @@ def test_main_wires_reward_config_into_envs(monkeypatch: pytest.MonkeyPatch) -> 
     # Both the training env and the eval env received the overridden shaping config.
     assert len(captured_reward_configs) == 2
     assert all(rc is not None and rc.boss_kill == 1.0 for rc in captured_reward_configs)
+
+
+def test_main_wires_stop_after_act_into_envs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() threads --stop-after-act into every constructed StsRunEnv (train + eval).
+
+    Engine-free: train and StsRunEnv are stubbed; the stub records its stop_after_act
+    kwarg, so the CLI -> env wire is checked without a native build. With num_envs == 1
+    both the eval env and the single training env are constructed via _make_run_env, so
+    both must carry the flag.
+
+    Revert-verify: drop stop_after_act=args.stop_after_act from _make_run_env in main()
+    and the recorded value falls back to None, failing this.
+    """
+    captured_stop: list[int | None] = []
+
+    class _StopStubRunEnv(_StubRunEnv):
+        def __init__(
+            self,
+            *,
+            ascension: int,
+            max_episode_steps: int,
+            reward_config: RewardConfig | None = None,
+            gamma: float = 1.0,
+            stop_after_act: int | None = None,
+        ) -> None:
+            super().__init__(
+                ascension=ascension,
+                max_episode_steps=max_episode_steps,
+                reward_config=reward_config,
+                gamma=gamma,
+                stop_after_act=stop_after_act,
+            )
+            captured_stop.append(stop_after_act)
+
+    def _fake_train(
+        _env: object,
+        config: TrainConfig,
+        *,
+        eval_env: object = None,
+        init_actor_critic: ActorCritic | None = None,
+    ) -> TrainHistory:
+        return TrainHistory(
+            records=[],
+            actor_critic=ActorCritic(),
+            eval_reports=[
+                EvalRecord(
+                    iteration=0,
+                    global_step=1,
+                    eval_seed_base=train_run.DEFAULT_EVAL_BASE_SEED,
+                    report=_make_report(0.0, n_episodes=train_run.DEFAULT_EVAL_EPISODES),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(train_run, "train", _fake_train)
+    fake_run_adapter = types.ModuleType("sts_rl.env.run_adapter")
+    setattr(fake_run_adapter, "StsRunEnv", _StopStubRunEnv)
+    monkeypatch.setitem(sys.modules, "sts_rl.env.run_adapter", fake_run_adapter)
+    monkeypatch.setattr(sys, "argv", ["train_run", "--stop-after-act", "1"])
+
+    train_run.main()
+
+    # Both envs built via _make_run_env (eval + single training env) carry the flag.
+    assert len(captured_stop) == 2
+    assert all(stop == 1 for stop in captured_stop)
 
 
 @pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")
@@ -702,3 +850,37 @@ def test_run_training_smoke_reports_act1_clear_rate() -> None:
     report = history.eval_reports[-1].report
     assert hasattr(report, "act1_clear_rate")
     assert 0.0 <= report.act1_clear_rate <= 1.0
+
+
+@pytest.mark.skipif(not _ENGINE_BUILT, reason="engine not built")
+def test_main_runs_vectorized_training_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """main() accepts --num-envs 2 and runs a couple of real vectorized iterations.
+
+    Spawns 2 StsRunEnv workers through SubprocVecEnv (the worker factory is a closure
+    shipped across the spawn boundary via cloudpickle), trains 2 short iterations, and
+    runs the final greedy eval - the whole run-mode vectorized pipeline end to end. Tiny
+    budgets keep it fast; reaching the end without raising is the assertion.
+    """
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_run",
+            "--num-envs",
+            "2",
+            "--num-iterations",
+            "2",
+            "--n-steps",
+            "8",
+            "--hidden-dim",
+            "32",
+            "--max-episode-steps",
+            "32",
+            "--eval-episodes",
+            "2",
+            "--eval-base-seed",
+            str(_EVAL_SEED_BASE),
+        ],
+    )
+
+    train_run.main()  # completes without raising

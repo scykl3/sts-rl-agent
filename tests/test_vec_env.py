@@ -20,6 +20,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without a build
 
 from sts_rl.env.adapter import StsEnv
 from sts_rl.env.reward import RewardConfig
+from sts_rl.env.run_adapter import StsRunEnv
 from sts_rl.env.vec_env import SubprocVecEnv
 from sts_rl.interface import ACTION_DIM, ACTION_BLOCK_BY_NAME, InterfaceError, OBS_FIELDS
 
@@ -33,8 +34,17 @@ def _make_env(
     return StsEnv(max_episode_steps=max_episode_steps, reward_config=reward_config)
 
 
+def _make_run_env(index: int, *, max_episode_steps: int = 3000) -> StsRunEnv:
+    return StsRunEnv(max_episode_steps=max_episode_steps)
+
+
 def _end_turn_actions(num_envs: int) -> np.ndarray:
     return np.full(num_envs, _END_TURN, dtype=np.int64)
+
+
+def _first_legal_actions(masks: np.ndarray) -> np.ndarray:
+    """One legal action index per env, taken from each env's current mask."""
+    return np.array([int(np.flatnonzero(row)[0]) for row in masks], dtype=np.int64)
 
 
 # -- Failure-path fixtures (module-level so they pickle across spawn) --------
@@ -79,6 +89,37 @@ def test_reset_batches_obs_and_masks() -> None:
             assert obs[field.name].dtype == field.dtype
         # Every env must have at least one legal action after reset.
         assert masks.any(axis=1).all()
+
+
+def test_run_env_workers_reset_and_step_batch() -> None:
+    # The full-run env (StsRunEnv) satisfies the same worker protocol as the combat
+    # env, so a SubprocVecEnv of StsRunEnv workers must reset/step and batch obs,
+    # masks, rewards, and done flags with the identical shapes/dtypes.
+    num_envs = 3
+    with SubprocVecEnv(_make_run_env, num_envs) as vec:
+        assert vec.num_envs == num_envs
+        assert vec.action_space.n == ACTION_DIM
+        obs, masks = vec.reset(seeds=[REGRESSION_SEED + i for i in range(num_envs)])
+        assert masks.shape == (num_envs, ACTION_DIM)
+        assert masks.dtype == np.bool_
+        assert masks.any(axis=1).all()  # every run starts on a genuine overworld decision
+        for field in OBS_FIELDS:
+            assert obs[field.name].shape == (num_envs, *field.shape)
+            assert obs[field.name].dtype == field.dtype
+        obs, rewards, terminated, truncated, step_masks, infos = vec.step(
+            _first_legal_actions(masks)
+        )
+        assert rewards.shape == (num_envs,) and rewards.dtype == np.float32
+        assert terminated.shape == (num_envs,) and terminated.dtype == np.bool_
+        assert truncated.shape == (num_envs,) and truncated.dtype == np.bool_
+        assert step_masks.shape == (num_envs, ACTION_DIM)
+        assert len(infos) == num_envs
+        for field in OBS_FIELDS:
+            assert obs[field.name].shape == (num_envs, *field.shape)
+        assert all(np.isfinite(rewards))
+        # Run-mode info always carries the run snapshot (which combat info lacks),
+        # confirming these workers are genuinely StsRunEnv, not the combat env.
+        assert all("run" in info for info in infos)
 
 
 def test_step_batches_results() -> None:

@@ -1,9 +1,11 @@
-"""Vectorized environment: run many :class:`StsEnv` in worker processes.
+"""Vectorized environment: run many single-instance envs in worker processes.
 
 :class:`SubprocVecEnv` spawns one worker process per engine instance and talks
-to them over pipes. Each worker owns a single :class:`StsEnv`; the parent
-batches observations, rewards, masks, and done flags across workers so the
-learner consumes stacked arrays.
+to them over pipes. Each worker owns a single env satisfying :class:`WorkerEnv`
+(the combat :class:`~sts_rl.env.adapter.StsEnv` and the full-run
+:class:`~sts_rl.env.run_adapter.StsRunEnv` both do); the parent batches
+observations, rewards, masks, and done flags across workers so the learner
+consumes stacked arrays.
 
 Workers auto-reset on episode end using the pre-1.0 Gymnasium "same-step"
 idiom: the observation returned for a done env is the first observation of the
@@ -18,6 +20,10 @@ crosses the pipe from worker to parent.
 The engine is a native extension, so workers use the ``spawn`` start method
 (safe with C++ state), and ``make_env`` is shipped to workers via cloudpickle so
 closures and lambdas are accepted, not only module-level callables.
+
+``make_env`` is typed against :class:`WorkerEnv`, a structural Protocol, rather
+than any concrete env, so this module stays engine-free (it imports no adapter)
+and both the combat and full-run envs qualify.
 """
 
 from __future__ import annotations
@@ -25,12 +31,12 @@ from __future__ import annotations
 import multiprocessing as mp
 from collections.abc import Callable, Sequence
 from multiprocessing.connection import Connection
-from typing import Any
+from typing import Any, Protocol
 
 import cloudpickle
+import gymnasium as gym
 import numpy as np
 
-from sts_rl.env.adapter import StsEnv
 from sts_rl.interface import InterfaceError, Info, Obs
 
 # A batched observation: same keys as a single Obs, each array gaining a leading
@@ -51,6 +57,36 @@ _ERROR = "error"
 _JOIN_TIMEOUT_S = 5.0
 
 
+class WorkerEnv(Protocol):
+    """Structural type of the single env each worker process owns.
+
+    Captures exactly the surface a worker touches: the two Gymnasium spaces, the
+    ``reset``/``step`` pair, and the ``legal_actions`` / ``set_global_step`` /
+    ``close`` hooks. It is a Protocol rather than a concrete env class so both the
+    combat env (:class:`~sts_rl.env.adapter.StsEnv`) and the full-run env
+    (:class:`~sts_rl.env.run_adapter.StsRunEnv`) - which are siblings, each a
+    plain ``gym.Env`` plus these extra methods, not a shared subclass - qualify.
+    Typing against it (instead of importing a concrete env) keeps this module
+    engine-free. ``gym.Env`` alone would not do: it declares neither
+    ``legal_actions`` nor ``set_global_step``, both of which the worker calls.
+    """
+
+    observation_space: gym.spaces.Space[Any]
+    action_space: gym.spaces.Space[Any]
+
+    def reset(
+        self, *, seed: int | None = ..., options: dict[str, Any] | None = ...
+    ) -> tuple[Obs, Info]: ...
+
+    def step(self, action: int) -> tuple[Obs, float, bool, bool, Info]: ...
+
+    def legal_actions(self) -> np.ndarray: ...
+
+    def set_global_step(self, t: int) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class _CloudpickleWrapper:
     """Wrap ``make_env`` so it survives the spawn pickle boundary.
 
@@ -58,7 +94,7 @@ class _CloudpickleWrapper:
     so callers may pass any callable rather than only module-level functions.
     """
 
-    def __init__(self, fn: Callable[[int], StsEnv]) -> None:
+    def __init__(self, fn: Callable[[int], WorkerEnv]) -> None:
         self.fn = fn
 
     def __getstate__(self) -> bytes:
@@ -121,12 +157,14 @@ def _worker(
 
 
 class SubprocVecEnv:
-    """Run ``num_envs`` :class:`StsEnv` in worker processes; batch their I/O.
+    """Run ``num_envs`` :class:`WorkerEnv` in worker processes; batch their I/O.
 
     Args:
         make_env: factory called once per worker as ``make_env(index)`` to build
-            that worker's env. May be a closure or lambda (shipped via
-            cloudpickle).
+            that worker's env (any :class:`WorkerEnv`, e.g.
+            :class:`~sts_rl.env.adapter.StsEnv` or
+            :class:`~sts_rl.env.run_adapter.StsRunEnv`). May be a closure or lambda
+            (shipped via cloudpickle).
         num_envs: number of parallel worker processes / engine instances.
         start_method: multiprocessing start method; ``spawn`` (the default) is
             required for the native engine.
@@ -134,7 +172,7 @@ class SubprocVecEnv:
 
     def __init__(
         self,
-        make_env: Callable[[int], StsEnv],
+        make_env: Callable[[int], WorkerEnv],
         num_envs: int,
         *,
         start_method: str = "spawn",
