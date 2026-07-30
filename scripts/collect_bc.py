@@ -1,9 +1,10 @@
-"""CLI: Collect a behavior-cloning dataset for the card-reward-pick decision.
+"""CLI: Collect a behavior-cloning dataset for the strategic decisions.
 
-Loads a warm-start checkpoint as the driving policy for non-card decisions, runs
-episodes in the full run-mode environment, and records teacher actions at every
-card-reward step. The resulting dataset is written to disk for offline BC
-training via ``train_bc.py``.
+Loads a warm-start checkpoint as the driving policy for the decisions the teacher
+does not cover, runs episodes in the full run-mode environment, and records the
+teacher's action at every decision it owns (reward-card pick, campfire, map/path,
+and potion). The resulting dataset is written to disk for offline BC training via
+``train_bc.py``.
 
 Usage:
     python scripts/collect_bc.py --warm-start <checkpoint> --output bc_data.npz \
@@ -22,7 +23,7 @@ DEFAULT_OUTPUT = "bc_dataset.npz"
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Collect a BC dataset for the card-reward-pick head."
+        description="Collect a BC dataset for the strategic decision heads."
     )
     parser.add_argument(
         "--warm-start",
@@ -79,8 +80,8 @@ def main() -> None:
     # Engine-dependent imports deferred to here so the CLI is parseable without
     # the engine (tests import and inspect the arg parser without running main).
     from sts_rl.agent.bc import collect_bc_dataset
-    from sts_rl.agent.card_teacher import CardRewardTeacher
     from sts_rl.agent.checkpoint_migration import load_checkpoint
+    from sts_rl.agent.strategic_teacher import StrategicTeacher
     from sts_rl.env.run_adapter import StsRunEnv
 
     # Load the driving policy
@@ -90,8 +91,8 @@ def main() -> None:
     # Build the run-mode environment
     env = StsRunEnv(ascension=args.ascension)
 
-    # Build the teacher
-    teacher = CardRewardTeacher(validate=True)
+    # Build the teacher (covers card pick + campfire + map + potion; defers the rest)
+    teacher = StrategicTeacher(validate=True)
 
     # Collect
     dataset = collect_bc_dataset(

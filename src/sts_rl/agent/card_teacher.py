@@ -44,6 +44,16 @@ CARD_PICK_START: int = _RS.start + REWARD_CARD_OFFSET
 CARD_PICK_END: int = CARD_PICK_START + MAX_REWARD_CARD_SLOTS
 CARD_SKIP_IDX: int = _RS.start + REWARD_SKIP_OFFSET
 
+
+def _has_legal_card_slot(mask: np.ndarray) -> bool:
+    """True if at least one card-pick slot is legal in the full-space mask.
+
+    The card-decision test both the BC collector and the composite teacher use to
+    decide whether a step is a reward-card pick the card teacher should own.
+    """
+    return bool(mask[CARD_PICK_START:CARD_PICK_END].any())
+
+
 # --- Ironclad card tier list -----------------------------------------------
 # Keyed by CardId enum NAME (UPPER_SNAKE). Ratings derived from community
 # consensus tier lists for Ascension 0 Ironclad. Cards not in this dict use
@@ -253,9 +263,9 @@ class CardRewardTeacher:
                 # No resolvable card slot is legal and skip is not legal. The
                 # teacher owns only the card-pick + skip sub-slice, so it must
                 # never fall back to a gold / potion / relic action in the wider
-                # REWARD_SELECT block (_action_to_subslice_idx would reject those).
-                # Reaching here means the caller invoked the teacher on a
-                # non-card-decision step.
+                # REWARD_SELECT block. Reaching here means the caller invoked the
+                # teacher on a non-card-decision step (the composite teacher gates
+                # this delegation on _has_legal_card_slot).
                 raise ValueError(
                     "CardRewardTeacher.select_action found no legal card slot and "
                     "no legal skip; invoke the teacher only on a card-decision step"
