@@ -112,7 +112,8 @@ PYTHONPATH=src:engine/sts_lightspeed/build python scripts/train_run.py \
 | `--ascension` | `0` | Ascension level |
 | `--max-episode-steps` | `3000` | Per-episode step cap (episode truncates when hit) |
 | `--seed` | `0` | Global + env reset seed |
-| `--num-envs` | `1` | Parallel training envs (only 1 is supported for now) |
+| `--num-envs` | `1` | Number of parallel run environments; `>1` runs them in worker processes and collects vectorized rollouts for higher throughput |
+| `--stop-after-act` | `None` | End each episode as soon as this act's boss is cleared (the run advances past the act), making "clear act N" a frequent terminal signal instead of a rare late-run event; unset runs the full three-act episode. Applies to both training and the periodic eval |
 
 #### PPO / optimization
 
@@ -173,16 +174,17 @@ Without `--eval-every` there is no periodic eval and no `best.pt` ranking.
 
 Before PPO, an optional supervised stage can bootstrap the network so the full run starts from a sensible prior rather than uniform-random exploration. Its output is a checkpoint that `train_run.py --warm-start` loads directly (same 3-key format). The stage has two parts, both starting from a warm-start policy (typically a combat-trained checkpoint from `train_combat.py`):
 
-1. Behavior cloning of the card-reward pick, in two steps:
+1. Behavior cloning of the run's strategic decisions - the card-reward pick together with campfire (rest vs. smith), map-path selection, and potion use - in two steps:
 
 ```bash
-# Collect a dataset: select non-card decisions with a warm-start policy, record the
-# heuristic teacher's action at every card-reward step.
+# Collect a dataset: use a warm-start policy for the remaining decisions and record
+# the heuristic teacher's action at every supported strategic decision (card reward,
+# campfire, map path, potions).
 PYTHONPATH=src:engine/sts_lightspeed/build python scripts/collect_bc.py \
     --warm-start runs/combat/checkpoints/best.pt --output bc_data.npz \
     --n-episodes 200 --seed 42
 
-# Train the card-pick sub-slice on that dataset; writes a warm-start-compatible checkpoint.
+# Train the cloned decisions on that dataset; writes a warm-start-compatible checkpoint.
 PYTHONPATH=src python scripts/train_bc.py \
     --dataset bc_data.npz --warm-start runs/combat/checkpoints/best.pt \
     --output bc_best.pt --epochs 30 --lr 1e-4 --seed 42
