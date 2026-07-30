@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from sts_rl.env._engine import slaythespire as sts
+from sts_rl.env.combat_state import StateSpec, resolve_deck, resolve_relics
+from sts_rl.env.encounters import resolve_encounter_names
 
 # The engine module ships no type stubs, so its classes (GameContext,
 # BattleContext, ...) are untyped at the boundary and annotated as Any here.
@@ -77,6 +79,39 @@ def start_combat(
         actions[0].execute(gc)
         steps += 1
     return gc, gc.create_battle_context()
+
+
+def start_combat_from_state(spec: StateSpec, *, seed: int = 0) -> tuple[Any, Any]:
+    """Build a combat from a mid-run :class:`~sts_rl.env.combat_state.StateSpec`.
+
+    Mirrors :func:`start_combat`'s contract - returns ``(game_context,
+    battle_context)`` - but instead of navigating a fresh run to its first fight it
+    constructs the run state the spec describes and builds the spec's chosen
+    encounter directly (no navigation). The steps, in order:
+
+    1. Create a fresh Ironclad ``GameContext`` at ``spec.ascension`` seeded by
+       ``seed`` (the seed drives the battle RNG: enemy HP rolls, move sequence).
+    2. Clear the starter deck and obtain the spec's cards with their upgrades.
+    3. Obtain the spec's relics (in addition to the always-present starter relic;
+       see :mod:`sts_rl.env.combat_state`).
+    4. Set ``max_hp`` then ``cur_hp`` (max first so lowering it never clamps the
+       current value below the intended one).
+    5. Build the spec's ``MonsterEncounter`` on that state.
+
+    Raises :class:`~sts_rl.interface.InterfaceError` (via the resolvers) if any
+    card, relic, or encounter name is unknown or the engine's ``INVALID`` sentinel.
+    """
+    gc = sts.GameContext(sts.CharacterClass.IRONCLAD, int(seed), int(spec.ascension))
+    gc.clear_deck()
+    for card in resolve_deck(spec.deck):
+        gc.obtain_card(card)
+    for relic in resolve_relics(spec.relics):
+        gc.obtain_relic(relic)
+    # max_hp before cur_hp: setting max below the current HP would otherwise clamp it.
+    gc.max_hp = int(spec.max_hp)
+    gc.cur_hp = int(spec.effective_cur_hp)
+    encounter = resolve_encounter_names([spec.encounter])[0]
+    return gc, gc.create_battle_context(encounter)
 
 
 @dataclass(frozen=True)
