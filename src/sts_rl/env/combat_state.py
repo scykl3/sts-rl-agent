@@ -51,6 +51,9 @@ MAX_ASCENSION = 20
 # The engine deck is a fixed-capacity buffer (fixed_list<Card, 96>) whose push_back
 # does not bounds-check, so obtaining more than this many cards writes out of bounds
 # (undefined behavior). A spec's deck length is capped here to keep the build safe.
+# Capping the spec deck is necessary but not sufficient: a card-adding relic (e.g.
+# CALLING_BELL) obtained on top of an at-cap 96-card deck can still push one card
+# past capacity, so keep such relics out of an at-cap spec.
 MAX_DECK_SIZE = 96
 
 

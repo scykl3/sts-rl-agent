@@ -204,7 +204,8 @@ def test_build_from_state_builds_requested_encounter() -> None:
     assert snap.monster_count == 1
     assert snap.monsters[0].monster_id == "GREMLIN_NOB"
 
-    # An Act-1 boss builds too (unwinnable with the starter deck; the point of F2).
+    # An Act-1 boss builds too (unwinnable with the starter deck, which is why
+    # building from an evolved-deck spec exists).
     boss = StateSpec(deck=_SAMPLE_DECK, encounter="HEXAGHOST")
     _, bc_boss = start_combat_from_state(boss, seed=REGRESSION_SEED)
     boss_snap = read_combat(bc_boss)
