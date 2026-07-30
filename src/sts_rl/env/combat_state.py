@@ -18,6 +18,15 @@ The starting relic is not removed: an Ironclad ``GameContext`` always carries it
 starter relic (``BURNING_BLOOD``), and the engine exposes no way to clear relics,
 so a spec's relics are obtained *in addition* to it. This matches every real
 Ironclad run, which always holds ``BURNING_BLOOD``.
+
+Fidelity caveat - relics that alter the deck on obtain: a few relics add or change
+cards the moment they are obtained, so a spec that lists one will NOT build the
+deck it names. ``WAR_PAINT`` and ``WHETSTONE`` upgrade random cards, ``TINY_HOUSE``
+upgrades a random card, ``PANDORAS_BOX`` transforms every starter Strike/Defend,
+and ``CALLING_BELL`` adds a curse. These are unsupported for exact-deck
+reproduction: cards are obtained before relics (so the relic sees the full deck),
+and the random-upgrade effects need the cards already present, so no reordering
+fixes it. Leave them out of a spec whose deck must match exactly.
 """
 
 from __future__ import annotations
@@ -38,6 +47,11 @@ IRONCLAD_BASE_MAX_HP = 80
 
 # Highest ascension level the game supports; specs are bounded to [0, MAX_ASCENSION].
 MAX_ASCENSION = 20
+
+# The engine deck is a fixed-capacity buffer (fixed_list<Card, 96>) whose push_back
+# does not bounds-check, so obtaining more than this many cards writes out of bounds
+# (undefined behavior). A spec's deck length is capped here to keep the build safe.
+MAX_DECK_SIZE = 96
 
 
 @dataclass(frozen=True)
@@ -69,7 +83,8 @@ class StateSpec:
 
     Fields:
         deck: the run deck as :class:`CardSpec` cards (ids + upgrades). Must be
-            non-empty - a combat needs a deck to draw from.
+            non-empty (a combat needs a deck to draw from) and at most
+            :data:`MAX_DECK_SIZE` cards (the engine's fixed deck capacity).
         encounter: the ``MonsterEncounter`` member name to fight (e.g.
             ``"GREMLIN_NOB"``, ``"HEXAGHOST"``), resolved via
             :func:`sts_rl.env.encounters.resolve_encounter_names`.
@@ -96,6 +111,11 @@ class StateSpec:
     def __post_init__(self) -> None:
         if not self.deck:
             raise InterfaceError("StateSpec.deck is empty; a combat needs at least one card")
+        if len(self.deck) > MAX_DECK_SIZE:
+            raise InterfaceError(
+                f"StateSpec.deck has {len(self.deck)} cards; the engine deck holds at most "
+                f"{MAX_DECK_SIZE}"
+            )
         if not self.encounter:
             raise InterfaceError("StateSpec.encounter is empty; name a MonsterEncounter member")
         if self.max_hp < 1:
@@ -177,6 +197,13 @@ def state_spec_from_game_context(gc: Any, *, encounter: str) -> StateSpec:
     Round-trips through :func:`sts_rl.env.engine.start_combat_from_state`: the
     starter relic the snapshot records is re-obtained (a no-op, since it is always
     present), so a rebuilt state carries the same deck, relics, and HP.
+
+    Round-trip limitation - relic counters are not captured: this records relic id
+    names only, not their stored per-relic values (Neow's Lament charges, Pen Nib's
+    attack count, Nunchaku's counter, Girya's lift count, and similar). On rebuild
+    each relic resets to its fresh-obtain default, so a stateful relic loses its
+    accumulated charge. Restore those explicitly with the engine's
+    ``set_relic_value`` if exact relic state matters.
     """
     deck = tuple(CardSpec(card.id.name, int(card.upgrade_count)) for card in gc.deck)
     relics = tuple(relic.id.name for relic in gc.relics)

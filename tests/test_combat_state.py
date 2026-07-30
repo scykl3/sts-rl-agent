@@ -17,6 +17,7 @@ import pytest
 from sts_rl.env.combat_state import (
     IRONCLAD_BASE_MAX_HP,
     MAX_ASCENSION,
+    MAX_DECK_SIZE,
     CardSpec,
     StateSpec,
 )
@@ -91,6 +92,15 @@ def test_card_spec_rejects_empty_id() -> None:
 def test_state_spec_rejects_empty_deck() -> None:
     with pytest.raises(InterfaceError):
         StateSpec(deck=(), encounter="GREMLIN_NOB")
+
+
+def test_state_spec_rejects_oversized_deck() -> None:
+    # The engine deck is a fixed-capacity buffer with no push_back bounds check, so
+    # a deck past MAX_DECK_SIZE would write out of bounds; the guard must reject it.
+    ok = tuple(CardSpec("STRIKE_RED") for _ in range(MAX_DECK_SIZE))
+    StateSpec(deck=ok, encounter="GREMLIN_NOB")  # exactly at the cap is allowed
+    with pytest.raises(InterfaceError):
+        StateSpec(deck=ok + (CardSpec("STRIKE_RED"),), encounter="GREMLIN_NOB")
 
 
 def test_state_spec_rejects_empty_encounter() -> None:
@@ -313,7 +323,9 @@ def test_strong_deck_vs_act1_boss_plays_to_terminal(boss: str) -> None:
     # (win or loss) with no error - impossible with the 10-card starter deck.
     from sts_rl.env.adapter import StsEnv
 
-    spec = StateSpec(deck=_STRONG_DECK, encounter=boss, max_hp=80, cur_hp=80)
+    spec = StateSpec(
+        deck=_STRONG_DECK, encounter=boss, max_hp=IRONCLAD_BASE_MAX_HP, cur_hp=IRONCLAD_BASE_MAX_HP
+    )
     env = StsEnv.from_state(spec, max_episode_steps=MAX_SCRIPTED_STEPS + 100)
     _, info = env.reset(seed=REGRESSION_SEED)
     terminated = truncated = False
