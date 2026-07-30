@@ -41,6 +41,10 @@ Extension points (deliberately deferred - do not half-implement):
 - TODO(potion-full): discarding a low-value held potion to make room for a better
   offered one is not representable - the engine enumerates no overworld potion
   discard, so a full belt simply cannot take a reward potion.
+- TODO(smith-select): the follow-up ``CARD_SELECT`` after choosing smith (WHICH card
+  to upgrade) defers to the base policy - the ``CARD_SELECT`` observation does not
+  encode the screen's purpose (upgrade vs remove vs transform), so labeling it
+  cleanly would need an interface change.
 """
 
 from __future__ import annotations
@@ -252,8 +256,11 @@ class StrategicTeacher:
         """Return a mask-legal action for a recognized screen, or ``None`` to defer.
 
         Screens are identified from the mask's legal action blocks (authoritative
-        about what is legal), so no engine screen enum is needed. Overworld screens
-        are mutually exclusive, so the dispatch order is a router, not a priority.
+        about what is legal), so no engine screen enum is needed. Most overworld
+        screens are mutually exclusive, so their dispatch order is order-independent;
+        the exception is the combat reward screen, which offers a card and a potion
+        at once, so checking the card slot before the reward-potion block is a
+        deliberate priority (take the card first).
         """
         # Reward-card pick: delegate verbatim (byte-for-byte unchanged behavior).
         if _has_legal_card_slot(mask):
