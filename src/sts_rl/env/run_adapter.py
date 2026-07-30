@@ -118,6 +118,15 @@ class StsRunEnv(gym.Env):
             ``gamma * Phi(s') - Phi(s)``. Pass the trainer's GAE discount so the
             shaping telescopes against the same return; defaults to
             :data:`~sts_rl.env.reward.DEFAULT_SHAPING_GAMMA`.
+        stop_after_act: if set, end the episode (``terminated=True``, not
+            ``truncated``) as soon as this act's boss is defeated - i.e. once the
+            run advances past the act - crediting the ``+1`` terminal win reward.
+            This turns "clear act N" into a frequent terminal signal instead of a
+            rare event inside a long three-act run. A value at or above the final
+            act only ends on a full-run victory, i.e. today's behavior. Default
+            ``None`` keeps the full-run episode (end only on run win/loss or
+            truncation). Potential-based shaping still telescopes to ``-Phi(s_0)``:
+            an earlier terminal only cashes the same potential out sooner.
         render_mode: one of ``None``, ``"ansi"``, ``"human"``.
     """
 
@@ -131,10 +140,13 @@ class StsRunEnv(gym.Env):
         strict: bool = False,
         reward_config: RewardConfig | None = None,
         gamma: float = DEFAULT_SHAPING_GAMMA,
+        stop_after_act: int | None = None,
         render_mode: str | None = None,
     ) -> None:
         if max_episode_steps < 1:
             raise InterfaceError(f"max_episode_steps must be >= 1, got {max_episode_steps}")
+        if stop_after_act is not None and stop_after_act < 1:
+            raise InterfaceError(f"stop_after_act must be >= 1 when set, got {stop_after_act}")
         valid_render_modes = (None, *self.metadata["render_modes"])
         if render_mode not in valid_render_modes:
             raise InterfaceError(
@@ -150,6 +162,9 @@ class StsRunEnv(gym.Env):
         self._strict = strict
         self._reward_config = reward_config if reward_config is not None else RewardConfig()
         self._gamma = float(gamma)
+        # Optional early terminal: end the episode once this act's boss is cleared
+        # (gc.act advances past it). None keeps the full-run episode.
+        self._stop_after_act = stop_after_act
         # Cached once; the pinned commit does not change during a run.
         self._engine_commit = engine_commit()
 
@@ -234,8 +249,20 @@ class StsRunEnv(gym.Env):
         else:
             self._step_overworld(engine_action)
 
-        terminated = is_run_over(self._gc)
-        won = run_won(self._gc)
+        run_over = is_run_over(self._gc)
+        # Optional early terminal: end the episode once the configured act's boss is
+        # cleared, so "clear act N" is a frequent terminal signal instead of a rare
+        # event late in a full three-act run. The engine advances gc.act past an act
+        # when its boss falls (the same signal the act-clear eval metric keys on), so
+        # the act is cleared exactly when gc.act > stop_after_act. Winning the final
+        # act ends the run via is_run_over (there is no act beyond the last), so that
+        # victory is folded into `won` through run_won, not an act increment.
+        act_cleared = self._stop_after_act is not None and int(self._gc.act) > self._stop_after_act
+        terminated = run_over or act_cleared
+        # An act-clear is this shortened episode's success, so it earns the +1 terminal
+        # win reward like a full-run victory; a death leaves run_won False (and
+        # act_cleared False) and takes the -1 terminal.
+        won = run_won(self._gc) or act_cleared
         terminal = 0.0
         if terminated:
             terminal = TERMINAL_WIN_REWARD if won else TERMINAL_LOSS_REWARD

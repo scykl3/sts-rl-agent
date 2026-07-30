@@ -551,3 +551,92 @@ def test_reset_without_seed_is_valid_and_bounded() -> None:
     assert info["action_mask"].any()
     assert 0 <= env._episode_seed < _MAX_SEED
     env.close()
+
+
+# gc.act is 1-based and beating the Act 1 boss advances the run to Act 2, so a
+# terminal act >= this means Act 1 was cleared (matches eval's act-clear threshold).
+_ACT2 = 2
+
+
+def test_stop_after_act_terminates_at_act_clear() -> None:
+    """stop_after_act=1 ends the episode at the Act 1 boss defeat with a win terminal.
+
+    Driving greedy on ACT_CROSSING_SEED clears the Act 1 boss (gc.act advances to 2).
+    With stop_after_act=1 the episode terminates there - terminated (not truncated),
+    won True, terminal act >= 2 - instead of continuing into Act 2, and the +1 terminal
+    win reward is credited on that step.
+    """
+    env = StsRunEnv(stop_after_act=1)
+    _, info0 = env.reset(seed=ACT_CROSSING_SEED)
+    trace = _drive(env, info0, _greedy_action)
+
+    last = trace[-1]
+    assert last["terminated"] and not last["truncated"]
+    assert last["info"]["won"] is True
+    assert last["info"]["act"] >= _ACT2  # cleared Act 1 -> advanced into Act 2
+    terminal_component = last["reward"] - sum(last["shaping"].values())
+    assert terminal_component == pytest.approx(TERMINAL_WIN_REWARD)
+    env.close()
+
+
+def test_stop_after_act_shortens_episode_vs_full_run() -> None:
+    """stop_after_act=1 ends earlier (a win) than the full-run default on the same drive.
+
+    The default (stop_after_act=None) runs the whole episode: greedy on
+    ACT_CROSSING_SEED clears Act 1 but dies later, a full-run loss. stop_after_act=1
+    stops at the Act 1 clear with a win. Same seed and policy, so the shared prefix is
+    byte-identical and the only divergence is the early terminal - this also guards
+    that stop_after_act=None is unchanged (the full-run loss still ends where it did).
+    """
+    full = StsRunEnv()  # stop_after_act defaults to None
+    _, full_info0 = full.reset(seed=ACT_CROSSING_SEED)
+    full_trace = _drive(full, full_info0, _greedy_action)
+    full.close()
+
+    stopped = StsRunEnv(stop_after_act=1)
+    _, stopped_info0 = stopped.reset(seed=ACT_CROSSING_SEED)
+    stopped_trace = _drive(stopped, stopped_info0, _greedy_action)
+    stopped.close()
+
+    # Default full run: continues past the Act 1 clear to a natural (loss) terminal.
+    assert full_trace[-1]["info"]["won"] is False
+    # Early stop: ends sooner, at the Act 1 clear, as a win.
+    assert stopped_trace[-1]["info"]["won"] is True
+    assert len(stopped_trace) < len(full_trace)
+    # Every pre-terminal step is identical between the two runs (same seed/policy, and
+    # the early-terminal branch has not fired yet), so their rewards match up to the
+    # step before stop. They differ only on stop's final step (which zeroes the
+    # potential and adds the +1 terminal).
+    for i in range(len(stopped_trace) - 1):
+        assert stopped_trace[i]["reward"] == pytest.approx(full_trace[i]["reward"])
+
+
+def test_stop_after_act_preserves_shaping_telescoping() -> None:
+    """With stop_after_act=1, each term's summed shaping still telescopes to -Phi_term(s_0).
+
+    Potential-based shaping is policy- AND horizon-invariant: ending the episode early
+    at the Act 1 clear (Phi := 0 at that terminal) leaves the undiscounted per-term sum
+    at Phi_term(terminal) - Phi_term(s_0) = -Phi_term(s_0), exactly as for a full run.
+    Guards that the early terminal did not break the telescoping invariant.
+    """
+    cfg = RewardConfig()
+    env = StsRunEnv(reward_config=cfg, stop_after_act=1)  # gamma defaults to 1.0
+    _, info0 = env.reset(seed=ACT_CROSSING_SEED)
+    phi0 = state_potentials(cfg, run=info0["run"])  # overworld start: no combat term
+    trace = _drive(env, info0, _greedy_action)
+
+    assert trace[-1]["terminated"] and not trace[-1]["truncated"]
+    assert trace[-1]["info"]["won"] is True  # ended at the Act 1 clear, not a loss
+    for term in SHAPING_TERMS:
+        total = sum(rec["shaping"][term] for rec in trace)
+        assert total == pytest.approx(-phi0[term], abs=1e-6)
+    # Non-vacuous: a run starts in act 1, so the boss potential at s_0 is nonzero.
+    assert phi0["boss_kill"] != 0.0
+    env.close()
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_stop_after_act_rejects_nonpositive(bad: int) -> None:
+    """stop_after_act must be a 1-based act index when set; <= 0 fails at construction."""
+    with pytest.raises(InterfaceError):
+        StsRunEnv(stop_after_act=bad)

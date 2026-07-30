@@ -25,14 +25,12 @@ cutoff, so a rollout need not contain a whole episode), ``--num-iterations`` is
 than combat eval, so this trades clear-rate stability against wall-clock). All are
 overridable.
 
-Vectorization. ``--num-envs`` currently accepts only ``1`` (single-env training).
-The parallel path would build ``SubprocVecEnv(lambda i: StsRunEnv(...))``, but
-:class:`~sts_rl.env.vec_env.SubprocVecEnv` types its ``make_env`` factory as
-``Callable[[int], StsEnv]`` (the combat env), so a ``StsRunEnv`` factory is
-rejected under ``mypy``. Enabling ``--num-envs > 1`` needs a one-line env-owner
-widening of that hint to ``Callable[[int], gym.Env]``; until then this driver is
-single-env and rejects ``--num-envs > 1`` with a clear error rather than reaching
-for a cast.
+Vectorization. ``--num-envs`` selects the number of parallel training envs.
+``1`` (the default) runs the original single-env path unchanged. ``> 1`` builds a
+``SubprocVecEnv(lambda i: StsRunEnv(...))`` of that many worker envs and drives
+the learning loop's existing vectorized rollout path (per-worker GAE, pooled
+episode stats). The eval env stays a single ``StsRunEnv`` (greedy holdout eval
+drives one env). Only the training env is vectorized.
 
 Usage:
 
@@ -63,6 +61,11 @@ from sts_rl.agent.encoder import HIDDEN_DIM
 from sts_rl.agent.ppo_update import PPOConfig
 from sts_rl.agent.train import DEFAULT_LEARNING_RATE, TrainConfig, TrainHistory, train
 from sts_rl.env.reward_cli import add_reward_shaping_args, reward_config_from_args
+
+# SubprocVecEnv is engine-free (it types its factory against a structural Protocol
+# and imports no adapter), so importing it here keeps this module engine-free too;
+# the engine only loads when a worker builds its StsRunEnv (deferred into main()).
+from sts_rl.env.vec_env import SubprocVecEnv, WorkerEnv
 from sts_rl.eval import EvalReport, evaluate, make_holdout_seeds
 
 logger = logging.getLogger("train_run")
@@ -90,8 +93,8 @@ DEFAULT_MAX_EPISODE_STEPS = 3000
 # so any potential-based shaping telescopes against this same return.
 FULL_RUN_GAMMA = 1.0
 FULL_RUN_GAE_LAMBDA = 0.97
-# Single-env only for now: the vectorized StsRunEnv path is blocked on an env-owner
-# type-hint widening (see the module docstring and _validate_num_envs).
+# Default to single-env training; --num-envs > 1 opts into vectorized workers
+# (see the module docstring and main()).
 DEFAULT_NUM_ENVS = 1
 # Full-run greedy eval is costly per episode (each run is up to
 # --max-episode-steps engine steps), so this is smaller than the combat driver's
@@ -111,23 +114,14 @@ RUN_BEST_METRIC = "act1_clear_rate"
 
 
 def _validate_num_envs(num_envs: int) -> None:
-    """Reject the not-yet-supported vectorized run-mode path.
+    """Reject a degenerate parallel-env count before touching the engine.
 
-    Only single-env (``num_envs == 1``) training is supported in this driver. The
-    parallel path would build ``SubprocVecEnv(lambda i: StsRunEnv(...))``, but
-    ``SubprocVecEnv.make_env`` is typed ``Callable[[int], StsEnv]`` (the combat
-    env), so a ``StsRunEnv`` factory does not type-check; enabling it needs a
-    one-line env-owner widening of that hint to ``Callable[[int], gym.Env]``. Fail
-    fast with that pointer rather than silently degrading or reaching for a cast.
+    ``num_envs == 1`` runs the single-env path; ``> 1`` runs the vectorized path.
+    A count below 1 is meaningless, so fail fast here with a clear message rather
+    than deferring to ``SubprocVecEnv`` / ``TrainConfig`` after the engine loads.
     """
-    if num_envs != 1:
-        raise NotImplementedError(
-            f"--num-envs={num_envs} is not supported yet: run-mode training is "
-            f"single-env for now. Vectorized StsRunEnv training is blocked on "
-            f"widening SubprocVecEnv.make_env's type hint from "
-            f"Callable[[int], StsEnv] to Callable[[int], gym.Env] (an env-owner "
-            f"change); pass --num-envs 1."
-        )
+    if num_envs < 1:
+        raise ValueError(f"--num-envs must be >= 1, got {num_envs}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -258,7 +252,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--num-envs",
         type=int,
         default=DEFAULT_NUM_ENVS,
-        help="parallel training envs (only 1 is supported for now; see module docstring)",
+        help="parallel training envs (1 = single-env; > 1 runs a SubprocVecEnv of workers)",
     )
     parser.add_argument(
         "--warm-start",
@@ -401,43 +395,67 @@ def main() -> None:
     # reward; unset flags reproduce the RewardConfig() default.
     reward_config = reward_config_from_args(args)
 
-    # Two env instances: `env` is the training env (its reset stream is seeded via
-    # TrainConfig.seed through the collector), and `eval_env` is a SEPARATE
-    # instance for greedy holdout eval - both the in-loop periodic eval and the
-    # final eval - so evaluate() resetting per seed never disturbs the training
-    # collector's rollout stream.
     # reward_config carries the CLI-overridable shaping coefficients; gamma is
     # single-sourced from args.gamma (the same discount TrainConfig/GAE use) so the
-    # env's potential-based shaping telescopes against the return.
-    env = StsRunEnv(
-        ascension=args.ascension,
-        max_episode_steps=args.max_episode_steps,
-        reward_config=reward_config,
-        gamma=args.gamma,
-    )
-    eval_env = StsRunEnv(
-        ascension=args.ascension,
-        max_episode_steps=args.max_episode_steps,
-        reward_config=reward_config,
-        gamma=args.gamma,
-    )
-
-    # Optional potential-based deck/economy shaping on the TRAINING env ONLY. gamma is
-    # single-sourced from args.gamma (the same discount TrainConfig/GAE use) so the term
-    # telescopes against the return and stays policy-invariant. eval_env is deliberately
-    # left unwrapped: the reported metric is terminal-win based, so eval reward stays clean.
-    if args.deck_economy_shaping:
-        env = DeckEconomyShapingWrapper(env, gamma=args.gamma, scale=args.deck_economy_scale)
-        logger.info(
-            "deck-economy shaping ENABLED on train env (scale=%.3f, gamma=%.3f)",
-            args.deck_economy_scale,
-            args.gamma,
+    # env's potential-based shaping telescopes against the return. A single builder so
+    # the training env(s) and the eval env are configured identically.
+    def _make_run_env() -> StsRunEnv:
+        return StsRunEnv(
+            ascension=args.ascension,
+            max_episode_steps=args.max_episode_steps,
+            reward_config=reward_config,
+            gamma=args.gamma,
         )
 
-    # Provenance for reproducibility: engine_commit and interface_version are
-    # always-present info keys. Read them from an initial reset; train() re-resets
-    # the env through its collector, so this read has no lasting effect.
-    _obs, reset_info = env.reset(seed=args.seed)
+    # eval_env is a SEPARATE single-env instance for greedy holdout eval (both the
+    # in-loop periodic eval and the final eval), so evaluate() resetting per seed never
+    # disturbs the training rollout stream. It is always single-env: only the TRAINING
+    # env is vectorized. It is deliberately left unwrapped by deck-economy shaping so
+    # the reported metric stays the clean terminal-win signal.
+    eval_env = _make_run_env()
+
+    # Training env: a single StsRunEnv (num_envs == 1, the original path) or a
+    # SubprocVecEnv of that many worker envs (num_envs > 1). Optional potential-based
+    # deck/economy shaping wraps the TRAINING env only; gamma is single-sourced from
+    # args.gamma so the term telescopes against the return and stays policy-invariant.
+    env: gym.Env | SubprocVecEnv
+    if args.num_envs == 1:
+        env = _make_run_env()
+        if args.deck_economy_shaping:
+            env = DeckEconomyShapingWrapper(env, gamma=args.gamma, scale=args.deck_economy_scale)
+            logger.info(
+                "deck-economy shaping ENABLED on train env (scale=%.3f, gamma=%.3f)",
+                args.deck_economy_scale,
+                args.gamma,
+            )
+        # Provenance for reproducibility: engine_commit and interface_version are
+        # always-present info keys. Read them from an initial reset; train() re-resets
+        # the env through its collector, so this read has no lasting effect.
+        _obs, reset_info = env.reset(seed=args.seed)
+    else:
+        # Each worker builds its own StsRunEnv (deck-economy shaping applied per worker).
+        # The factory is shipped to workers via cloudpickle, so it may close over args.
+        def _make_worker_env(index: int) -> WorkerEnv:
+            worker = _make_run_env()
+            if args.deck_economy_shaping:
+                return DeckEconomyShapingWrapper(
+                    worker, gamma=args.gamma, scale=args.deck_economy_scale
+                )
+            return worker
+
+        env = SubprocVecEnv(_make_worker_env, args.num_envs)
+        if args.deck_economy_shaping:
+            logger.info(
+                "deck-economy shaping ENABLED on %d train workers (scale=%.3f, gamma=%.3f)",
+                args.num_envs,
+                args.deck_economy_scale,
+                args.gamma,
+            )
+        # SubprocVecEnv.reset returns only batched obs + masks (no info dict), so read
+        # provenance from the single eval_env instead. Both envs share the pinned engine
+        # commit and interface version, so the eval_env read is authoritative; train()
+        # re-resets eval_env per holdout seed, so this read has no lasting effect.
+        _obs, reset_info = eval_env.reset(seed=args.seed)
     engine_commit = reset_info["engine_commit"]
     interface_version = reset_info["interface_version"]
 
@@ -455,6 +473,9 @@ def main() -> None:
     config = TrainConfig(
         num_iterations=args.num_iterations,
         n_steps=args.n_steps,
+        # num_envs == 1 (default) keeps the single-env path byte-for-byte; > 1 selects
+        # train()'s vectorized rollout path, which requires the SubprocVecEnv above.
+        num_envs=args.num_envs,
         learning_rate=args.learning_rate,
         anneal_lr=args.anneal_lr,
         gamma=args.gamma,
