@@ -16,7 +16,12 @@ import pytest
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
-from sts_rl.agent.checkpoint_migration import LEGACY_TRUNK_INPUT_WEIGHT_KEY, load_checkpoint
+from sts_rl.agent.aux_heads import AUX_TARGETS
+from sts_rl.agent.checkpoint_migration import (
+    AUX_HEAD_WEIGHT_KEY,
+    LEGACY_TRUNK_INPUT_WEIGHT_KEY,
+    load_checkpoint,
+)
 from sts_rl.agent.train import (
     CHECKPOINT_HIDDEN_DIM_KEY,
     CHECKPOINT_INTERFACE_VERSION_KEY,
@@ -80,6 +85,44 @@ def test_future_version_new_format_loads_verbatim(tmp_path) -> None:
     model = load_checkpoint(path)
     assert torch.equal(model.policy.learned_logit.weight, reference.policy.learned_logit.weight)
     assert torch.equal(model.encoder.card_embed.weight, reference.encoder.card_embed.weight)
+
+
+def test_aux_enabled_checkpoint_round_trips(tmp_path) -> None:
+    """An aux-enabled checkpoint rebuilds WITH the aux head and loads byte-identical.
+
+    A net trained with ``aux_coef > 0`` carries ``aux_head.*`` in its state_dict.
+    The loader must detect :data:`AUX_HEAD_WEIGHT_KEY` and rebuild with the aux head;
+    a headless ActorCritic would reject the extra keys under the strict load. This is
+    the revert guard: without the aux-aware rebuild the load raises ``InterfaceError``
+    instead of round-tripping, so an aux checkpoint could not be warm-started or
+    evaluated from disk.
+    """
+    reference = ActorCritic(hidden_dim=HIDDEN, aux_targets=AUX_TARGETS)
+    assert reference.aux_head is not None
+    assert AUX_HEAD_WEIGHT_KEY in reference.state_dict()
+    path = tmp_path / "aux.pt"
+    _write_checkpoint(path, reference.state_dict(), INTERFACE_VERSION, HIDDEN)
+
+    model = load_checkpoint(path)
+    assert model.aux_head is not None
+    assert model.aux_head.out_features == len(AUX_TARGETS)
+    ref_state = reference.state_dict()
+    got_state = model.state_dict()
+    assert set(got_state) == set(ref_state)  # aux keys present, none dropped or added
+    for key in ref_state:
+        assert torch.equal(got_state[key], ref_state[key]), f"{key} changed on load"
+
+
+def test_aux_free_checkpoint_loads_headless(tmp_path) -> None:
+    """An aux-free checkpoint still builds the default headless net (no aux head)."""
+    reference = ActorCritic(hidden_dim=HIDDEN)
+    assert reference.aux_head is None
+    path = tmp_path / "plain.pt"
+    _write_checkpoint(path, reference.state_dict(), INTERFACE_VERSION, HIDDEN)
+
+    model = load_checkpoint(path)
+    assert model.aux_head is None
+    assert not any("aux" in key for key in model.state_dict())
 
 
 def test_missing_required_key_raises(tmp_path) -> None:

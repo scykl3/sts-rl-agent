@@ -90,20 +90,22 @@ def test_deterministic_act_is_reproducible_and_legal():
 
 
 def test_evaluate_actions_is_consistent_with_value_head():
-    """evaluate_actions -> three (BATCH,) tensors; value matches the value head.
+    """evaluate_actions -> four values; value matches the value head, aux_pred is None.
 
     Re-running the encoder + value head on the same obs must reproduce the value
     returned by evaluate_actions (eval mode: no dropout/randomness in the encoder).
+    A default ActorCritic has no aux head, so aux_pred must be None.
     """
     ac = ActorCritic()
     ac.eval()
     obs = sample_observation_batch(BATCH)
     mask = _legal_prefix_mask()
     actions = torch.zeros(BATCH, dtype=torch.long)  # index 0 is legal under the prefix
-    log_prob, entropy, value = ac.evaluate_actions(obs, mask, actions)
+    log_prob, entropy, value, aux_pred = ac.evaluate_actions(obs, mask, actions)
     for tensor in (log_prob, entropy, value):
         assert tensor.shape == (BATCH,)
     assert torch.isfinite(log_prob).all()
+    assert aux_pred is None
     _per_token, pooled_cls, _mask = ac.encoder(obs)
     expected_value = ac.value(pooled_cls)
     assert torch.allclose(value, expected_value)
@@ -120,7 +122,7 @@ def test_gradient_reaches_encoder_and_both_heads():
     obs = sample_observation_batch(BATCH)
     mask = _legal_prefix_mask()
     actions = torch.zeros(BATCH, dtype=torch.long)
-    log_prob, _, value = ac.evaluate_actions(obs, mask, actions)
+    log_prob, _, value, _aux = ac.evaluate_actions(obs, mask, actions)
     (log_prob.sum() + value.sum()).backward()
 
     encoder_grad = ac.encoder.card_embed.weight.grad

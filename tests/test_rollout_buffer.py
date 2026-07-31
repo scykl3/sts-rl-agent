@@ -10,6 +10,8 @@ coverage, ordering, and shapes.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -133,6 +135,8 @@ def test_iter_minibatches_keeps_all_fields_on_data_device():
         assert mb.old_values.device.type == "meta"
         assert mb.advantages.device.type == "meta"
         assert mb.returns.device.type == "meta"
+        assert mb.end_combat_hp.device.type == "meta"
+        assert mb.end_combat_hp_valid.device.type == "meta"
 
 
 def test_iter_minibatches_covers_every_index_once():
@@ -255,3 +259,68 @@ def test_stored_tensors_do_not_alias_caller_memory():
     batch = next(iter(buffer.iter_minibatches(1, shuffle=False)))
     assert torch.equal(batch.obs[SAMPLE_FIELD][0], original_field)
     assert bool(batch.masks[0, 0])  # still legal despite the caller's in-place edit
+
+
+# --- end_combat_hp aux field ------------------------------------------------
+
+
+def test_add_defaults_end_combat_hp_to_invalid_placeholder():
+    """add() without the aux fields stores a NaN placeholder flagged invalid.
+
+    end_combat_hp is a future value unknown at add-time; the collector backfills it
+    once the combat ends, so until then every step is an invalid NaN placeholder.
+    """
+    buffer = RolloutBuffer()
+    _fill_buffer(buffer, length=3)
+    assert all(math.isnan(hp) for hp in buffer._end_combat_hp)
+    assert buffer._end_combat_hp_valid == [False, False, False]
+
+
+def test_backfill_end_combat_hp_marks_span_valid():
+    """backfill fills exactly [start, stop) with the end HP and flags those steps valid."""
+    buffer = RolloutBuffer()
+    _fill_buffer(buffer, length=T)  # T == 10
+    buffer.backfill_end_combat_hp(2, 5, 55.0)
+
+    for i in range(T):
+        if 2 <= i < 5:
+            assert buffer._end_combat_hp[i] == 55.0
+            assert buffer._end_combat_hp_valid[i] is True
+        else:
+            assert math.isnan(buffer._end_combat_hp[i])
+            assert buffer._end_combat_hp_valid[i] is False
+
+
+def test_backfill_end_combat_hp_rejects_out_of_range():
+    """A span outside the stored steps (or empty/reversed) fails loudly, not silently."""
+    buffer = RolloutBuffer()
+    _fill_buffer(buffer, length=4)
+    for bad_start, bad_stop in [(0, 5), (-1, 2), (3, 3), (3, 2)]:
+        with pytest.raises(ValueError):
+            buffer.backfill_end_combat_hp(bad_start, bad_stop, 10.0)
+
+
+def test_iter_minibatches_carries_backfilled_end_combat_hp():
+    """A no-shuffle full-width minibatch carries end_combat_hp/valid aligned to steps."""
+    buffer = RolloutBuffer()
+    _fill_buffer(buffer, length=T)
+    buffer.backfill_end_combat_hp(2, 5, 55.0)
+    buffer.compute_advantages(torch.zeros(()))
+
+    (batch,) = buffer.iter_minibatches(T, shuffle=False)
+    assert batch.end_combat_hp.shape == (T,)
+    assert batch.end_combat_hp_valid.dtype == torch.bool
+    valid = batch.end_combat_hp_valid
+    assert valid.tolist() == [i in (2, 3, 4) for i in range(T)]
+    assert torch.allclose(batch.end_combat_hp[valid], torch.full((3,), 55.0))
+    assert torch.isnan(batch.end_combat_hp[~valid]).all()
+
+
+def test_reset_clears_end_combat_hp():
+    """reset drops the aux accumulators alongside the core ones."""
+    buffer = RolloutBuffer()
+    _fill_buffer(buffer, length=4)
+    buffer.backfill_end_combat_hp(0, 4, 12.0)
+    buffer.reset()
+    assert buffer._end_combat_hp == []
+    assert buffer._end_combat_hp_valid == []

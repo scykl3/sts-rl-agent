@@ -34,9 +34,15 @@ class ActorCritic(nn.Module):
     ``act`` is the rollout path (sample or greedy) and ``evaluate_actions`` is
     the PPO update path (recompute log-prob/entropy/value with gradients). Both
     encode once and share that single encode across the two heads.
+
+    An optional auxiliary head (built only when ``aux_targets`` is non-empty)
+    reads the same pooled ``CLS`` context to predict dense, observation-derived
+    targets, shaping the shared encoder toward survival-relevant features. With
+    the default empty ``aux_targets`` no aux params exist, so the module's
+    state_dict is unchanged and existing checkpoints load.
     """
 
-    def __init__(self, hidden_dim: int = HIDDEN_DIM) -> None:
+    def __init__(self, hidden_dim: int = HIDDEN_DIM, aux_targets: tuple[str, ...] = ()) -> None:
         super().__init__()
         # hidden_dim is the transformer d_model; the constructor name is kept so
         # the training config (TrainConfig.hidden_dim) and saved checkpoints keep
@@ -47,6 +53,17 @@ class ActorCritic(nn.Module):
         # head reads the per-token embeddings; the value head reads pooled CLS.
         self.policy = PointerPolicyHead(input_dim=self.encoder.output_dim)
         self.value = ValueHead(input_dim=self.encoder.output_dim)
+        # Optional auxiliary perception head over the SAME pooled CLS the value head
+        # reads. Built ONLY when aux_targets is non-empty; with the default empty
+        # tuple aux_head is None, so the module has no extra params and its
+        # state_dict key set is unchanged (existing checkpoints load, training is
+        # byte-identical). The aux LOSS is separately gated off by default
+        # (PPOConfig.aux_coef == 0), but the head must exist to be trained, so its
+        # presence is the opt-in here.
+        self.aux_targets: tuple[str, ...] = tuple(aux_targets)
+        self.aux_head: nn.Linear | None = (
+            nn.Linear(self.encoder.output_dim, len(self.aux_targets)) if self.aux_targets else None
+        )
 
     def act(
         self,
@@ -75,17 +92,23 @@ class ActorCritic(nn.Module):
         obs: dict[str, Tensor],
         mask: Tensor,
         actions: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Recompute ``(log_prob, entropy, value)`` of ``actions`` for the PPO update.
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        """Recompute ``(log_prob, entropy, value, aux_pred)`` of ``actions`` for the PPO update.
 
         Gradients flow through the shared encoder and both heads. ``actions`` is
-        ``(B,)``; each returned tensor is ``(B,)``.
+        ``(B,)``; ``log_prob``/``entropy``/``value`` are each ``(B,)``. ``aux_pred``
+        is the auxiliary head's ``(B, len(aux_targets))`` prediction from the SAME
+        pooled ``CLS`` context (no second encode), or ``None`` when no aux head was
+        built (empty ``aux_targets``) - the byte-identical default the PPO update
+        skips.
         """
         # Single encode shared by both heads (same encoder as the rollout path).
         per_token, pooled_cls, key_padding_mask = self.encoder(obs)
         log_prob, entropy = self.policy.evaluate_actions(per_token, key_padding_mask, mask, actions)
         value = self.value(pooled_cls)
-        return log_prob, entropy, value
+        # Aux head reads the SAME pooled CLS (no second encode); None when disabled.
+        aux_pred = self.aux_head(pooled_cls) if self.aux_head is not None else None
+        return log_prob, entropy, value, aux_pred
 
     def get_value(self, obs: dict[str, Tensor]) -> Tensor:
         """Estimate state-value only, of shape ``(B,)``.

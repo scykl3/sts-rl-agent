@@ -144,6 +144,12 @@ class TrainConfig:
     gae_lambda: float = DEFAULT_GAE_LAMBDA
     seed: int = 0
     hidden_dim: int = HIDDEN_DIM
+    # Auxiliary-perception head opt-in, threaded to ActorCritic like hidden_dim.
+    # Empty (the default) builds NO aux head, so the net is byte-identical and
+    # existing checkpoints load; set to aux_heads.AUX_TARGETS to build the head
+    # (paired with ppo.aux_coef > 0 to actually train it). Not used by the
+    # warm-start path (see train()).
+    aux_targets: tuple[str, ...] = ()
     ppo: PPOConfig = field(default_factory=PPOConfig)
     # Periodic holdout eval + checkpointing, all default OFF: eval_every=None
     # disables periodic eval, checkpoint_dir=None disables checkpointing, so an
@@ -371,6 +377,11 @@ def train(
     must equal ``config.hidden_dim`` (a mismatch raises, because that width is
     recorded in saved checkpoints). ``None`` (the default) rebuilds a fresh net, so
     the default path is behaviour-identical to before.
+
+    ``config.aux_targets`` (default empty, off) threads to the fresh-init network's
+    optional aux head; a warm-started net is used as-is and must already carry the
+    requested head (else a clear error), so aux + warm-start from an aux-free
+    checkpoint is rejected rather than silently no-op.
     """
     # Periodic eval needs its OWN env: evaluate() resets the env once per holdout
     # seed, which would derail the training collector mid-rollout. Fail fast rather
@@ -394,7 +405,7 @@ def train(
     # for a fixed seed regardless of the net's origin. init_actor_critic=None (the
     # default) rebuilds a fresh net exactly as before, so that path is unchanged.
     if init_actor_critic is None:
-        actor_critic = ActorCritic(hidden_dim=config.hidden_dim)
+        actor_critic = ActorCritic(hidden_dim=config.hidden_dim, aux_targets=config.aux_targets)
     else:
         # config.hidden_dim is recorded verbatim in every saved checkpoint
         # (_save_checkpoint) and must therefore describe the actual trunk width; a
@@ -409,6 +420,17 @@ def train(
                 f"config.hidden_dim ({config.hidden_dim}); pass a TrainConfig whose "
                 f"hidden_dim equals the injected network's encoder width (saved "
                 f"checkpoints record config.hidden_dim, so a mismatch would be unloadable)"
+            )
+        # A warm-started net is used as-is, so it must already carry the aux head the
+        # config asks for. Warm-starting an aux run from an aux-free checkpoint is a
+        # deliberate follow-on (it needs a checkpoint migration to add the head), so
+        # fail loudly rather than silently training with no aux head.
+        if config.aux_targets and init_actor_critic.aux_head is None:
+            raise ValueError(
+                "config.aux_targets requests an aux head but init_actor_critic has "
+                "none; warm-starting an aux run from an aux-free checkpoint is not "
+                "supported yet (train the aux head from a fresh init, or omit --aux-coef "
+                "when warm-starting)"
             )
         actor_critic = init_actor_critic
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=config.learning_rate)

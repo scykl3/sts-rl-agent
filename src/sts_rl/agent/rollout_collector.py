@@ -51,6 +51,7 @@ import torch
 from torch import Tensor
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.aux_heads import PLAYER_CUR_HP_INDEX
 from sts_rl.agent.ppo import DEFAULT_GAE_LAMBDA, DEFAULT_GAMMA
 from sts_rl.agent.rollout_buffer import RolloutBuffer, VecRolloutBuffer
 from sts_rl.interface import (
@@ -80,6 +81,12 @@ EPISODE_LENGTH_KEY = "l"
 # EPISODE_INFO_KEY) is preserved under this key while the top-level info describes
 # the freshly reset episode - the VecEnvProtocol same-step idiom.
 FINAL_INFO_KEY = "final_info"
+
+# On the same auto-resetting step, the finished env's TERMINAL observation is
+# preserved under this key (the top-level obs row is already the reset episode's
+# first obs). The vec collector reads it to source a run-terminal combat's
+# end-of-combat HP, since the returned next_obs row is post-reset on an autoreset.
+FINAL_OBSERVATION_KEY = "final_observation"
 
 # A batched (num_envs-leading) observation: same keys as a single Obs, each array
 # gaining a leading num_envs axis. Mirrors SubprocVecEnv's BatchObs.
@@ -117,6 +124,22 @@ def vec_observation_to_tensors(obs: BatchObs, device: torch.device) -> dict[str,
         dtype = torch.long if field.name in _ID_FIELDS else torch.float32
         batched[field.name] = torch.as_tensor(obs[field.name], dtype=dtype, device=device)
     return batched
+
+
+def _obs_in_combat(enemy_alive: np.ndarray) -> bool:
+    """True if any enemy is alive in this ``(MAX_ENEMIES,)`` row - the combat signal.
+
+    The same combat-membership signal
+    :func:`~sts_rl.agent.aux_heads.compute_aux_targets` uses (``enemy_alive`` any
+    alive), read here off the raw stored observation so the collector's per-step
+    combat membership matches the aux loss's ``combat_mask`` exactly.
+    """
+    return bool(np.any(np.asarray(enemy_alive) > 0.0))
+
+
+def _obs_player_hp(player_scalars: np.ndarray) -> float:
+    """Raw current player HP from a ``(PLAYER_SCALAR_DIM,)`` row (index from aux_heads)."""
+    return float(np.asarray(player_scalars)[PLAYER_CUR_HP_INDEX])
 
 
 @dataclass(frozen=True)
@@ -228,7 +251,20 @@ class RolloutCollector:
         try:
             loop_start = time.perf_counter()
             with torch.no_grad():
-                for _ in range(n_steps):
+                # Engine invariant (load-bearing): a combat is a MAXIMAL run of
+                # consecutive in-combat obs (enemy_alive.any() True), separated by at
+                # least one all-dead obs. The end_combat_hp backfill assumes NO
+                # mid-combat all-dead obs - a wave/split that momentarily showed no
+                # live enemy mid-combat would split one combat's span and backfill a
+                # wrong mid-combat HP. Believed safe for Ironclad Acts 1-3
+                # (spawns/splits resolve within the same step).
+                # Combat-span tracker (collect-local): sub-buffer index where the
+                # current run of consecutive in-combat steps began, or None when not in
+                # a combat. Reset per collect because the buffer is cleared each call,
+                # so a combat spanning the cutoff leaves this collect's steps unfinished
+                # (invalid) and a combat straddling the start re-opens at index 0 here.
+                combat_start: int | None = None
+                for step_idx in range(n_steps):
                     obs_batched = observation_to_batched_tensors(self._obs, self._device)
                     mask_batched = self._batched_mask(self._mask)
 
@@ -254,6 +290,39 @@ class RolloutCollector:
                         done=float(terminated),
                         mask=mask_batched.squeeze(0),
                     )
+
+                    # Track this combat's step span and backfill its end-of-combat HP
+                    # once it ends. Membership uses the STORED obs's enemy_alive (the
+                    # same signal the aux combat_mask uses), so combat steps here match
+                    # the loss's. self._obs is still obs_t; the cursor advance below
+                    # reassigns it. Reads only obs values (no RNG), so reward/done/GAE
+                    # stay unchanged.
+                    in_combat = _obs_in_combat(self._obs["enemy_alive"])
+                    if in_combat and combat_start is None:
+                        combat_start = step_idx
+                    if in_combat:
+                        end_hp: float | None = None
+                        if terminated:
+                            # Run ended in combat: the final combat resolved (win or
+                            # death). On a single env step()'s next_obs IS the terminal
+                            # obs (the manual reset below has not run yet).
+                            end_hp = _obs_player_hp(next_obs["player_scalars"])
+                        elif not truncated and not _obs_in_combat(next_obs["enemy_alive"]):
+                            # enemy_alive True->False within the episode: combat ended
+                            # into the overworld; end HP is the post-combat obs HP.
+                            end_hp = _obs_player_hp(next_obs["player_scalars"])
+                        if end_hp is not None:
+                            assert combat_start is not None
+                            buffer.backfill_end_combat_hp(combat_start, step_idx + 1, end_hp)
+                            combat_start = None
+                        elif truncated:
+                            # Truncation mid-combat = unfinished (step cap, not a real
+                            # combat end): leave the span invalid.
+                            combat_start = None
+                    elif terminated or truncated:
+                        # Overworld episode boundary: no open combat to close; clear the
+                        # tracker defensively at the episode edge.
+                        combat_start = None
 
                     if terminated or truncated:
                         episode = info[EPISODE_INFO_KEY]
@@ -322,7 +391,11 @@ class VecEnvProtocol(Protocol):
     Auto-reset contract (SubprocVecEnv's pre-1.0 "same-step" idiom): on a step
     where env ``i`` ends, the returned ``obs``/``masks`` row ``i`` is ALREADY the
     next episode's first observation, and env ``i``'s terminal info - including
-    the ``episode`` stats - is preserved under ``infos[i]["final_info"]``.
+    the ``episode`` stats - is preserved under ``infos[i]["final_info"]``. Its
+    TERMINAL observation is likewise preserved under
+    ``infos[i]["final_observation"]``; the vec collector reads it to source a
+    terminal-in-combat step's end-of-combat HP, since the top-level row ``i`` is
+    already the post-reset obs.
     """
 
     num_envs: int
@@ -424,7 +497,10 @@ class VecRolloutCollector:
         try:
             loop_start = time.perf_counter()
             with torch.no_grad():
-                for _ in range(n_steps):
+                # Per-env combat-span trackers (collect-local, one per env; see the
+                # single-env collector). Reset each collect since the buffer clears.
+                combat_starts: list[int | None] = [None] * self._num_envs
+                for step_idx in range(n_steps):
                     obs_batched = vec_observation_to_tensors(self._obs, self._device)
                     masks_batched = self._batched_masks(self._masks)
 
@@ -457,6 +533,39 @@ class VecRolloutCollector:
                     # episode stats live under infos[i][FINAL_INFO_KEY], not the fresh
                     # top-level info (which already describes the next episode).
                     for i in range(self._num_envs):
+                        # Per-env combat-span tracking (see the single-env collector).
+                        # self._obs is still each env's stored obs_t; next_obs row i is
+                        # the true successor UNLESS env i auto-reset (terminated/
+                        # truncated), in which case the terminal obs is under
+                        # infos[i][FINAL_OBSERVATION_KEY], not next_obs row i.
+                        in_combat = _obs_in_combat(self._obs["enemy_alive"][i])
+                        if in_combat and combat_starts[i] is None:
+                            combat_starts[i] = step_idx
+                        if in_combat:
+                            end_hp: float | None = None
+                            if terminated[i]:
+                                # Run ended in combat: the final combat resolved. On the
+                                # auto-resetting vec env the terminal obs is under
+                                # final_observation, not next_obs row i (post-reset).
+                                final_obs = infos[i][FINAL_OBSERVATION_KEY]
+                                end_hp = _obs_player_hp(final_obs["player_scalars"])
+                            elif not truncated[i] and not _obs_in_combat(
+                                next_obs["enemy_alive"][i]
+                            ):
+                                # enemy_alive True->False within the episode (no reset
+                                # this step): end HP is the post-combat successor obs.
+                                end_hp = _obs_player_hp(next_obs["player_scalars"][i])
+                            start = combat_starts[i]
+                            if end_hp is not None:
+                                assert start is not None
+                                buffer.backfill_end_combat_hp(i, start, step_idx + 1, end_hp)
+                                combat_starts[i] = None
+                            elif truncated[i]:
+                                # Truncation mid-combat = unfinished: leave invalid.
+                                combat_starts[i] = None
+                        elif terminated[i] or truncated[i]:
+                            combat_starts[i] = None
+
                         if terminated[i] or truncated[i]:
                             episode = infos[i][FINAL_INFO_KEY][EPISODE_INFO_KEY]
                             episode_returns.append(float(episode[EPISODE_RETURN_KEY]))

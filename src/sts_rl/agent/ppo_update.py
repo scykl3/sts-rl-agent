@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.aux_heads import HP_SCALE, compute_aux_targets
 from sts_rl.agent.ppo import DEFAULT_CLIP_COEF, clipped_policy_loss, clipped_value_loss
 from sts_rl.agent.rollout_buffer import SupportsMinibatches
 from sts_rl.agent.running_moments import RunningMoments
@@ -25,6 +26,10 @@ from sts_rl.agent.running_moments import RunningMoments
 # propagates instead of being buried as literals in PPOConfig's signature.
 DEFAULT_VF_COEF: float = 0.5
 DEFAULT_ENT_COEF: float = 0.01
+# Auxiliary-perception loss weight; 0.0 == OFF (the default), a true no-op: the aux
+# targets and loss are not computed and total_loss/gradients stay byte-identical to
+# the aux-free objective. See sts_rl.agent.aux_heads for the targets it weights.
+DEFAULT_AUX_COEF: float = 0.0
 DEFAULT_N_EPOCHS: int = 4
 DEFAULT_MINIBATCH_SIZE: int = 64
 DEFAULT_MAX_GRAD_NORM: float = 0.5
@@ -71,6 +76,11 @@ class PPOConfig:
     adv_norm_decay: float = DEFAULT_ADV_NORM_DECAY
     clip_value_loss: bool = True
     target_kl: float | None = None
+    # Auxiliary-perception loss weight (see aux_heads / ppo_update). 0.0 is OFF and
+    # the DEFAULT: the aux loss is not computed at all, so total_loss and gradients
+    # are byte-identical to the aux-free objective. Appended last so existing
+    # PPOConfig(...) call sites are unaffected.
+    aux_coef: float = DEFAULT_AUX_COEF
 
 
 @dataclass(frozen=True)
@@ -99,6 +109,11 @@ class PPOStats:
     # existing PPOStats(...) call sites are unaffected.
     adv_norm_std: float = 0.0
     adv_norm_mean: float = 0.0
+    # Mean auxiliary-perception loss over the minibatch steps (0.0 when aux_coef == 0
+    # or the net has no aux head, i.e. the loss was never computed). Observability
+    # only. Defaulted and placed last so existing PPOStats(...) call sites are
+    # unaffected.
+    aux_loss: float = 0.0
 
 
 def _explained_variance(y_pred: torch.Tensor, y_true: torch.Tensor) -> float:
@@ -132,7 +147,15 @@ def ppo_update(
     recomputes grad-tracked log-prob/entropy/value for the stored actions, forms
     the clipped policy loss, the (optionally clipped) value loss, and the entropy
     bonus, then backprops the combined objective, clips the global grad norm, and
-    steps the optimizer. Returns the mean of each scalar stat over every
+    steps the optimizer. When ``config.aux_coef > 0`` and the network has an aux
+    head, a masked auxiliary-perception MSE is added to that objective: the
+    obs-derivable columns (see
+    :func:`~sts_rl.agent.aux_heads.compute_aux_targets`) are masked over combat
+    steps, and the collector-backfilled ``end_combat_hp`` column is masked over
+    steps whose combat completed (``mb.end_combat_hp_valid``), each column's masked
+    MSE averaged. It defaults OFF (``aux_coef == 0``), in which case it is not
+    computed at all and the objective is byte-identical to the aux-free one.
+    Returns the mean of each scalar stat over every
     minibatch update; an empty buffer (zero minibatches) yields zeroed stats
     with ``n_updates == 0`` rather than dividing by zero.
 
@@ -151,6 +174,7 @@ def ppo_update(
     approx_kl_sum = 0.0
     clip_fraction_sum = 0.0
     grad_norm_sum = 0.0
+    aux_loss_sum = 0.0
     n_updates = 0
 
     # Advantage normalization tracker. A shared instance passed by the caller
@@ -186,7 +210,9 @@ def ppo_update(
                 assert moments is not None  # built above whenever normalize_advantages
                 advantages = moments.normalize(advantages)
 
-            log_prob, entropy, value = actor_critic.evaluate_actions(mb.obs, mb.masks, mb.actions)
+            log_prob, entropy, value, aux_pred = actor_critic.evaluate_actions(
+                mb.obs, mb.masks, mb.actions
+            )
 
             policy_loss = clipped_policy_loss(
                 log_prob, mb.old_log_probs, advantages, config.clip_coef
@@ -201,6 +227,47 @@ def ppo_update(
             # policy exploratory), and the optimizer minimizes, so a larger
             # entropy lowers the total loss.
             total_loss = policy_loss + config.vf_coef * value_loss - config.ent_coef * entropy_bonus
+
+            # Optional auxiliary-perception term (OFF by default, aux_coef == 0): a
+            # masked MSE regressing the aux head's prediction to dense, obs-derived
+            # combat targets over COMBAT steps only. Skipped entirely when disabled
+            # or when the net has no aux head (aux_pred is None), so total_loss and
+            # the gradients stay byte-identical to the aux-free objective.
+            aux_loss_value = 0.0
+            if config.aux_coef > 0.0 and aux_pred is not None:
+                # Assemble the full per-column target: the obs-derivable columns from
+                # compute_aux_targets, then the collector-backfilled end_combat_hp
+                # column (normalized by HP_SCALE like the obs columns). end_combat_hp
+                # is a future outcome, not obs-derivable, so it is supplied here from
+                # the buffer rather than by compute_aux_targets.
+                obs_targets, combat_mask = compute_aux_targets(mb.obs)
+                end_hp_target = (mb.end_combat_hp / HP_SCALE).unsqueeze(-1)
+                targets = torch.cat([obs_targets, end_hp_target], dim=-1)
+                if aux_pred.shape[-1] != targets.shape[-1]:
+                    raise ValueError(
+                        f"aux head width {aux_pred.shape[-1]} != aux target width "
+                        f"{targets.shape[-1]}; build ActorCritic(aux_targets=AUX_TARGETS)"
+                    )
+                # Per-column validity: the obs columns apply over combat steps
+                # (combat_mask); the end_combat_hp column applies only where the
+                # collector marked it valid (a completed combat), so overworld steps
+                # and an unfinished trailing combat contribute nothing to it.
+                n_obs_cols = obs_targets.shape[-1]
+                col_masks = [combat_mask] * n_obs_cols + [mb.end_combat_hp_valid]
+                # Masked MSE per column with the existing all-False guard (a mean over
+                # zero rows would be NaN), then averaged across columns. Rows are
+                # selected by the column's mask BEFORE the subtraction, so a NaN
+                # end_combat_hp placeholder on an invalid step never enters the graph.
+                col_losses: list[torch.Tensor] = []
+                for col, col_mask in enumerate(col_masks):
+                    if bool(col_mask.any()):
+                        diff = aux_pred[:, col][col_mask] - targets[:, col][col_mask]
+                        col_losses.append((diff**2).mean())
+                    else:
+                        col_losses.append(aux_pred.new_zeros(()))
+                aux_loss = torch.stack(col_losses).mean()
+                total_loss = total_loss + config.aux_coef * aux_loss
+                aux_loss_value = aux_loss.item()
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -230,6 +297,7 @@ def ppo_update(
             epoch_approx_kl_sum += approx_kl_value
             clip_fraction_sum += clip_fraction.item()
             grad_norm_sum += grad_norm.item()
+            aux_loss_sum += aux_loss_value
             n_updates += 1
             epoch_minibatches += 1
 
@@ -260,6 +328,7 @@ def ppo_update(
             n_updates=0,
             adv_norm_std=moments.std if moments is not None else 0.0,
             adv_norm_mean=moments.mean if moments is not None else 0.0,
+            aux_loss=0.0,
         )
 
     # Explained variance is a property of the collection-time values vs the GAE
@@ -281,4 +350,5 @@ def ppo_update(
         n_updates=n_updates,
         adv_norm_std=moments.std if moments is not None else 0.0,
         adv_norm_mean=moments.mean if moments is not None else 0.0,
+        aux_loss=aux_loss_sum / n_updates,
     )

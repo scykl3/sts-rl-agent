@@ -15,12 +15,15 @@ reproduces the single-env :class:`RolloutCollector` byte-for-byte).
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 import torch
 from conftest import make_stub_env, make_stub_vec_env
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.aux_heads import PLAYER_CUR_HP_INDEX
 from sts_rl.agent.ppo import compute_gae
 from sts_rl.agent.rollout_buffer import RolloutBuffer, VecRolloutBuffer
 from sts_rl.agent.rollout_collector import (
@@ -263,6 +266,13 @@ def test_num_envs_one_matches_single_env_path() -> None:
     assert torch.equal(torch.stack(single_buffer._actions), torch.stack(sub._actions))
     assert single_buffer._rewards == sub._rewards
     assert single_buffer._dones == sub._dones
+    # The per-env combat-span backfill reproduces the single-env path byte-for-byte:
+    # same obs stream (same RNG) -> same enemy_alive boundaries -> same end_combat_hp.
+    # The single path sources a terminal combat's end HP from step()'s next_obs; the
+    # vec path from final_observation - which is that same obs under num_envs=1.
+    assert single_buffer._end_combat_hp_valid == sub._end_combat_hp_valid
+    for single_hp, vec_hp in zip(single_buffer._end_combat_hp, sub._end_combat_hp):
+        assert (math.isnan(single_hp) and math.isnan(vec_hp)) or single_hp == vec_hp
 
     (single_batch,) = list(single_buffer.iter_minibatches(steps, shuffle=False))
     (vec_batch,) = list(vec_buffer.iter_minibatches(steps, shuffle=False))
@@ -504,3 +514,300 @@ def test_compute_advantages_rejects_wrong_last_values_leading_dim() -> None:
     buffer = VecRolloutBuffer(2)
     with pytest.raises(ValueError, match="last_values"):
         buffer.compute_advantages(torch.zeros(3))  # 3 != num_envs (2)
+
+
+# -- end_combat_hp per-env tracking + buffer delegation ----------------------
+
+
+class _ScriptedVecEnv:
+    """In-process vec env emitting a scripted per-env enemy_alive / player-HP sequence.
+
+    ``alive[i][k]`` / ``hp[i][k]`` define env ``i``'s obs at step index ``k`` (``k == 0``
+    is the reset obs). No terminations/truncations, so the collector never resets
+    mid-collect and the per-env combat-span tracking is exercised purely on the
+    enemy_alive True->False signal and the rollout cutoff. Structurally satisfies
+    ``VecEnvProtocol``.
+    """
+
+    def __init__(self, alive: list[list[bool]], hp: list[list[float]]) -> None:
+        self.num_envs = len(alive)
+        self._alive = alive
+        self._hp = hp
+        self._base, _ = make_stub_env().reset(seed=0)  # a full valid obs to overlay onto
+        self._k = 0
+
+    def reset(self, seeds=None):
+        self._k = 0
+        return self._batched_obs(0), self._masks()
+
+    def step(self, actions):
+        self._k += 1
+        obs = self._batched_obs(self._k)
+        rewards = np.zeros(self.num_envs, dtype=np.float32)
+        flags = np.zeros(self.num_envs, dtype=np.bool_)
+        infos = [{"action_mask": self._legal_row()} for _ in range(self.num_envs)]
+        return obs, rewards, flags, flags.copy(), self._masks(), infos
+
+    def _batched_obs(self, k: int) -> dict:
+        obs = {
+            field.name: np.stack(
+                [np.asarray(self._base[field.name]).copy() for _ in range(self.num_envs)], axis=0
+            )
+            for field in OBS_FIELDS
+        }
+        enemy_alive = np.zeros_like(np.asarray(obs["enemy_alive"], dtype=np.float32))
+        player_scalars = np.asarray(obs["player_scalars"], dtype=np.float32).copy()
+        for i in range(self.num_envs):
+            if self._alive[i][k]:
+                enemy_alive[i, 0] = 1.0
+            player_scalars[i, PLAYER_CUR_HP_INDEX] = self._hp[i][k]
+        obs["enemy_alive"] = enemy_alive
+        obs["player_scalars"] = player_scalars
+        return obs
+
+    def _legal_row(self) -> np.ndarray:
+        row = np.zeros(ACTION_DIM, dtype=np.bool_)
+        row[0] = True
+        return row
+
+    def _masks(self) -> np.ndarray:
+        masks = np.zeros((self.num_envs, ACTION_DIM), dtype=np.bool_)
+        masks[:, 0] = True
+        return masks
+
+
+def test_vec_backfill_end_combat_hp_delegates_to_one_env() -> None:
+    """backfill_end_combat_hp routes to exactly one env's sub-buffer; others untouched."""
+    num_envs = 2
+    buffer = VecRolloutBuffer(num_envs)
+    mask = _legal_bool_mask(num_envs)
+    for _ in range(3):
+        obs = {field.name: torch.zeros((num_envs, *field.shape)) for field in OBS_FIELDS}
+        buffer.add_batch(
+            obs=obs,
+            actions=torch.zeros(num_envs, dtype=torch.long),
+            log_probs=torch.zeros(num_envs),
+            values=torch.zeros(num_envs),
+            rewards=torch.zeros(num_envs),
+            dones=torch.zeros(num_envs),
+            masks=mask,
+        )
+    buffer.backfill_end_combat_hp(1, 0, 2, 33.0)  # env 1, steps [0, 2)
+
+    env0, env1 = buffer._buffers
+    assert all(valid is False for valid in env0._end_combat_hp_valid)  # env 0 untouched
+    assert env1._end_combat_hp_valid == [True, True, False]
+    assert env1._end_combat_hp[0] == 33.0
+    assert env1._end_combat_hp[1] == 33.0
+
+
+def test_vec_backfill_rejects_bad_env_index() -> None:
+    """An env_index outside [0, num_envs) fails loudly at the vec boundary."""
+    buffer = VecRolloutBuffer(2)
+    with pytest.raises(ValueError, match="env_index"):
+        buffer.backfill_end_combat_hp(2, 0, 1, 5.0)
+
+
+def test_add_batch_defaults_end_combat_hp_to_invalid_placeholder() -> None:
+    """add_batch without the aux fields leaves every env's steps invalid placeholders."""
+    num_envs = 2
+    buffer = VecRolloutBuffer(num_envs)
+    obs = {field.name: torch.zeros((num_envs, *field.shape)) for field in OBS_FIELDS}
+    buffer.add_batch(
+        obs=obs,
+        actions=torch.zeros(num_envs, dtype=torch.long),
+        log_probs=torch.zeros(num_envs),
+        values=torch.zeros(num_envs),
+        rewards=torch.zeros(num_envs),
+        dones=torch.zeros(num_envs),
+        masks=_legal_bool_mask(num_envs),
+    )
+    for sub in buffer._buffers:
+        assert sub._end_combat_hp_valid == [False]
+        assert math.isnan(sub._end_combat_hp[0])
+
+
+def test_vec_collector_tracks_end_combat_hp_per_env() -> None:
+    """Per-env combat spans are tracked independently: each env backfills its own end HP.
+
+    env 0: combat over steps 0,1 ends into the overworld at obs_2 (HP A0); steps 2-4
+    overworld. env 1: overworld at step 0; combat over steps 1,2 ends at obs_3 (HP A1);
+    step 3 overworld; a combat reopens at step 4 and is unfinished at the cutoff. The
+    distinct A0/A1 prove env 1 does not read env 0's end HP (or vice versa).
+    """
+    a0, a1 = 41.0, 57.0
+    alive = [
+        [True, True, False, False, False, False],  # env 0
+        [False, True, True, False, True, True],  # env 1
+    ]
+    hp = [
+        [10.0, 11.0, a0, 13.0, 14.0, 15.0],  # env 0: obs_2 HP == a0
+        [20.0, 21.0, 22.0, a1, 24.0, 25.0],  # env 1: obs_3 HP == a1
+    ]
+    collector = VecRolloutCollector(_ScriptedVecEnv(alive, hp), _make_ac(), seed=0)
+    buffer = VecRolloutBuffer(2)
+
+    collector.collect(buffer, 5)
+
+    env0, env1 = buffer._buffers
+    # env 0: steps 0,1 valid with a0; steps 2,3,4 invalid.
+    assert env0._end_combat_hp_valid == [True, True, False, False, False]
+    assert env0._end_combat_hp[0] == a0
+    assert env0._end_combat_hp[1] == a0
+    # env 1: steps 1,2 valid with a1; step 0 overworld, step 4 unfinished -> invalid.
+    assert env1._end_combat_hp_valid == [False, True, True, False, False]
+    assert env1._end_combat_hp[1] == a1
+    assert env1._end_combat_hp[2] == a1
+
+
+# -- Deterministic vec terminal-in-combat -> final_observation ---------------
+
+# Distinct HP sentinels for the terminating-vec test so a cross-env leak, or a read
+# of the post-reset row instead of final_observation, changes an asserted value.
+TERMINAL_COMBAT_HP = 38.0  # env 0's end-of-combat HP, exposed ONLY via final_observation
+POST_RESET_HP = 99.0  # env 0's post-reset top-level HP (must never be backfilled)
+OVERWORLD_END_HP = 57.0  # env 1's end-of-combat HP (its combat ends into the overworld)
+
+
+class _TerminatingScriptedVecEnv:
+    """Scripted vec env where one env terminates IN COMBAT on a fixed step.
+
+    A deterministic (RNG-free) sibling of :class:`_ScriptedVecEnv` that exercises the
+    vec collector's terminal-in-combat path. ``alive[i][k]`` / ``hp[i][k]`` define env
+    ``i``'s obs at step index ``k`` (``k == 0`` is the reset obs); ``term_step[i]`` is
+    the collector step on which env ``i`` reports ``terminated``. On that step, exactly
+    as :class:`~conftest.StubVecEnv` does, the terminal obs (in combat, HP
+    ``term_hp[i]``) is preserved under ``infos[i]['final_observation']`` and its
+    ``episode`` stats under ``infos[i]['final_info']`` while the returned row ``i`` is a
+    post-reset overworld obs (HP :data:`POST_RESET_HP`). Structurally satisfies
+    ``VecEnvProtocol``.
+    """
+
+    def __init__(
+        self,
+        alive: list[list[bool]],
+        hp: list[list[float]],
+        term_step: dict[int, int],
+        term_hp: dict[int, float],
+    ) -> None:
+        self.num_envs = len(alive)
+        self._alive = alive
+        self._hp = hp
+        self._term_step = term_step
+        self._term_hp = term_hp
+        self._base, _ = make_stub_env().reset(seed=0)  # a full valid obs to overlay onto
+        self._calls = 0
+        self._done: set[int] = set()
+
+    def reset(self, seeds=None):
+        self._calls = 0
+        self._done = set()
+        rows = [self._single_obs(self._alive[i][0], self._hp[i][0]) for i in range(self.num_envs)]
+        return self._batched(rows), self._masks()
+
+    def step(self, actions):
+        self._calls += 1
+        k = self._calls  # obs index this step transitions into
+        step_idx = self._calls - 1  # collector step index (0-based)
+        rows: list[dict] = []
+        terminated = np.zeros(self.num_envs, dtype=np.bool_)
+        truncated = np.zeros(self.num_envs, dtype=np.bool_)
+        infos: list[dict] = []
+        for i in range(self.num_envs):
+            if i not in self._done and self._term_step.get(i) == step_idx:
+                # Terminal-in-combat step: stash the terminal obs (HP term_hp[i]) and
+                # episode stats, return a post-reset overworld row (same-step idiom).
+                terminated[i] = True
+                self._done.add(i)
+                rows.append(self._single_obs(False, POST_RESET_HP))
+                infos.append(
+                    {
+                        "action_mask": self._legal_row(),
+                        "final_observation": self._single_obs(True, self._term_hp[i]),
+                        "final_info": {
+                            "episode": {"r": 0.0, "l": step_idx + 1},
+                            "action_mask": self._legal_row(),
+                        },
+                    }
+                )
+            elif i in self._done:
+                # Already reset in a prior step: stays in a fresh overworld episode.
+                rows.append(self._single_obs(False, POST_RESET_HP))
+                infos.append({"action_mask": self._legal_row()})
+            else:
+                rows.append(self._single_obs(self._alive[i][k], self._hp[i][k]))
+                infos.append({"action_mask": self._legal_row()})
+        return (
+            self._batched(rows),
+            np.zeros(self.num_envs, dtype=np.float32),
+            terminated,
+            truncated,
+            self._masks(),
+            infos,
+        )
+
+    def _single_obs(self, alive_flag: bool, hp_value: float) -> dict:
+        obs = {name: np.asarray(value).copy() for name, value in self._base.items()}
+        enemy_alive = np.zeros_like(np.asarray(obs["enemy_alive"], dtype=np.float32))
+        if alive_flag:
+            enemy_alive[0] = 1.0
+        obs["enemy_alive"] = enemy_alive
+        player = np.asarray(obs["player_scalars"], dtype=np.float32).copy()
+        player[PLAYER_CUR_HP_INDEX] = hp_value
+        obs["player_scalars"] = player
+        return obs
+
+    @staticmethod
+    def _batched(rows: list[dict]) -> dict:
+        return {name: np.stack([row[name] for row in rows], axis=0) for name in rows[0]}
+
+    def _legal_row(self) -> np.ndarray:
+        row = np.zeros(ACTION_DIM, dtype=np.bool_)
+        row[0] = True
+        return row
+
+    def _masks(self) -> np.ndarray:
+        masks = np.zeros((self.num_envs, ACTION_DIM), dtype=np.bool_)
+        masks[:, 0] = True
+        return masks
+
+
+def test_vec_terminal_in_combat_reads_own_final_observation() -> None:
+    """A terminal-in-combat env backfills its OWN final_observation HP; peers unaffected.
+
+    num_envs=2 so the per-env routing is real. env 0 is in combat over steps 0-2 and
+    TERMINATES in combat at step 2, so its end-of-combat HP is available only under
+    infos[0]['final_observation'] (the top-level row 0 is already the post-reset obs,
+    HP POST_RESET_HP). env 1 is elsewhere: overworld at step 0, then its own combat over
+    steps 1-2 ending INTO THE OVERWORLD at obs_3. The distinct sentinels prove env 0
+    reads final_observation (not the post-reset row) and that neither env reads the
+    other's HP. This locks the vec terminal-in-combat -> final_observation path that the
+    num_envs=1 parity test covers only probabilistically.
+    """
+    alive = [
+        [True, True, True, False],  # env 0: in combat, terminates in combat at step 2
+        [False, True, True, False],  # env 1: overworld, then combat, ends into overworld
+    ]
+    hp = [
+        [50.0, 48.0, 46.0, 44.0],  # env 0 stored HPs (backfill uses final_observation, not these)
+        [60.0, 61.0, 62.0, OVERWORLD_END_HP],  # env 1: obs_3 HP is the post-combat overworld HP
+    ]
+    collector = VecRolloutCollector(
+        _TerminatingScriptedVecEnv(alive, hp, term_step={0: 2}, term_hp={0: TERMINAL_COMBAT_HP}),
+        _make_ac(),
+        seed=0,
+    )
+    buffer = VecRolloutBuffer(2)
+
+    collector.collect(buffer, 3)
+
+    env0, env1 = buffer._buffers
+    # env 0: all three in-combat steps backfilled from ITS OWN terminal HP, sourced from
+    # final_observation - NOT the post-reset row (POST_RESET_HP) and NOT env 1's HP.
+    assert env0._end_combat_hp_valid == [True, True, True]
+    assert all(hp_v == TERMINAL_COMBAT_HP for hp_v in env0._end_combat_hp)
+    # env 1 unaffected: its own combat (steps 1,2) ends into the overworld at obs_3;
+    # step 0 was overworld (invalid). Distinct from env 0's terminal HP.
+    assert env1._end_combat_hp_valid == [False, True, True]
+    assert env1._end_combat_hp[1] == OVERWORLD_END_HP
+    assert env1._end_combat_hp[2] == OVERWORLD_END_HP

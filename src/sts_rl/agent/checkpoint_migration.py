@@ -30,6 +30,7 @@ from typing import Any
 import torch
 
 from sts_rl.agent.actor_critic import ActorCritic
+from sts_rl.agent.aux_heads import AUX_TARGETS
 from sts_rl.agent.train import (
     CHECKPOINT_HIDDEN_DIM_KEY,
     CHECKPOINT_INTERFACE_VERSION_KEY,
@@ -44,6 +45,14 @@ from sts_rl.interface import InterfaceError
 # INTERFACE_VERSION is unchanged across the rewrite (see the module docstring).
 LEGACY_TRUNK_INPUT_WEIGHT_KEY: str = "encoder.trunk.0.weight"
 
+# State-dict key of the optional auxiliary-perception head. Its presence marks an
+# aux-enabled checkpoint (saved from an aux_coef > 0 run), which must be rebuilt WITH
+# the aux head so the key set matches; a headless ActorCritic would reject aux_head.*
+# as unexpected keys under the strict load below. The head's WIDTH is still validated
+# by the strict load itself (a mismatch against len(AUX_TARGETS) surfaces as a typed
+# InterfaceError rather than a silent partial load).
+AUX_HEAD_WEIGHT_KEY: str = "aux_head.weight"
+
 
 def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> ActorCritic:
     """Load a training checkpoint into an :class:`ActorCritic`.
@@ -53,7 +62,10 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
     :data:`~sts_rl.agent.train.CHECKPOINT_HIDDEN_DIM_KEY`,
     :data:`~sts_rl.agent.train.CHECKPOINT_INTERFACE_VERSION_KEY`), builds an
     ``ActorCritic`` at the checkpoint's own width (``hidden_dim`` == the
-    transformer ``d_model``), and loads the weights ``strict=True``.
+    transformer ``d_model``), and loads the weights ``strict=True``. A checkpoint
+    saved from an aux-enabled run (its state_dict carries
+    :data:`AUX_HEAD_WEIGHT_KEY`) is rebuilt WITH the aux head so it round-trips;
+    an aux-free checkpoint builds the default headless net.
 
     A pre-transformer (flat-trunk) checkpoint is detected by
     :data:`LEGACY_TRUNK_INPUT_WEIGHT_KEY` and rejected with a clear
@@ -85,7 +97,11 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
             f"intentionally dropped in the transformer rewrite - retrain from scratch."
         )
 
-    model = ActorCritic(hidden_dim=hidden_dim)
+    # Rebuild with the aux head when the checkpoint carries one, so an aux-enabled
+    # checkpoint round-trips (a headless net would fail the strict load on the extra
+    # aux_head.* keys). An aux-free checkpoint builds the default headless net.
+    aux_targets = AUX_TARGETS if AUX_HEAD_WEIGHT_KEY in model_state else ()
+    model = ActorCritic(hidden_dim=hidden_dim, aux_targets=aux_targets)
     try:
         model.load_state_dict(model_state, strict=True)
     except RuntimeError as exc:
