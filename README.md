@@ -1,101 +1,58 @@
 # Slay the Spire RL
 
-A reinforcement-learning agent that learns to play **Slay the Spire** (Ironclad,
-Acts 1-3), built from scratch as a portfolio project.
+A reinforcement learning agent for playing **Slay the Spire** as Ironclad across Acts 1–3.
 
-The learning stack - observation encoding, action masking, reward design, the
-neural network, a self-implemented PPO, and the training loop - is our own work.
-We use the [`daniel-ziegler/sts_lightspeed`](https://github.com/daniel-ziegler/sts_lightspeed)
-C++ engine **as the environment only** (a fast, headless, RNG-accurate Ironclad
-simulator with Python bindings). We do **not** use its bundled RL code
-(`silverbot`). That boundary is the core of the "from scratch" claim: the
-environment is a third-party dependency, like a game engine; the agent is ours.
+The project uses a custom state encoder, legal-action masking, reward shaping, policy/value networks, and PPO. Training runs on the [`daniel-ziegler/sts_lightspeed`](https://github.com/daniel-ziegler/sts_lightspeed) C++ engine, which provides a fast headless Slay the Spire simulator with Python bindings.
+
+We use `sts_lightspeed` only for the game simulation. The engine's included RL agent, `silverbot`, is not used.
 
 ## Why RL
 
-Playing a full Ironclad run is sequential decision-making under stochasticity
-with delayed, sparse reward (win or lose the run) - the canonical RL setting.
-Heuristics can't self-improve, imitation caps the agent at its teacher, and pure
-search trains no model. RL is the only approach that trains our own model end to
-end, and a fast headless simulator supplies the one hard prerequisite: millions
-of cheap episodes.
+Slay the Spire has a large number of decisions whose effects can show up much later in a run. A card picked early in Act 1 can change how a deck handles elites, bosses, shops, and later acts. The same applies to routing, upgrades, purchases, and combat decisions.
 
-## Goal
+Running the game through a headless C++ simulator makes it possible to train on far more runs than would be practical through the normal game client.
 
-Train an Ironclad agent that plays competently across ascension levels, with a
-reproducible pipeline and a demonstrable result (training curves plus a sample
-playthrough).
+## Architecture
 
-- **Primary target:** 50-70% win rate at Ascension 0 through Act 3.
-- **Stretch:** climb the ascension ladder (A1-A10+), reported as a
-  win-rate-vs-ascension curve.
+The project is split into a few main pieces:
 
-Scope is Ironclad only, Acts 1-3 (no Act 4 / Corrupt Heart, which the engine does
-not implement).
+* **Environment interface** — passes actions and game state between the Python training code and C++ simulator.
+* **Observation encoder** — turns the current game state into fixed-size numerical input for the network.
+* **Action masking** — removes illegal actions before sampling from the policy.
+* **Policy/value network** — predicts action probabilities and the expected value of the current state.
+* **PPO trainer** — collects rollouts and updates the policy using Proximal Policy Optimization.
+* **Reward system** — assigns rewards for run outcomes and intermediate progress.
+* **Evaluation pipeline** — runs the policy without training-time exploration and records its performance.
 
-## Status
+The action space includes both combat actions and run-level choices, including card rewards, path selection, shops, and rest sites.
 
-Phases 0-2 are implemented. The engine build, interface, observation encoder, and
-action masking are in place, and the from-scratch PPO stack trains against the
-live engine on single Act 1 combats. On sampled Act 1 elites (Gremlin Nob,
-Lagavulin, Three Sentries) the greedy win rate climbs from near the random-legal
-floor (0-3.5%) to ~99%. Phase 3 (full Act 1 clear) is next.
+## Results
 
-## Roadmap
+We first tested the training setup on sampled Act 1 elite fights against **Gremlin Nob, Lagavulin, and Three Sentries**.
 
-| Phase | Milestone | Status |
-|---|---|---|
-| 0 | Repo scaffold, engine build, enum validation, interface sign-off | Done |
-| 1 | Observation encoder + action masking against the live engine | Done |
-| 2 | Self-implemented PPO on single Act 1 combats (>90% on sampled combats) | Done |
-| 3 | Full Act 1 clear (>80% clear rate) | Next |
-| 4 | Full-run training, Acts 1-3, toward the 50-70% primary band | Planned |
-| 5 | RL + MCTS search extension (deferred; needs a trained policy/value first) | Planned |
+On these encounters, the greedy policy went from roughly random legal-action performance to about a **99% win rate** after training.
 
-## Design decisions
+The current full-run setup trains one policy across Acts 1–3. We also use it to measure how performance changes as ascension increases.
 
-The approaches we considered, why we rejected the alternatives, and the empirical
-evidence behind each choice are recorded as
-[Architecture Decision Records](https://adr.github.io/) (ADRs). The decision log
-will be published under `decisions/` as the project matures - each record's
-evidence section filled in from real results (benchmarks, learning curves) as the
-corresponding phase lands. It is not in the repository yet; it will be published
-once its evidence sections are backfilled from the landed phases.
+## Training
 
-## Engine dependency and fork
+Training uses **Proximal Policy Optimization (PPO)** with action masking.
 
-The engine originates from
-[`daniel-ziegler/sts_lightspeed`](https://github.com/daniel-ziegler/sts_lightspeed).
-The submodule under `engine/sts_lightspeed` does not point at upstream directly:
-it tracks a light fork
-([`maxy1991991/sts_lightspeed`](https://github.com/maxy1991991/sts_lightspeed),
-branch `master`) that carries a build-portability patch and a few
-Python-binding additions. No simulation logic is changed, so runs stay
-RNG-accurate against upstream. Relative to the upstream `heart1` tag, the pinned
-commit adds:
+For each rollout:
 
-- **Portable macOS SDK path.** Upstream hardcodes an absolute SDK path
-  (`/Library/Developer/CommandLineTools/SDKs/MacOSX15.2.sdk`) before the
-  `project()` command, which fails to configure on any machine without that exact
-  SDK. The fork pins that path only when it exists and otherwise lets CMake
-  auto-detect the active SDK.
-- **Read-only `BattleContext` bindings** exposing the potion belt and the
-  card-select selected bits for observation encoding.
-- **`GameContext` write bindings** exposing `clear_deck`, `obtain_card`,
-  `obtain_relic`, `set_relic_value`, and the `cur_hp` / `max_hp` setters, so a
-  caller can build a chosen mid-run state (deck, relics, HP) before a combat.
-- **Optional encounter selection.** `create_battle_context` accepts an optional
-  `MonsterEncounter`, so a caller can spawn a chosen combat by reusing the
-  engine's existing `BattleContext::init(gc, encounter)` path. It defaults to the
-  rolled encounter, so existing callers are unchanged.
+1. The simulator returns the current game state.
+2. The encoder converts that state into the model input.
+3. Illegal actions are removed from the policy distribution.
+4. The policy samples an action.
+5. The simulator executes the action and returns the next state.
+6. The transition, reward, and value estimate are stored.
+7. Generalized Advantage Estimation (GAE) computes the advantages for the rollout.
+8. PPO updates the policy and value networks using the collected data.
 
-The fork carries these changes so the exact vendored source is a single submodule
-checkout, rather than pinning upstream and re-applying a patch at build time. If
-they land upstream, the submodule can be repointed at
-`daniel-ziegler/sts_lightspeed` with no other change.
+During evaluation, the agent takes the highest-probability legal action instead of sampling. This removes training-time exploration from the reported results.
 
-## License and attribution
+## License and Attribution
 
-The `sts_lightspeed` engine is MIT licensed and used as an external dependency.
-All RL code in this repository is our own. Slay the Spire is a trademark of
-Mega Crit; this is a non-commercial, educational project.
+[`sts_lightspeed`](https://github.com/daniel-ziegler/sts_lightspeed) is MIT licensed and used as an external dependency.
+
+Slay the Spire is a trademark of Mega Crit. This project is non-commercial and educational.
