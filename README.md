@@ -4,8 +4,6 @@ A reinforcement learning agent for playing **Slay the Spire** as Ironclad across
 
 The project uses a custom state encoder, legal-action masking, reward shaping, policy/value networks, and PPO. Training runs on the [`daniel-ziegler/sts_lightspeed`](https://github.com/daniel-ziegler/sts_lightspeed) C++ engine, which provides a fast headless Slay the Spire simulator with Python bindings.
 
-We use `sts_lightspeed` only for the game simulation. The engine's included RL agent, `silverbot`, is not used.
-
 ## Why RL
 
 Slay the Spire has a large number of decisions whose effects can show up much later in a run. A card picked early in Act 1 can change how a deck handles elites, bosses, shops, and later acts. The same applies to routing, upgrades, purchases, and combat decisions.
